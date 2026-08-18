@@ -1,10 +1,10 @@
-formula = "fbd-slice"
-description = "Per-slice implementation workflow for the federated-beads epic: plan, TDD implementation, autoreview, local merge."
+formula = "hank-slice"
+description = "Per-slice implementation workflow for Hank: plan, TDD implementation, autoreview, local merge."
 version = 1
 type = "workflow"
 
 [vars.slice_id]
-description = "Bead id of the slice task this molecule implements (e.g. federated-beads-dxh.1)"
+description = "Bead id of the slice task this molecule implements (e.g. hank-a38ce90d)"
 required = true
 
 [vars.slice_num]

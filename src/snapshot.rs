@@ -1,6 +1,6 @@
 //! The snapshot read model: one call turns the hub's `bd ready` output into the
 //! attributed, sorted rows the ready screen consumes — UI-agnostic and
-//! serializable (Slice 6 emits it verbatim as `fbd snapshot --json`).
+//! serializable (Slice 6 emits it verbatim as `hank snapshot --json`).
 //!
 //! Grouping is a view concern (Slice 9): rows merely *carry* `repo_name` so a
 //! view can group by it. See `plans/slices/slice-5.md`.

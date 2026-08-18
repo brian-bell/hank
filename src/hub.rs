@@ -1,7 +1,7 @@
 //! Hub lifecycle: create the bd aggregation workspace on first run and
 //! reconcile the roster into it on every run.
 //!
-//! The hub is a bd "hub" workspace under fbd's data dir
+//! The hub is a bd "hub" workspace under hank's data dir
 //! (`<data_dir>/hub`). [`ensure_hub`] initializes it once, then registers each
 //! roster repo the hub does not already track; missing roster paths warn rather
 //! than fail. [`reset`] deletes the hub dir, guarded so it can only ever remove
@@ -175,7 +175,7 @@ pub fn ensure_hub(
     mkdir_all(&hub)?;
 
     // Single-process reconciliation: this check-then-init (and the roster
-    // read/add below) is not guarded against a second fbd running concurrently.
+    // read/add below) is not guarded against a second hank running concurrently.
     // Cross-process safety is the Slice 4 hub lock's job (see the master plan's
     // process-level locking design); ensure_hub stays simple here and surfaces a
     // genuine init failure rather than masking it behind a partial `.beads`.
@@ -184,7 +184,7 @@ pub fn ensure_hub(
     }
 
     // bd stores additional repos relative to the hub (`bd -C <hub>`), so resolve
-    // any relative stored entry against `hub` — not fbd's cwd — before comparing.
+    // any relative stored entry against `hub` — not hank's cwd — before comparing.
     let mut existing: HashSet<PathBuf> = read_hub_roster(&hub)?
         .iter()
         .map(|p| normalize(&resolve_against(&hub, p)))
@@ -269,7 +269,7 @@ pub fn read_hub_roster(hub: &Path) -> Result<Vec<PathBuf>, HubError> {
     Ok(additional.into_iter().map(PathBuf::from).collect())
 }
 
-/// The subset of `<hub>/.beads/config.yaml` fbd reads. Every field is optional so
+/// The subset of `<hub>/.beads/config.yaml` hank reads. Every field is optional so
 /// both the commented template (fresh init) and the minimal active block
 /// (post `repo add`) parse.
 #[derive(Debug, Deserialize)]
@@ -303,7 +303,7 @@ fn ensure_within(parent: &Path, target: &Path) -> Result<(), HubError> {
 /// `bd init` aborts citing the existing `.beads/embeddeddolt/<db>`. A bare or
 /// partial `.beads/` left by an interrupted `bd init` therefore correctly reads
 /// as uninitialized, so `ensure_hub` re-inits instead of reporting a broken hub
-/// as ready. (fbd always uses the default embedded backend — see the plan.)
+/// as ready. (hank always uses the default embedded backend — see the plan.)
 fn is_initialized(hub: &Path) -> bool {
     hub.join(".beads").join("embeddeddolt").is_dir()
 }
@@ -563,13 +563,13 @@ mod tests {
 
     #[test]
     fn reset_guard_rejects_path_outside_data_dir() {
-        let data = Path::new("/data/federated-beads");
+        let data = Path::new("/data/hank");
         assert!(ensure_within(data, Path::new("/etc")).is_err());
         assert!(ensure_within(data, &data.join("hub")).is_ok());
         // Equal path is refused (would remove the data dir itself).
         assert!(ensure_within(data, data).is_err());
         // Sibling with a shared string prefix must not pass.
-        assert!(ensure_within(data, Path::new("/data/federated-beads-evil")).is_err());
+        assert!(ensure_within(data, Path::new("/data/hank-evil")).is_err());
     }
 
     #[test]

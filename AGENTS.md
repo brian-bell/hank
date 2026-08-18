@@ -9,11 +9,11 @@
 
 ## Project Overview
 
-**fbd (Federated Beads)** is a read-only Rust terminal UI (ratatui + crossterm)
+**Hank (`hank`)** is a read-only Rust terminal UI (ratatui + crossterm)
 that federates N beads repositories into one persistent `bd` hub workspace and
 answers "what's ready to work on across all my repos?" It shows a cross-repo
 ready list with a detail pane, cross-repo search (`/`), repo/priority filters,
-and a copy-context action (`y`/`Y` via OSC 52). fbd never writes issue data;
+and a copy-context action (`y`/`Y` via OSC 52). Hank never writes issue data;
 its only source-repo write is `bd export` refreshing `.beads/issues.jsonl`.
 
 Requires `bd` >= 1.1.0 with `schema_version == 1` on `PATH` at runtime (gated
@@ -23,7 +23,7 @@ at startup; constants in `src/cli.rs`). Rust edition 2024.
 
 ```bash
 cargo build                                    # build
-cargo run                                      # launch the TUI (bare fbd)
+cargo run                                      # launch the TUI (bare hank)
 cargo run -- snapshot                          # headless ready list
 cargo fmt --check                              # quality gate: formatting
 cargo clippy --all-targets -- -D warnings      # quality gate: lints
@@ -43,16 +43,16 @@ when `bd` is missing.
 ## Architecture
 
 - **Hub, not custom store**: aggregation is a `bd` hub workspace under
-  `<data_dir>/federated-beads/hub` using bd's multi-repo hydration
+  `<data_dir>/hank/hub` using bd's multi-repo hydration
   (`bd repo add` + `bd repo sync`). Every read goes through `bd … --json`
-  subprocess calls against the hub; fbd never reimplements ready/blocked
+  subprocess calls against the hub; Hank never reimplements ready/blocked
   semantics.
-- **Repo attribution**: bd's JSON has no source-repo field, so fbd maps issue
+- **Repo attribution**: bd's JSON has no source-repo field, so Hank maps issue
   ids to repos by longest id prefix (from each repo's effective `bd` prefix),
   flagging collisions.
 - **Refresh**: async and TUI-owned — export each repo + one hub sync on a
-  worker thread; an advisory lock on `<hub>/.fbd.lock` serializes concurrent
-  fbd instances.
+  worker thread; an advisory lock on `<hub>/.hank.lock` serializes concurrent
+  Hank instances.
 - **Pure state core**: the TUI is `reduce(&mut App, Msg) -> Vec<Effect>` with
   no I/O, clock, or threads inside; the runtime performs effects. `view::draw`
   is pure over `(App, now)` and tested with ratatui's `TestBackend`.
@@ -65,20 +65,23 @@ Module map (`src/`):
 | `bd/` | `BdClient` trait, real `BdCli` subprocess impl, `FakeBdClient` test double, serde types |
 | `hub` | Hub lifecycle: create on first run, reconcile roster, guarded `reset` |
 | `refresh` | Export-all + sync + prefix→repo attribution map, advisory lock |
-| `snapshot` | Read model: `bd ready` → attributed, sorted rows (also `fbd snapshot --json`) |
+| `snapshot` | Read model: `bd ready` → attributed, sorted rows (also `hank snapshot --json`) |
 | `app/` | `mod` (pure `reduce` core), `view` (renderer), `keys` (crossterm→`Msg`, only file importing crossterm), `context` (copy builders + OSC 52) |
 | `runtime` | Event loop: event + refresh worker threads feed one mpsc channel |
 | `cli` | Headless runners (`snapshot`, `doctor`, `reset`, `repos`), version gate |
 
 ## Conventions & Gotchas
 
-- Development is TDD in vertical slices; `plans/fbd-v1-implementation-plan.md`
-  is the master design and `plans/slices/` the per-slice history (module doc
-  comments cite them).
+- Development favors TDD in vertical slices, especially for behavior changes,
+  parsers, migration logic, and public interfaces.
 - serde forward-compatibility: any key bd omits when empty is
   `Option`/`#[serde(default)]`; never add `#[serde(deny_unknown_fields)]`.
 - `bd repo list --json` is broken in bd 1.1.0 (ignores `--json`), so the hub's
   roster is read from `<hub>/.beads/config.yaml` `repos.additional` instead.
+- Canonical user state lives at `<config_root>/hank/config.toml` and
+  `<data_root>/hank/ui_state.json`. Startup safely migrates only those two
+  user-owned legacy files from `federated-beads/`; it never copies the legacy
+  hub, cache, locks, or temp state. `hank reset` skips migration.
 - ratatui is pinned with the `unstable-rendered-line-info` feature for
   `Paragraph::line_count` (detail-pane scroll clamping); stay within 0.30.x.
 - Only `main.rs` resolves real paths, spawns the real `bd`, and wires

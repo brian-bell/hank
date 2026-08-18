@@ -1,4 +1,4 @@
-# Federated Beads (fbd) — common developer commands.
+# Hank — common developer commands.
 # Commands mirror the "Build, Test, Run" section of AGENTS.md; keep the two in sync.
 
 .DEFAULT_GOAL := help
@@ -15,10 +15,10 @@ build: ## Debug build
 release: ## Optimized release build
 	cargo build --release
 
-run: ## Launch the TUI (bare fbd)
+run: ## Launch the TUI (bare hank)
 	cargo run
 
-snapshot: ## Headless ready list (fbd snapshot)
+snapshot: ## Headless ready list (hank snapshot)
 	cargo run -- snapshot
 
 test: ## Unit + render tests (green without bd)
@@ -40,7 +40,7 @@ clippy: ## Quality gate: lints (warnings are errors)
 
 check: fmt-check clippy test ## All quality gates: fmt, clippy, unit tests
 
-install: ## Install fbd to ~/.cargo/bin
+install: ## Install hank to ~/.cargo/bin
 	cargo install --path . --locked
 
 clean: ## Remove build artifacts

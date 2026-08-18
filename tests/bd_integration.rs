@@ -9,11 +9,11 @@ mod helpers;
 
 use std::time::SystemTime;
 
-use fbd::bd::{BdCli, BdClient, RepoSyncReport};
-use fbd::cli::run_snapshot;
-use fbd::config::{Config, Paths, RepoEntry};
-use fbd::hub::{ensure_hub, hub_dir, read_hub_roster};
-use fbd::{refresh, snapshot};
+use hank::bd::{BdCli, BdClient, RepoSyncReport};
+use hank::cli::run_snapshot;
+use hank::config::{Config, Paths, RepoEntry};
+use hank::hub::{ensure_hub, hub_dir, read_hub_roster};
+use hank::{refresh, snapshot};
 use helpers::{bd_available, build_ready_fixture_repo, build_ready_fixture_repo_with_prefix};
 
 #[test]

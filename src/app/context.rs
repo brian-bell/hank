@@ -179,7 +179,7 @@ pub fn osc52(payload: &str) -> String {
 }
 
 /// Standard (RFC 4648 §4) base64 with `=` padding. Small and self-contained so
-/// fbd takes no clipboard/base64 dependency for the one place it needs encoding.
+/// hank takes no clipboard/base64 dependency for the one place it needs encoding.
 pub fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);

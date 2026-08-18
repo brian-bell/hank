@@ -1,12 +1,13 @@
 [package]
-name = "fbd"
-version = "0.1.0-rc.1"
+name = "hank"
+version = "0.1.0-rc.2"
+default-run = "hank"
 edition = "2024"
 rust-version = "1.88.0"
-description = "Federated Beads: a read-only terminal UI over a bd multi-repo hub — one cross-repo ready-work list, detail pane, search, and copy-context."
+description = "Hank: a read-only terminal UI over a bd multi-repo hub — one cross-repo ready-work list, detail pane, search, and copy-context."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/brian-bell/federated-beads"
+repository = "https://github.com/brian-bell/hank"
 keywords = ["tui", "beads", "issue-tracker", "ratatui", "cli"]
 categories = ["command-line-utilities"]
 exclude = [

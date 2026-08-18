@@ -1,5 +1,5 @@
-//! The `bd` interface layer: serde domain types for `bd --json` payloads fbd
-//! reads, human-readable detail output, the [`BdClient`] trait fbd calls, and its
+//! The `bd` interface layer: serde domain types for `bd --json` payloads hank
+//! reads, human-readable detail output, the [`BdClient`] trait hank calls, and its
 //! real ([`BdCli`]) and fake ([`FakeBdClient`]) implementations.
 
 pub mod cli;
@@ -31,10 +31,10 @@ pub struct ShowDetail {
     pub issue: Issue,
 }
 
-/// Everything fbd asks of `bd`. All calls are blocking subprocess invocations in
+/// Everything hank asks of `bd`. All calls are blocking subprocess invocations in
 /// the real impl; the fake makes them synchronous and programmable for tests.
 ///
-/// `dir`/`hub`/`repo` are passed to `bd -C <dir>`; `hub` is fbd's aggregation
+/// `dir`/`hub`/`repo` are passed to `bd -C <dir>`; `hub` is hank's aggregation
 /// workspace, `repo`/`dir` a source beads repo.
 pub trait BdClient: Sync {
     /// `bd version --json` — the startup gate.

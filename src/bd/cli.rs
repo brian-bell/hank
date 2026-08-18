@@ -133,7 +133,7 @@ fn argv_repo_list(hub: &Path) -> Vec<OsString> {
 }
 
 fn argv_export(repo: &Path, output: &Path) -> Vec<OsString> {
-    // bd resolves a relative `-o` against fbd's *process* working directory, not
+    // bd resolves a relative `-o` against hank's *process* working directory, not
     // the `-C` dir (verified against bd 1.1.0: `bd -C <repo> export -o
     // .beads/issues.jsonl` writes under the caller's cwd, not <repo>). So the
     // output path must locate the repo explicitly. Joining onto `repo` writes to
@@ -205,7 +205,7 @@ fn argv_search(hub: &Path, query: &str) -> Vec<OsString> {
     ]
 }
 
-/// `bd config get <key> --json` payload; fbd reads only `value`.
+/// `bd config get <key> --json` payload; hank reads only `value`.
 #[derive(Debug, serde::Deserialize)]
 struct ConfigValue {
     value: String,

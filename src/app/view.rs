@@ -23,7 +23,7 @@ use crate::cli::{format_row_body, sanitize};
 
 /// Shown when the roster has no rows at all (no repos configured / nothing
 /// hydrated yet — see slice-9 decision 3).
-const EMPTY_HINT: &str = "no repos configured — run: fbd repos discover ~/dev";
+const EMPTY_HINT: &str = "no repos configured — run: hank repos discover ~/dev";
 
 /// Shown when there are rows but the active filters hide them all, so the user
 /// is not misdirected to reconfigure the roster.
@@ -33,23 +33,23 @@ const NO_MATCH_HINT: &str = "no issues match the current filters — press f/p t
 /// the UI never promises an inert command; `enter detail` is live as of Slice 10
 /// and `/ search` as of Slice 11.
 const LIST_HINTS: &str =
-    "fbd · q quit · r refresh · / search · f repos · p prio · j/k move · enter detail";
+    "hank · q quit · r refresh · / search · f repos · p prio · j/k move · enter detail";
 
 /// One-line key hints for the detail pane: `j`/`k` move through beads, while
 /// `J`/`K` and PageUp/PageDown scroll the pane.
-const DETAIL_HINTS: &str = "fbd · esc back · j/k move · J/K scroll · PgUp/PgDn page · q quit";
+const DETAIL_HINTS: &str = "hank · esc back · j/k move · J/K scroll · PgUp/PgDn page · q quit";
 
 /// One-line key hints while editing the search query: the keys that act there.
-const SEARCH_EDIT_HINTS: &str = "fbd search · type query · enter run · esc cancel";
+const SEARCH_EDIT_HINTS: &str = "hank search · type query · enter run · esc cancel";
 
 /// One-line key hints while browsing search results: the keys that act there
 /// (`f`/`p` filter the results the same as the ready list).
 const SEARCH_RESULTS_HINTS: &str =
-    "fbd search · j/k move · f repos · p prio · enter open · esc edit · q quit";
+    "hank search · j/k move · f repos · p prio · enter open · esc edit · q quit";
 
 /// One-line key hints while a search is pending or failed: only these act there
 /// (navigation and detail-open are inert until results arrive).
-const SEARCH_WAIT_HINTS: &str = "fbd search · esc edit · q quit";
+const SEARCH_WAIT_HINTS: &str = "hank search · esc edit · q quit";
 
 /// Render the whole screen for the current [`App`] state and clock `now`: a title
 /// hint row, the mode-specific content (ready list or list+detail split), and the
@@ -725,14 +725,14 @@ mod tests {
         let app = app_with(
             vec![row("repo-a", "ra-1", 1, "t")],
             vec![
-                "fbd requires bd >= 1.1.0".into(),
+                "hank requires bd >= 1.1.0".into(),
                 "id prefix `dup` claimed by 2 repos".into(),
             ],
         );
         let status = line_text(&render(&app, at(1000)), H - 1);
 
         assert!(
-            status.contains("fbd requires bd >= 1.1.0"),
+            status.contains("hank requires bd >= 1.1.0"),
             "the first warning is shown verbatim: {status:?}"
         );
         assert!(

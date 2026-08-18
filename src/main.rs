@@ -1,4 +1,4 @@
-//! fbd CLI entry point.
+//! hank CLI entry point.
 //!
 //! Thin by design: parse args, resolve real XDG [`Paths`], load the roster, and
 //! dispatch to a [`cli`] runner. All command logic and its tests live in
@@ -11,23 +11,23 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use fbd::bd::BdCli;
-use fbd::cli::{self, CliError};
-use fbd::config::Paths;
+use hank::bd::BdCli;
+use hank::cli::{self, CliError};
+use hank::config::Paths;
 
 #[derive(Parser)]
 #[command(
-    name = "fbd",
+    name = "hank",
     version,
-    about = "Federated Beads: a read-only view across your beads repos",
-    after_help = "Run `fbd` with no command to launch the interactive TUI \
+    about = "Hank: a read-only view across your beads repos",
+    after_help = "Run `hank` with no command to launch the interactive TUI \
                   (ready list, detail pane, search). Keys: j/k move, f repository \
                   picker, p priority filter, / search, Enter detail, y copy \
                   `cd … && bd show <id>`, Y copy a markdown block, r refresh, \
                   Esc back, q quit. The last confirmed repository view is \
                   restored on the next launch; All repos is the first-run \
                   default.\n\n\
-                  First run: `fbd repos discover ~/dev --add` then `fbd`."
+                  First run: `hank repos discover ~/dev --add` then `hank`."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -97,6 +97,10 @@ fn run() -> Result<(), CliError> {
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
 
+    if !matches!(&cli.command, Some(Command::Doctor | Command::Reset)) {
+        cli::prepare_legacy_state(&paths, &mut stderr)?;
+    }
+
     // Load the roster per command, not up front: `reset` needs only `Paths`, and
     // `doctor` loads it itself so it can report a bad config instead of aborting.
     // Only `snapshot` treats a malformed config as fatal.
@@ -117,11 +121,11 @@ fn run() -> Result<(), CliError> {
                 cli::run_repos_discover(&paths, &root, add, &mut stdout)
             }
         },
-        // Bare `fbd` launches the interactive TUI: ensure_hub warnings flow to
+        // Bare `hank` launches the interactive TUI: ensure_hub warnings flow to
         // the status bar and the initial refresh is spawned at launch.
         None => {
             let roster = cli::load_roster(&paths)?;
-            fbd::runtime::run(&paths, roster)
+            hank::runtime::run(&paths, roster)
         }
     }
 }

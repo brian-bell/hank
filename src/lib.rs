@@ -1,4 +1,4 @@
-//! fbd — Federated Beads: a read-only TUI over a `bd` multi-repo hub.
+//! hank — Hank: a read-only TUI over a `bd` multi-repo hub.
 //!
 //! Library crate exposing the modules the binary and integration tests drive.
 //! Only `main` resolves real XDG paths; everything here is I/O-injectable so it

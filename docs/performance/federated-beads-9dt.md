@@ -1,5 +1,8 @@
 # `federated-beads-9dt` refresh performance evidence
 
+> Historical evidence recorded before the Hank rename. The durable Beads issue
+> id and measurements are preserved unchanged.
+
 Recorded 2026-07-28 on:
 
 - Apple arm64, Darwin 25.5.0

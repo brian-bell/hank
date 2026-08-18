@@ -2,8 +2,8 @@
 //! prefix→repo attribution map — collecting per-repo failures instead of
 //! aborting on the first bad repo.
 //!
-//! A process-level advisory lock on `<hub>/.fbd.lock` serializes refreshes
-//! across concurrent fbd instances so two cannot run `repo sync` against the
+//! A process-level advisory lock on `<hub>/.hank.lock` serializes refreshes
+//! across concurrent hank instances so two cannot run `repo sync` against the
 //! same embedded-Dolt hub at once. See `plans/slices/slice-4.md`.
 
 use std::collections::{HashMap, HashSet};
@@ -23,8 +23,8 @@ use crate::config::{Config, Paths, RepoEntry};
 use crate::hub::hub_dir;
 
 /// Advisory lock file, inside the hub dir.
-const LOCK_FILE: &str = ".fbd.lock";
-const GENERATION_FILE: &str = ".fbd-generation";
+const LOCK_FILE: &str = ".hank.lock";
+const GENERATION_FILE: &str = ".hank-generation";
 
 /// A completed refresh. Individual repos may still appear in `errors`; a
 /// completed refresh with per-repo errors is still a success (the hub was
@@ -136,7 +136,7 @@ pub enum RepoError {
     #[error("cannot read prefix for {repo}: {detail}")]
     Metadata { repo: PathBuf, detail: String },
     /// Preparing, comparing, cleaning, or atomically publishing an export
-    /// failed. The original JSONL is never opened for writing by fbd.
+    /// failed. The original JSONL is never opened for writing by hank.
     #[error("export {operation} failed for {repo} at {path}: {detail}")]
     ExportFile {
         repo: PathBuf,
@@ -149,9 +149,9 @@ pub enum RepoError {
 /// A fatal refresh failure, or a declined refresh.
 #[derive(Debug, thiserror::Error)]
 pub enum RefreshError {
-    /// Another fbd instance holds the hub lock; this refresh declined to run and
+    /// Another hank instance holds the hub lock; this refresh declined to run and
     /// performed no exports or sync. The caller retries on the next refresh.
-    #[error("another fbd instance is refreshing this hub")]
+    #[error("another hank instance is refreshing this hub")]
     AlreadyRefreshing,
     /// The single `bd repo sync` failed, so the hub was not updated at all.
     #[error("hub sync failed: {0}")]
@@ -271,7 +271,7 @@ impl PrefixMap {
     }
 }
 
-/// An acquired advisory lock on `<hub>/.fbd.lock`. The OS lock is released when
+/// An acquired advisory lock on `<hub>/.hank.lock`. The OS lock is released when
 /// the held `File` drops (closing the fd releases the `flock`).
 #[derive(Debug)]
 pub struct HubLock {
@@ -310,18 +310,38 @@ pub(crate) fn publish_hub_generation(
     paths: &Paths,
     token: &HubGenerationToken,
 ) -> Result<(), RefreshError> {
+    publish_hub_generation_with_counter(paths, token, &GENERATION_COUNTER)
+}
+
+fn publish_hub_generation_with_counter(
+    paths: &Paths,
+    token: &HubGenerationToken,
+    counter: &AtomicU64,
+) -> Result<(), RefreshError> {
     let hub = hub_dir(paths);
     let marker = hub.join(GENERATION_FILE);
-    let temp = hub.join(format!(
-        ".fbd-generation.{}.{}.tmp",
-        std::process::id(),
-        GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| {
-        let mut file = OpenOptions::new()
+    let (mut file, temp) = loop {
+        let candidate = hub.join(format!(
+            ".hank-generation.{}.{}.tmp",
+            std::process::id(),
+            counter.fetch_add(1, Ordering::Relaxed)
+        ));
+        match OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temp)?;
+            .open(&candidate)
+        {
+            Ok(file) => break (file, candidate),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(RefreshError::Generation {
+                    path: marker,
+                    source,
+                });
+            }
+        }
+    };
+    let result = (|| {
         file.write_all(token.0.as_bytes())?;
         file.sync_all()?;
         fs::rename(&temp, &marker)
@@ -650,7 +670,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Export to a unique sibling, compare it with the canonical JSONL, then either
 /// discard it or install it with one same-directory rename. This is deliberately
-/// the only source-artifact publication path in fbd.
+/// the only source-artifact publication path in hank.
 fn stable_export(bd: &impl BdClient, repo: &Path) -> Vec<RepoError> {
     if !repo.exists() {
         return Vec::new();
@@ -766,7 +786,7 @@ fn reserve_temp_export(
 ) -> Result<PathBuf, (PathBuf, std::io::Error)> {
     loop {
         let candidate = parent.join(format!(
-            ".issues.jsonl.fbd.{process_id}.{}.tmp",
+            ".issues.jsonl.hank.{process_id}.{}.tmp",
             counter.fetch_add(1, Ordering::Relaxed)
         ));
         match OpenOptions::new()
@@ -781,12 +801,12 @@ fn reserve_temp_export(
     }
 }
 
-/// Apply fbd's supported metadata contract to a replacement export.
+/// Apply hank's supported metadata contract to a replacement export.
 ///
 /// An unchanged export leaves the canonical inode untouched, preserving all of
 /// its metadata. A changed export must use a new inode for atomic rename, so the
 /// portable contract preserves `std::fs::Permissions` (Unix mode bits, Windows
-/// readonly state). Ownership remains that of the fbd-created sibling file;
+/// readonly state). Ownership remains that of the hank-created sibling file;
 /// ACLs, xattrs, SELinux labels, file flags, and inode identity are explicitly
 /// outside the cross-platform contract. Attempting to preserve the old inode
 /// would weaken the crash-safe atomic publication invariant.
@@ -876,9 +896,9 @@ pub(crate) fn attribution_map(bd: &impl BdClient, roster: &Config) -> (PrefixMap
     (PrefixMap::from_pairs(pairs), errors)
 }
 
-/// The subset of `<repo>/.beads/metadata.json` fbd reads: the id prefix, stored
+/// The subset of `<repo>/.beads/metadata.json` hank reads: the id prefix, stored
 /// under `dolt_database`. Tolerant (no `deny_unknown_fields`) — bd writes other
-/// keys fbd ignores.
+/// keys hank ignores.
 #[derive(Debug, Deserialize)]
 struct Metadata {
     dolt_database: String,
@@ -1232,14 +1252,14 @@ mod tests {
     fn temporary_export_reservation_retries_stale_name_collisions() {
         let tmp = tempfile::tempdir().unwrap();
         let counter = AtomicU64::new(0);
-        let stale = tmp.path().join(".issues.jsonl.fbd.7.0.tmp");
+        let stale = tmp.path().join(".issues.jsonl.hank.7.0.tmp");
         fs::write(&stale, b"stale").unwrap();
 
         let reserved = reserve_temp_export(tmp.path(), 7, &counter).unwrap();
 
         assert_eq!(
             reserved,
-            tmp.path().join(".issues.jsonl.fbd.7.1.tmp"),
+            tmp.path().join(".issues.jsonl.hank.7.1.tmp"),
             "the next unused counter value is reserved"
         );
         assert_eq!(
@@ -1268,7 +1288,7 @@ mod tests {
                         .unwrap()
                         .file_name()
                         .to_string_lossy()
-                        .contains(".fbd.")
+                        .contains(".hank.")
                 })
         );
     }
@@ -1328,7 +1348,7 @@ mod tests {
                         .unwrap()
                         .file_name()
                         .to_string_lossy()
-                        .contains(".fbd.")
+                        .contains(".hank.")
                 })
         );
     }
@@ -1947,5 +1967,26 @@ mod tests {
                 .to_string_lossy()
                 .contains(".tmp")
         }));
+    }
+
+    #[test]
+    fn hub_generation_temp_collision_is_preserved_and_retried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let hub = hub_dir(&paths);
+        fs::create_dir_all(&hub).unwrap();
+        let counter = AtomicU64::new(0);
+        let collision = hub.join(format!(".hank-generation.{}.0.tmp", std::process::id()));
+        fs::write(&collision, "not ours").unwrap();
+        let token = HubGenerationToken::new("next-generation");
+
+        publish_hub_generation_with_counter(&paths, &token, &counter).unwrap();
+
+        assert_eq!(read_hub_generation(&paths).unwrap(), Some(token));
+        assert_eq!(fs::read_to_string(collision).unwrap(), "not ours");
+        assert!(
+            !hub.join(format!(".hank-generation.{}.1.tmp", std::process::id()))
+                .exists()
+        );
     }
 }

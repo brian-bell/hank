@@ -1,5 +1,5 @@
 //! Shared helpers for gated integration tests: arranging real `bd` repo state
-//! in temp dirs, independent of fbd's own `BdCli` so a client bug can't mask a
+//! in temp dirs, independent of hank's own `BdCli` so a client bug can't mask a
 //! helper bug.
 
 use std::path::Path;

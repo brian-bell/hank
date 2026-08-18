@@ -78,7 +78,7 @@ pub fn load(path: &Path, now: SystemTime, roster: &Config) -> Option<Snapshot> {
 /// partial/interleaved write — the same atomic-replace pattern
 /// [`crate::config::Config::save`] uses for `config.toml`.
 ///
-/// Two fbd instances can each hold the hub lock only during their own sync
+/// Two hank instances can each hold the hub lock only during their own sync
 /// (see `refresh::run`), so their later, lock-free `bd ready` reads and cache
 /// writes can finish out of order. An exclusive OS lock (mirroring
 /// `refresh::HubLock`, but blocking rather than declining) is held across the
@@ -165,7 +165,7 @@ fn lock_path(path: &Path) -> PathBuf {
 
 /// Remove the cache file at `path`, if present. A missing file is not an
 /// error — `reset` calls this unconditionally alongside deleting the hub, so
-/// a launch just after `fbd reset` never paints rows from the discarded hub
+/// a launch just after `hank reset` never paints rows from the discarded hub
 /// (see [`crate::hub::reset`]).
 pub fn clear(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn save_never_regresses_a_newer_cache() {
-        // Simulates two fbd instances whose syncs finish in one order but
+        // Simulates two hank instances whose syncs finish in one order but
         // whose (lock-free) `bd ready` reads and cache writes land in the
         // other: the older snapshot's write must not clobber the newer one.
         let tmp = tempfile::tempdir().unwrap();

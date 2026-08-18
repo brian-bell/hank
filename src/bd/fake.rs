@@ -3,7 +3,7 @@
 //! Exposure decision: this is ordinary `pub` (but `#[doc(hidden)]`) library
 //! code rather than `#[cfg(test)]`-gated, so later slices' unit tests for the
 //! `hub`, `refresh`, and `snapshot` modules — which take a `&impl BdClient` —
-//! can drive it. It is a test double, not part of fbd's supported API.
+//! can drive it. It is a test double, not part of hank's supported API.
 
 use std::collections::HashMap;
 use std::fs;

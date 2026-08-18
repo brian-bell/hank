@@ -1,4 +1,4 @@
-//! The headless command runners behind fbd's clap CLI: `snapshot`, `doctor`,
+//! The headless command runners behind hank's clap CLI: `snapshot`, `doctor`,
 //! and `reset`, plus the startup version gate and the shared row formatter.
 //!
 //! Every runner takes an injected `&impl BdClient`, `&Paths`, and explicit
@@ -13,14 +13,14 @@ use std::time::SystemTime;
 
 use crate::bd::{BdClient, BdError, BdVersion};
 use crate::cache;
-use crate::config::{Config, Paths, RepoEntry};
+use crate::config::{self, Config, Paths, RepoEntry};
 use crate::hub::{self, HubError, hub_dir};
 use crate::refresh::{self, PrefixMap, RefreshError};
 use crate::snapshot::{self, Row};
 
 /// The minimum bd the version gate accepts.
 const MIN_BD_VERSION: (u64, u64, u64) = (1, 1, 0);
-/// The bd `schema_version` fbd's `--json` parsing is written against.
+/// The bd `schema_version` hank's `--json` parsing is written against.
 const REQUIRED_SCHEMA: i64 = 1;
 
 /// A fatal command failure. `Ok(())` maps to exit 0 in `main`; any `Err` prints
@@ -45,6 +45,9 @@ pub enum CliError {
     /// (e.g. `repos add` on a directory that is not a beads repo).
     #[error("{0}")]
     Roster(String),
+    /// Legacy user state could not be validated or published safely.
+    #[error("{0}")]
+    Migration(String),
     /// Writing to an output sink failed.
     #[error("writing output: {0}")]
     Io(#[from] std::io::Error),
@@ -68,7 +71,7 @@ pub fn format_row(row: &Row) -> String {
 /// Format the repo-independent body of a row: `P<priority> <id> <title>`, with
 /// bd-sourced `id`/`title` [`sanitize`]d. Shared with Slice 9's TUI view, which
 /// draws the repo in a group header instead of inline — so the headless
-/// (`fbd snapshot`) and TUI renderings of a row can never drift.
+/// (`hank snapshot`) and TUI renderings of a row can never drift.
 pub fn format_row_body(row: &Row) -> String {
     format!(
         "P{} {} {}",
@@ -101,7 +104,7 @@ pub fn version_gate(v: &BdVersion) -> Result<(), String> {
     }
     let (maj, min, pat) = MIN_BD_VERSION;
     Err(format!(
-        "fbd requires bd >= {maj}.{min}.{pat} with schema_version {REQUIRED_SCHEMA}, \
+        "hank requires bd >= {maj}.{min}.{pat} with schema_version {REQUIRED_SCHEMA}, \
          but found bd {} (schema_version {}). Upgrade bd \
          (https://github.com/gastownhall/beads).",
         v.version, v.schema_version,
@@ -112,7 +115,7 @@ pub fn version_gate(v: &BdVersion) -> Result<(), String> {
 /// tuple, ignoring any `-pre`/`+build` suffix. Requires all three numeric
 /// components — an incomplete or non-numeric version (`1.1`, `2`, `x`) yields
 /// `None` and fails the gate closed, since the gate exists to refuse a bd whose
-/// schema fbd cannot vouch for.
+/// schema hank cannot vouch for.
 fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     let core = s.split(['-', '+']).next().unwrap_or(s);
     let mut parts = core.split('.');
@@ -134,7 +137,7 @@ pub fn run_snapshot(
     err: &mut impl Write,
 ) -> Result<(), CliError> {
     // The gate protects the whole data-reading path: reject a bd whose schema
-    // fbd's `--json` parsing was not written against, before touching the hub.
+    // hank's `--json` parsing was not written against, before touching the hub.
     version_gate(&bd.version()?).map_err(CliError::VersionGate)?;
 
     let status = hub::ensure_hub(bd, paths, roster)?;
@@ -174,11 +177,11 @@ pub fn run_snapshot(
             drop(synced);
             (snapshot, warnings)
         }
-        // Degraded, not fatal: another fbd holds the lock, so print the last
+        // Degraded, not fatal: another hank holds the lock, so print the last
         // synced data (attribution unavailable → every row falls to `unknown`).
         Err(RefreshError::AlreadyRefreshing) => (
             snapshot::fetch(bd, &hub, &fallback_map, SystemTime::now())?,
-            vec!["another fbd is refreshing this hub; showing the last synced data".to_string()],
+            vec!["another hank is refreshing this hub; showing the last synced data".to_string()],
         ),
         Err(fatal) => return Err(fatal.into()),
     };
@@ -207,6 +210,22 @@ pub fn run_snapshot(
 /// aborts the command before it can diagnose anything — the config being broken
 /// is one of the things you run doctor to discover.
 pub fn run_doctor(bd: &impl BdClient, paths: &Paths, out: &mut impl Write) -> Result<(), CliError> {
+    let migration = config::migrate_legacy_state(paths);
+    if migration.problems().next().is_none() {
+        writeln!(
+            out,
+            "legacy migration: OK ({} file(s) migrated)",
+            migration.migrated().len()
+        )?;
+    } else {
+        if let Some(problem) = migration.fatal_problem() {
+            writeln!(out, "legacy migration: ERROR {problem}")?;
+        }
+        for warning in migration.warnings() {
+            writeln!(out, "legacy migration: WARNING {warning}")?;
+        }
+    }
+
     // Doctor is the diagnostic you run *because* something is wrong, so it never
     // gates: it reports the version and whether the gate would pass, and tolerates
     // bd being absent entirely.
@@ -261,6 +280,20 @@ pub fn run_doctor(bd: &impl BdClient, paths: &Paths, out: &mut impl Write) -> Re
             }
         }
         Err(e) => writeln!(out, "roster: ERROR reading {}: {e}", config_file.display())?,
+    }
+    Ok(())
+}
+
+/// Run the launch-time legacy migration for commands other than `doctor`.
+/// Invalid config or migration infrastructure is fatal; invalid legacy UI state
+/// is reported and the TUI safely falls back to All repositories.
+pub fn prepare_legacy_state(paths: &Paths, err: &mut impl Write) -> Result<(), CliError> {
+    let migration = config::migrate_legacy_state(paths);
+    if let Some(problem) = migration.fatal_problem() {
+        return Err(CliError::Migration(problem.to_string()));
+    }
+    for warning in migration.warnings() {
+        writeln!(err, "warning: {warning}")?;
     }
     Ok(())
 }
@@ -342,7 +375,7 @@ fn expand_tilde(p: &Path) -> PathBuf {
 /// Limitation: a repo added *through a symlink* is stored under the symlink's
 /// target; if that symlink later dangles, this fallback resolves to the link path,
 /// not the stored target, so `remove` by the original link spelling no longer
-/// matches. Removing it by the canonical path shown in `fbd repos list` still works.
+/// matches. Removing it by the canonical path shown in `hank repos list` still works.
 fn store_path(p: &Path) -> PathBuf {
     let expanded = expand_tilde(p);
     if let Ok(canonical) = std::fs::canonicalize(&expanded) {
@@ -367,7 +400,7 @@ fn save_roster(roster: &Config, paths: &Paths) -> Result<(), CliError> {
         .map_err(|e| CliError::Io(std::io::Error::other(e)))
 }
 
-/// `fbd repos add <path>`: canonicalize and append a beads repo to the roster.
+/// `hank repos add <path>`: canonicalize and append a beads repo to the roster.
 ///
 /// Rejects a directory without a `.beads/` subdir (naming the path and pointing at
 /// `bd init`); a path already present (by canonical form) is reported and left as a
@@ -410,8 +443,8 @@ pub fn run_repos_add(paths: &Paths, path: &Path, out: &mut impl Write) -> Result
     Ok(())
 }
 
-/// `fbd repos remove <path>`: drop the entry naming `path` and hint that the hub
-/// needs a `fbd reset` to forget it. Removing an entry that is not present is a
+/// `hank repos remove <path>`: drop the entry naming `path` and hint that the hub
+/// needs a `hank reset` to forget it. Removing an entry that is not present is a
 /// friendly no-op (idempotent), not an error.
 ///
 /// Matching normalizes both the input and each stored entry through `store_path`, so
@@ -419,7 +452,7 @@ pub fn run_repos_add(paths: &Paths, path: &Path, out: &mut impl Write) -> Result
 /// directly added and since deleted still matches via the parent-canonicalize
 /// fallback. A raw path-string equality is kept as a last resort. The one gap is a
 /// repo added via a now-dangling symlink (see `store_path`); remove it by the
-/// canonical path from `fbd repos list`.
+/// canonical path from `hank repos list`.
 pub fn run_repos_remove(paths: &Paths, path: &Path, out: &mut impl Write) -> Result<(), CliError> {
     let canonical = store_path(path);
     let expanded = expand_tilde(path);
@@ -447,19 +480,19 @@ pub fn run_repos_remove(paths: &Paths, path: &Path, out: &mut impl Write) -> Res
     // without pruning the hub here.
     writeln!(
         out,
-        "note: run `fbd reset` so the hub drops this repo (the hub is rebuilt from the roster)",
+        "note: run `hank reset` so the hub drops this repo (the hub is rebuilt from the roster)",
     )?;
     Ok(())
 }
 
-/// `fbd repos list`: print the roster, one path per line, or a guiding hint when it
+/// `hank repos list`: print the roster, one path per line, or a guiding hint when it
 /// is empty.
 pub fn run_repos_list(paths: &Paths, out: &mut impl Write) -> Result<(), CliError> {
     let roster = load_roster(paths)?;
     if roster.repos.is_empty() {
         writeln!(
             out,
-            "roster is empty; add repos with `fbd repos add <path>`"
+            "roster is empty; add repos with `hank repos add <path>`"
         )?;
         return Ok(());
     }
@@ -470,7 +503,7 @@ pub fn run_repos_list(paths: &Paths, out: &mut impl Write) -> Result<(), CliErro
     Ok(())
 }
 
-/// `fbd repos discover <root>`: scan `<root>/*/.beads` one level deep. Lists the new
+/// `hank repos discover <root>`: scan `<root>/*/.beads` one level deep. Lists the new
 /// beads repos found (those not already in the roster); with `add`, appends them.
 ///
 /// Preview-first by design (see slice-7 plan): a bare `discover` mutates nothing, so
@@ -934,6 +967,28 @@ mod tests {
     }
 
     #[test]
+    fn doctor_reports_legacy_migration_problems_without_silently_emptying_roster() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let legacy = tmp.path().join("federated-beads/config.toml");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "repos = [not valid TOML").unwrap();
+        let bd = FakeBdClient::new();
+        let mut out = Vec::new();
+
+        run_doctor(&bd, &paths, &mut out).expect("doctor still succeeds");
+
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(stdout.contains("legacy migration: ERROR"), "{stdout}");
+        assert!(stdout.contains(&legacy.display().to_string()), "{stdout}");
+        assert!(
+            stdout.contains("roster (0 repos)") || stdout.contains("roster: ERROR"),
+            "doctor continues through the complete report: {stdout}"
+        );
+        assert!(!paths.config_file().exists());
+    }
+
+    #[test]
     fn load_roster_absent_is_empty_but_invalid_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
@@ -1017,7 +1072,7 @@ mod tests {
 
     #[test]
     fn reset_clears_the_snapshot_cache() {
-        // A launch right after `fbd reset` must not paint rows from the
+        // A launch right after `hank reset` must not paint rows from the
         // just-discarded hub, so reset clears the cache alongside it
         // (federated-beads review finding: cache survived reset otherwise).
         let tmp = tempfile::tempdir().unwrap();
@@ -1051,6 +1106,29 @@ mod tests {
             crate::app::RepoFilter::Only("repo-a".into()),
             "reset preserves the user's repository preference"
         );
+    }
+
+    #[test]
+    fn reset_never_touches_legacy_user_or_derived_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let legacy = tmp.path().join("federated-beads");
+        fs::create_dir_all(legacy.join("hub")).unwrap();
+        fs::write(legacy.join("config.toml"), "repos = []\n").unwrap();
+        fs::write(legacy.join("ui_state.json"), r#"{"version":2}"#).unwrap();
+        fs::write(legacy.join("snapshot_cache.json"), "legacy cache").unwrap();
+        fs::create_dir_all(hub_dir(&paths)).unwrap();
+        fs::write(paths.cache_file(), "canonical cache").unwrap();
+        let mut out = Vec::new();
+
+        run_reset(&paths, &mut out).expect("ok");
+
+        assert!(legacy.join("hub").exists());
+        assert!(legacy.join("config.toml").exists());
+        assert!(legacy.join("ui_state.json").exists());
+        assert!(legacy.join("snapshot_cache.json").exists());
+        assert!(!hub_dir(&paths).exists());
+        assert!(!paths.cache_file().exists());
     }
 
     #[cfg(unix)]
@@ -1173,7 +1251,7 @@ mod tests {
         let mut out = Vec::new();
         run_repos_remove(&paths, &ra, &mut out).expect("remove ok");
         assert!(
-            String::from_utf8(out).unwrap().contains("fbd reset"),
+            String::from_utf8(out).unwrap().contains("hank reset"),
             "remove hints that the hub needs a reset (federated-beads-dxh.15)"
         );
     }

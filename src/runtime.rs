@@ -147,7 +147,7 @@ impl From<Msg> for Incoming {
     }
 }
 
-/// Launch the interactive TUI (bare `fbd`). Sets up the terminal, runs the event
+/// Launch the interactive TUI (bare `hank`). Sets up the terminal, runs the event
 /// loop against `roster`, and always restores the terminal before returning —
 /// even on error, so a failure never leaves the user's terminal wedged.
 pub fn run(paths: &Paths, roster: Config) -> Result<(), CliError> {
@@ -183,7 +183,7 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
     let mut app = initial_app(paths, roster, SystemTime::now());
     // In-flight background workers (refresh *and* detail), tracked so shutdown can
     // wait for the running bd subprocess to finish and release the hub lock —
-    // never orphaning a child that would keep mutating the hub after fbd's lock
+    // never orphaning a child that would keep mutating the hub after hank's lock
     // has dropped. Finished handles are pruned on each new spawn so the vec cannot
     // grow across a long session (the Slice 8 guard bounds live refresh workers to
     // one; detail fetches are short and pruned likewise).
@@ -555,14 +555,14 @@ fn gather_search_with_state(
         Some(lock) => lock,
         None => {
             return Err(
-                "search unavailable while another fbd is refreshing; retry shortly".to_string(),
+                "search unavailable while another hank is refreshing; retry shortly".to_string(),
             );
         }
     };
     let marker = refresh::read_hub_generation(paths)
         .map_err(|error| sanitize(&format!("search failed: {error}")))?;
     if marker.as_ref() != Some(&verified.hub_token) {
-        return Err("hub changed in another fbd process; refresh required".to_string());
+        return Err("hub changed in another hank process; refresh required".to_string());
     }
     let issues = bd
         .search(&hub, query)
@@ -783,7 +783,7 @@ fn gather_snapshot_with_metrics(
     let total_started = std::time::Instant::now();
     let mut warnings = Vec::new();
 
-    // Version gate: a bd whose schema fbd cannot vouch for yields no snapshot.
+    // Version gate: a bd whose schema hank cannot vouch for yields no snapshot.
     let version_was_uncached = state.compatibility.get().is_none();
     let version_started = std::time::Instant::now();
     let compatibility = state.compatibility.get_or_init(|| match bd.version() {
@@ -838,12 +838,12 @@ fn gather_snapshot_with_metrics(
             }
             synced
         }
-        // Another fbd holds the lock: keep the current view intact rather than
+        // Another hank holds the lock: keep the current view intact rather than
         // fetching a snapshot with no prefix map (which would re-attribute every
         // row to `unknown`, reset the age, and empty an active repo filter).
         // Returning `None` makes `reduce` retain the last-good rows.
         Err(RefreshError::AlreadyRefreshing) => {
-            warnings.push("another fbd is refreshing this hub; keeping the current view".into());
+            warnings.push("another hank is refreshing this hub; keeping the current view".into());
             metrics.total = total_started.elapsed();
             return (None, warnings);
         }
@@ -1017,6 +1017,27 @@ mod tests {
         }
     }
 
+    /// macOS can briefly retain an advisory flock after the refresh owner has
+    /// returned. Production correctly asks the user to retry; tests that need
+    /// the post-refresh state wait a bounded interval and still fail on a real
+    /// lock leak.
+    fn search_after_completed_refresh(
+        bd: &impl BdClient,
+        paths: &Paths,
+        query: &str,
+        state: &RuntimeRefreshState,
+    ) -> Result<(Vec<Row>, VerifiedAttribution), String> {
+        for _ in 0..100 {
+            match gather_search_with_state(bd, paths, query, state) {
+                Err(error) if error.contains("another hank is refreshing") => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                result => return result,
+            }
+        }
+        Err("completed refresh lock remained held for 100 ms".to_string())
+    }
+
     fn issue(id: &str, priority: i64, title: &str) -> Issue {
         Issue {
             id: id.to_string(),
@@ -1166,7 +1187,7 @@ mod tests {
     #[test]
     fn persist_repo_view_failure_is_reported_without_aborting() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("federated-beads"), "not a directory").unwrap();
+        fs::write(tmp.path().join("hank"), "not a directory").unwrap();
         let paths = Paths::with_base(tmp.path());
         let (tx, rx) = mpsc::channel();
         let mut handles = Vec::new();
@@ -1585,7 +1606,7 @@ mod tests {
                 .0
                 .is_some()
         );
-        let rows = gather_search_with_state(&bd, &paths, "found", &state)
+        let rows = search_after_completed_refresh(&bd, &paths, "found", &state)
             .expect("search succeeds")
             .0;
 
@@ -1618,7 +1639,7 @@ mod tests {
             .filter(|call| matches!(call, crate::bd::Call::IssuePrefix(_)))
             .count();
 
-        let rows = gather_search_with_state(&bd, &paths, "found", &state)
+        let rows = search_after_completed_refresh(&bd, &paths, "found", &state)
             .unwrap()
             .0;
 
@@ -1714,9 +1735,9 @@ mod tests {
                 .0
                 .is_some()
         );
-        fs::write(hub_dir(&paths).join(".fbd-generation"), "external").unwrap();
+        fs::write(hub_dir(&paths).join(".hank-generation"), "external").unwrap();
 
-        let error = gather_search_with_state(&bd, &paths, "found", &state)
+        let error = search_after_completed_refresh(&bd, &paths, "found", &state)
             .expect_err("a stale local map must fail closed");
 
         assert!(error.contains("refresh required"), "{error}");
@@ -1745,8 +1766,8 @@ mod tests {
                 .is_some()
         );
 
-        refresh::run(&bd, &config, &paths).expect("another fbd refresh");
-        let error = gather_search_with_state(&bd, &paths, "found", &state)
+        refresh::run(&bd, &config, &paths).expect("another hank refresh");
+        let error = search_after_completed_refresh(&bd, &paths, "found", &state)
             .expect_err("the stateless refresh must advance the marker");
 
         assert!(error.contains("refresh required"), "{error}");
@@ -1787,7 +1808,7 @@ mod tests {
 
         assert_ne!(current_generation, old_generation);
         assert!(state.map_for(old_generation).is_some());
-        let rows = gather_search_with_state(&second_bd, &paths, "found", &state)
+        let rows = search_after_completed_refresh(&second_bd, &paths, "found", &state)
             .unwrap()
             .0;
         assert_eq!(rows[0].attribution_generation, Some(current_generation));
@@ -1809,7 +1830,7 @@ mod tests {
             .rows[0]
             .attribution_generation
             .unwrap();
-        let marker = hub_dir(&paths).join(".fbd-generation");
+        let marker = hub_dir(&paths).join(".hank-generation");
         fs::remove_file(&marker).unwrap();
         fs::create_dir(&marker).unwrap();
 
@@ -2123,7 +2144,7 @@ mod tests {
 
     #[test]
     fn gather_snapshot_none_when_refresh_declined() {
-        // Another fbd holds the lock: gather must NOT fetch a mis-attributed
+        // Another hank holds the lock: gather must NOT fetch a mis-attributed
         // snapshot; it returns None so the caller keeps its last-good rows.
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
