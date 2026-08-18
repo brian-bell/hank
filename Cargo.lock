@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "hank"
-version = "0.1.0-rc.2"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
