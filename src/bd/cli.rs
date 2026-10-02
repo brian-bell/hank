@@ -6,7 +6,9 @@ use std::process::Command;
 
 use serde::de::DeserializeOwned;
 
-use super::{BdClient, BdError, BdErrorKind, BdVersion, Issue, IssueDetail, RepoSyncReport};
+use super::{
+    BdClient, BdError, BdErrorKind, BdVersion, Issue, IssueDetail, RepoSyncReport, WriteCommand,
+};
 
 /// The real [`BdClient`]: every method shells out to the `bd` binary on PATH.
 #[derive(Debug, Clone)]
@@ -63,6 +65,10 @@ impl BdCli {
     fn run_text(&self, args: Vec<OsString>) -> Result<String, BdError> {
         self.run_capture(&args, None)
             .map(|stdout| String::from_utf8_lossy(&stdout).into_owned())
+    }
+
+    fn run_write(&self, repo: &Path, command: &WriteCommand) -> Result<(), BdError> {
+        self.run_ok(argv_write(repo, command))
     }
 
     /// Spawn `bd <args>` (optionally with `cwd` as the working directory),
@@ -223,6 +229,28 @@ fn argv_show_json(hub: &Path, id: &str) -> Vec<OsString> {
     ]
 }
 
+fn argv_write(repo: &Path, command: &WriteCommand) -> Vec<OsString> {
+    let mut args = vec!["-C".into(), arg(repo)];
+    match command {
+        WriteCommand::Claim { id } => {
+            args.push("update".into());
+            args.push(id.as_str().into());
+            args.push("--claim".into());
+        }
+        WriteCommand::Close { id } => {
+            args.push("close".into());
+            args.push(id.as_str().into());
+        }
+        WriteCommand::SetPriority { id, priority } => {
+            args.push("update".into());
+            args.push(id.as_str().into());
+            args.push("--priority".into());
+            args.push(priority.to_string().into());
+        }
+    }
+    args
+}
+
 fn argv_search(hub: &Path, query: &str) -> Vec<OsString> {
     // `--query=<value>` keeps a flag-like query (e.g. `--help`) literal instead
     // of letting bd parse it as an option; `--limit 0` avoids the default 50 cap.
@@ -324,6 +352,24 @@ impl BdClient for BdCli {
 
     fn search(&self, hub: &Path, query: &str) -> Result<Vec<Issue>, BdError> {
         self.run_json(argv_search(hub, query)).map(drop_closed)
+    }
+
+    fn claim(&self, repo: &Path, id: &str) -> Result<(), BdError> {
+        self.run_write(repo, &WriteCommand::Claim { id: id.to_string() })
+    }
+
+    fn close(&self, repo: &Path, id: &str) -> Result<(), BdError> {
+        self.run_write(repo, &WriteCommand::Close { id: id.to_string() })
+    }
+
+    fn set_priority(&self, repo: &Path, id: &str, priority: i64) -> Result<(), BdError> {
+        self.run_write(
+            repo,
+            &WriteCommand::SetPriority {
+                id: id.to_string(),
+                priority,
+            },
+        )
     }
 }
 
@@ -532,5 +578,100 @@ esac
         .expect("issues parse");
         let ids: Vec<String> = drop_closed(issues).into_iter().map(|i| i.id).collect();
         assert_eq!(ids, ["ra-1", "ra-3", "ra-4"]);
+    }
+
+    /// A stand-in `bd` whose script body is `script`. The returned client spawns
+    /// that program; `$0.calls` is where a script can append the argv it saw.
+    #[cfg(unix)]
+    fn install_fake_bd(script: &str) -> (tempfile::TempDir, BdCli) {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let program = tmp.path().join("fake-bd");
+        fs::write(&program, script).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let bd = BdCli {
+            program: program.to_string_lossy().into_owned(),
+        };
+        (tmp, bd)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn triage_writes_shell_out_claim_close_and_set_priority() {
+        let (_tmp, bd) = install_fake_bd(
+            r#"#!/bin/sh
+for arg in "$@"; do
+  printf '%s\n' "$arg" >> "${0}.calls"
+done
+printf '\n' >> "${0}.calls"
+printf 'updated\n'
+exit 0
+"#,
+        );
+        let repo = Path::new("/tmp/repo");
+
+        assert_eq!(bd.claim(repo, "ra-1"), Ok(()));
+        assert_eq!(bd.close(repo, "ra-2"), Ok(()));
+        assert_eq!(bd.set_priority(repo, "ra-3", 0), Ok(()));
+
+        let calls = std::fs::read_to_string(format!("{}.calls", bd.program)).unwrap();
+        assert_eq!(
+            calls,
+            "\
+-C
+/tmp/repo
+update
+ra-1
+--claim
+
+-C
+/tmp/repo
+close
+ra-2
+
+-C
+/tmp/repo
+update
+ra-3
+--priority
+0
+
+"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn triage_write_shell_out_failure_is_nonzero_exit() {
+        let (_tmp, bd) = install_fake_bd(
+            r#"#!/bin/sh
+printf 'denied\n' >&2
+exit 1
+"#,
+        );
+        let repo = Path::new("/tmp/repo");
+        let program = bd.program.clone();
+
+        let claim = bd.claim(repo, "ra-1").expect_err("claim fails");
+        let close = bd.close(repo, "ra-2").expect_err("close fails");
+        let priority = bd
+            .set_priority(repo, "ra-3", 0)
+            .expect_err("priority fails");
+
+        assert_eq!(
+            claim.command,
+            format!("{program} -C /tmp/repo update ra-1 --claim")
+        );
+        assert_eq!(close.command, format!("{program} -C /tmp/repo close ra-2"));
+        assert_eq!(
+            priority.command,
+            format!("{program} -C /tmp/repo update ra-3 --priority 0")
+        );
+        for err in [&claim, &close, &priority] {
+            assert_eq!(err.stderr, "denied\n");
+            assert_eq!(err.kind, BdErrorKind::NonZeroExit { code: Some(1) });
+        }
     }
 }

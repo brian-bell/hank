@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::{BdClient, BdError, BdVersion, Issue, RepoSyncReport};
+use super::{BdClient, BdError, BdVersion, Issue, RepoSyncReport, WriteCommand};
 
 type CallHook = dyn Fn(&Call) + Send + Sync;
 
@@ -33,6 +33,7 @@ pub enum Call {
     Show(PathBuf, String),
     ShowIssue(PathBuf, String),
     Search(PathBuf, String),
+    Write(PathBuf, WriteCommand),
 }
 
 /// A programmable [`BdClient`] test double.
@@ -43,8 +44,9 @@ pub enum Call {
 /// without writing another fake. Each `with_*` response is **reused** across
 /// calls (not consumed). Unset slots default to something benign: the
 /// value-returning calls yield an empty list / bd 1.1.0 version / an empty show
-/// error, and the unit-returning calls (`init`/`repo_add`/`repo_remove`/`repo_sync`) yield
-/// `Ok(())`. `export` is keyed **per repo path** so one repo can fail while the
+/// error, and the unit-returning calls (`init`/`repo_add`/`repo_remove`/`repo_sync`,
+/// and the triage writes `claim`/`close`/`set_priority`) yield `Ok(())`.
+/// `export` is keyed **per repo path** so one repo can fail while the
 /// rest succeed. Every call is recorded and retrievable via
 /// [`FakeBdClient::calls`].
 #[doc(hidden)]
@@ -70,6 +72,9 @@ pub struct FakeBdClient {
     /// Successful `set_events_journal` writes, read back by
     /// `events_journal_enabled` ahead of the programmed values.
     journal_writes: Mutex<HashMap<PathBuf, bool>>,
+    claim: Option<Result<(), BdError>>,
+    close: Option<Result<(), BdError>>,
+    set_priority: Option<Result<(), BdError>>,
 }
 
 impl std::fmt::Debug for FakeBdClient {
@@ -216,6 +221,24 @@ impl FakeBdClient {
         self
     }
 
+    /// Program every `claim` call to fail. Unset, claim succeeds.
+    pub fn with_claim_err(mut self, err: BdError) -> Self {
+        self.claim = Some(Err(err));
+        self
+    }
+
+    /// Program every `close` call to fail. Unset, close succeeds.
+    pub fn with_close_err(mut self, err: BdError) -> Self {
+        self.close = Some(Err(err));
+        self
+    }
+
+    /// Program every `set_priority` call to fail. Unset, set_priority succeeds.
+    pub fn with_set_priority_err(mut self, err: BdError) -> Self {
+        self.set_priority = Some(Err(err));
+        self
+    }
+
     /// Run a thread-safe observer after each call is recorded. Tests use this
     /// for barriers, bounds, and panic injection without wall-clock sleeps.
     pub fn with_call_hook(mut self, hook: impl Fn(&Call) + Send + Sync + 'static) -> Self {
@@ -236,6 +259,17 @@ impl FakeBdClient {
         if let Some(hook) = &self.call_hook {
             hook(&call);
         }
+    }
+
+    fn run_write(&self, repo: &Path, command: WriteCommand) -> Result<(), BdError> {
+        let programmed = match &command {
+            WriteCommand::Claim { .. } => &self.claim,
+            WriteCommand::Close { .. } => &self.close,
+            WriteCommand::SetPriority { .. } => &self.set_priority,
+        };
+        let result = resolve(programmed, || ());
+        self.record(Call::Write(repo.to_path_buf(), command));
+        result
     }
 }
 
@@ -379,13 +413,31 @@ impl BdClient for FakeBdClient {
         self.record(Call::Search(hub.to_path_buf(), query.to_string()));
         resolve(&self.search, Vec::new)
     }
+
+    fn claim(&self, repo: &Path, id: &str) -> Result<(), BdError> {
+        self.run_write(repo, WriteCommand::Claim { id: id.to_string() })
+    }
+
+    fn close(&self, repo: &Path, id: &str) -> Result<(), BdError> {
+        self.run_write(repo, WriteCommand::Close { id: id.to_string() })
+    }
+
+    fn set_priority(&self, repo: &Path, id: &str, priority: i64) -> Result<(), BdError> {
+        self.run_write(
+            repo,
+            WriteCommand::SetPriority {
+                id: id.to_string(),
+                priority,
+            },
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bd::types::Issue;
-    use crate::bd::{BdClient, BdErrorKind};
+    use crate::bd::{BdClient, BdErrorKind, WriteCommand};
     use std::path::Path;
 
     fn sample_issue(id: &str) -> Issue {
@@ -522,6 +574,113 @@ mod tests {
                 .with_search_err(err())
                 .search(hub, "q")
                 .is_err()
+        );
+        assert!(
+            FakeBdClient::new()
+                .with_claim_err(err())
+                .claim(hub, "ra-1")
+                .is_err()
+        );
+        assert!(
+            FakeBdClient::new()
+                .with_close_err(err())
+                .close(hub, "ra-1")
+                .is_err()
+        );
+        assert!(
+            FakeBdClient::new()
+                .with_set_priority_err(err())
+                .set_priority(hub, "ra-1", 0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn claim_close_and_set_priority_succeed_and_record_the_write() {
+        let fake = FakeBdClient::new();
+        let repo = Path::new("/tmp/ra");
+
+        assert_eq!(fake.claim(repo, "ra-1"), Ok(()));
+        assert_eq!(fake.close(repo, "ra-2"), Ok(()));
+        assert_eq!(fake.set_priority(repo, "ra-3", 0), Ok(()));
+
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call::Write(
+                    repo.to_path_buf(),
+                    WriteCommand::Claim { id: "ra-1".into() },
+                ),
+                Call::Write(
+                    repo.to_path_buf(),
+                    WriteCommand::Close { id: "ra-2".into() },
+                ),
+                Call::Write(
+                    repo.to_path_buf(),
+                    WriteCommand::SetPriority {
+                        id: "ra-3".into(),
+                        priority: 0,
+                    },
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn claim_close_and_set_priority_return_programmed_command_failures() {
+        let fake = FakeBdClient::new()
+            .with_claim_err(BdError {
+                command: "bd -C /tmp/ra update ra-1 --claim".into(),
+                stderr: "claim failed".into(),
+                kind: BdErrorKind::NonZeroExit { code: Some(1) },
+            })
+            .with_close_err(BdError {
+                command: "bd -C /tmp/ra close ra-2".into(),
+                stderr: "close failed".into(),
+                kind: BdErrorKind::NonZeroExit { code: Some(2) },
+            })
+            .with_set_priority_err(BdError {
+                command: "bd -C /tmp/ra update ra-3 --priority 0".into(),
+                stderr: "priority failed".into(),
+                kind: BdErrorKind::NonZeroExit { code: Some(3) },
+            });
+        let repo = Path::new("/tmp/ra");
+
+        let claim = fake.claim(repo, "ra-1").expect_err("claim fails");
+        let close = fake.close(repo, "ra-2").expect_err("close fails");
+        let priority = fake
+            .set_priority(repo, "ra-3", 0)
+            .expect_err("priority fails");
+
+        assert_eq!(claim.command, "bd -C /tmp/ra update ra-1 --claim");
+        assert_eq!(claim.stderr, "claim failed");
+        assert_eq!(claim.kind, BdErrorKind::NonZeroExit { code: Some(1) });
+        assert_eq!(close.command, "bd -C /tmp/ra close ra-2");
+        assert_eq!(close.stderr, "close failed");
+        assert_eq!(close.kind, BdErrorKind::NonZeroExit { code: Some(2) });
+        assert_eq!(priority.command, "bd -C /tmp/ra update ra-3 --priority 0");
+        assert_eq!(priority.stderr, "priority failed");
+        assert_eq!(priority.kind, BdErrorKind::NonZeroExit { code: Some(3) });
+
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call::Write(
+                    repo.to_path_buf(),
+                    WriteCommand::Claim { id: "ra-1".into() },
+                ),
+                Call::Write(
+                    repo.to_path_buf(),
+                    WriteCommand::Close { id: "ra-2".into() },
+                ),
+                Call::Write(
+                    repo.to_path_buf(),
+                    WriteCommand::SetPriority {
+                        id: "ra-3".into(),
+                        priority: 0,
+                    },
+                ),
+            ]
         );
     }
 
