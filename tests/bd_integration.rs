@@ -14,7 +14,10 @@ use hank::cli::run_snapshot;
 use hank::config::{Config, Paths, RepoEntry};
 use hank::hub::{ensure_hub, hub_dir, read_hub_roster};
 use hank::{refresh, snapshot};
-use helpers::{bd_available, build_ready_fixture_repo, build_ready_fixture_repo_with_prefix};
+use helpers::{
+    bd_available, build_ready_fixture_repo, build_ready_fixture_repo_with_prefix,
+    create_closed_issue,
+};
 
 #[test]
 fn bd_probe_skips_cleanly_when_absent() {
@@ -358,6 +361,9 @@ fn search_end_to_end() {
     std::fs::create_dir_all(&rb).expect("mkdir rb");
     build_ready_fixture_repo_with_prefix(&ra, "ra");
     build_ready_fixture_repo_with_prefix(&rb, "rb");
+    // bd >= 1.3.0 includes closed issues in `bd search` by default; hank's search
+    // is for finding live work, so a closed match must not come back.
+    let closed = create_closed_issue(&ra, "Closed task");
 
     let paths = Paths::with_base(tmp.path());
     let roster = Config {
@@ -380,6 +386,16 @@ fn search_end_to_end() {
     assert!(
         !issues.is_empty(),
         "the fixture titles all contain 'task', so search finds them"
+    );
+    assert!(
+        issues
+            .iter()
+            .all(|i| i.id != closed && i.status != "closed"),
+        "closed issues are excluded from search: {:?}",
+        issues
+            .iter()
+            .map(|i| (&i.id, &i.status))
+            .collect::<Vec<_>>()
     );
     let snap = snapshot::attribute(issues, &refreshed.prefix_map, SystemTime::now());
 
