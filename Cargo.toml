@@ -1,5 +1,5 @@
 [package]
-name = "hank"
+name = "hank-tui"
 version = "0.1.0"
 default-run = "hank"
 edition = "2024"
@@ -23,6 +23,21 @@ exclude = [
     "/Makefile",
     "/tests/**",
 ]
+
+[lib]
+name = "hank"
+
+[[bin]]
+name = "hank"
+path = "src/main.rs"
+
+# `cargo binstall hank-tui` resolves the cargo-dist GitHub Release archives. The
+# archives are named after the binary (`hank-<target>.tar.xz`), not the crate,
+# so the URL is spelled out instead of using binstall's `{ name }` default.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/hank-{ target }{ archive-suffix }"
+bin-dir = "hank-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "txz"
 
 [dependencies]
 anyhow = "1.0.103"

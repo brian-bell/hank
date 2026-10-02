@@ -35,6 +35,14 @@ The installer places `hank` in `$CARGO_HOME/bin`, falling back to
 `~/.cargo/bin`, and tells you if that directory needs to be added to `PATH`.
 `bd` remains a separate runtime requirement.
 
+Rust users can install from crates.io. The crate is `hank-tui` (the name `hank`
+belongs to an unrelated crate); the binary it installs is still `hank`:
+
+```bash
+cargo binstall hank-tui   # prebuilt binary from the GitHub release, no compile
+cargo install hank-tui    # build from source
+```
+
 To build from a local source checkout instead:
 
 ```bash

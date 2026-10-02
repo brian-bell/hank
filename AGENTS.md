@@ -36,6 +36,22 @@ fixture repos with `bd` in tempdirs and prints an explicit `SKIP` line per test
 when `bd` is missing. CI runs the integration suite in its own job against a
 pinned `bd` and fails on any `SKIP`.
 
+## Releases and Publishing
+
+- Binaries: tag `vX.Y.Z` and cargo-dist (`dist-workspace.toml`,
+  `.github/workflows/release.yml`) builds the GitHub release archives named
+  `hank-<target>.tar.xz` plus the shell installer.
+- Crates.io: the package is `hank-tui` (`hank` is taken by an unrelated crate);
+  the binary and lib stay `hank` via `[[bin]]`/`[lib]` in `Cargo.toml`.
+  Publishing is manual by the owner (`cargo publish`, after the tag's release
+  exists) — no CI job or `CRATES_IO_TOKEN` secret yet; revisit if releases get
+  frequent.
+- `[package.metadata.binstall]` hardcodes the archive URL as `hank-<target>`
+  because binstall's default would use the crate name. If a cargo-dist release
+  ever names archives `hank-tui-<target>`, update `pkg-url`/`bin-dir`.
+- `cargo publish --dry-run` and `cargo package --list` must stay free of
+  `.beads`, `.claude`, `.github`, and agent files (see `exclude`).
+
 ## Architecture
 
 Fuller narrative in [docs/architecture.md](docs/architecture.md).

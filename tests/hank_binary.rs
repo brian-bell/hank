@@ -43,7 +43,7 @@ fn cargo_metadata_exposes_exactly_one_hank_binary() {
 
     let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let package = &metadata["packages"][0];
-    assert_eq!(package["name"], "hank");
+    assert_eq!(package["name"], "hank-tui");
     assert_eq!(package["version"], "0.1.0");
     assert_eq!(package["default_run"], "hank");
 
