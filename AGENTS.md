@@ -53,8 +53,9 @@ when `bd` is missing.
 - **Refresh**: async and TUI-owned — re-read the roster, export each repo +
   one hub sync on a worker thread (so `repos add`/`remove` in another terminal
   apply to an open TUI's next refresh); an advisory lock on `<hub>/.hank.lock`
-  serializes concurrent Hank instances. The `--watch` watcher still follows the
-  repos in the launch roster.
+  serializes concurrent Hank instances. Each reloaded roster is also handed to
+  the `--watch` watcher, which starts following any repo added since launch (a
+  removed repo keeps its follower until exit; its refreshes skip it).
 - **Live refresh (opt-in)**: `hank --watch` or `watch = true` in
   `config.toml`. `watch` follows each repo's events journal (bd >= 1.3.0) and
   sends `Msg::WatchChanged(RefreshScope)`; the runtime runs a scoped refresh

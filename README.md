@@ -58,7 +58,8 @@ Off by default. Launch with `hank --watch`, or set `watch = true` at the top of
 `config.toml`, and Hank follows each repo's `bd` events journal
 (`bd events tail --follow`) in the background. When a repo changes, Hank
 re-exports just that repo and re-syncs the hub, so the list updates without
-pressing `r`. The status bar shows `live` while the watcher runs.
+pressing `r`. The status bar shows `live` while the watcher runs. A repo added
+with `hank repos add` while the TUI is open is followed from its next refresh.
 
 The journal is per workspace and off by default. Turn it on in each repo you
 want followed (Hank is read-only and never does this for you):

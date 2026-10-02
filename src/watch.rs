@@ -542,10 +542,23 @@ pub fn batch_reports(
     }
 }
 
-/// A running watcher: one follower per repo plus the batcher.
+/// A running watcher: one follower per repo plus the batcher. Repos can join
+/// after start ([`Watcher::follow`]), so a roster that grows mid-session is
+/// watched without a restart.
 pub struct Watcher {
     stop: Arc<AtomicBool>,
     source: Arc<dyn JournalSource>,
+    checkpoints_file: PathBuf,
+    followers: Mutex<Followers>,
+}
+
+/// The mutable half of a [`Watcher`], behind one lock so a late
+/// [`Watcher::follow`] can never race [`Watcher::stop`].
+struct Followers {
+    /// Cloned into each new follower; `None` once stopped. The batcher exits
+    /// when this and every follower's clone are gone.
+    reports: Option<Sender<Report>>,
+    followed: BTreeSet<PathBuf>,
     handles: Vec<thread::JoinHandle<()>>,
 }
 
@@ -558,36 +571,76 @@ impl Watcher {
         checkpoints_file: PathBuf,
         deliver: impl FnMut(Msg) + Send + 'static,
     ) -> Watcher {
-        let stop = Arc::new(AtomicBool::new(false));
         let saved = Checkpoints::load(&checkpoints_file);
         let (tx, rx) = mpsc::channel::<Report>();
-        let mut handles = Vec::with_capacity(repos.len() + 1);
-        for repo in repos {
-            let source = Arc::clone(&source);
-            let tx = tx.clone();
-            let stop = Arc::clone(&stop);
+        let batcher = {
+            let checkpoints_file = checkpoints_file.clone();
+            thread::spawn(move || {
+                let mut deliver = deliver;
+                batch_reports(&rx, &checkpoints_file, saved, &mut deliver);
+            })
+        };
+        let watcher = Watcher {
+            stop: Arc::new(AtomicBool::new(false)),
+            source,
+            checkpoints_file,
+            followers: Mutex::new(Followers {
+                reports: Some(tx),
+                followed: BTreeSet::new(),
+                handles: vec![batcher],
+            }),
+        };
+        watcher.follow(repos);
+        watcher
+    }
+
+    /// Start a follower for each of `repos` not already followed. Each resumes
+    /// from its saved checkpoint, so a repo watched in an earlier session picks
+    /// up where it left off. A no-op once stopped. Repos are never unfollowed:
+    /// a repo dropped from the roster keeps its follower until shutdown, and
+    /// its reports only ask for a refresh the reloaded roster no longer runs.
+    pub fn follow(&self, repos: impl IntoIterator<Item = PathBuf>) {
+        let mut followers = self.followers.lock().expect("watch followers poisoned");
+        let Followers {
+            reports,
+            followed,
+            handles,
+        } = &mut *followers;
+        let Some(reports) = reports.as_ref() else {
+            return;
+        };
+        let new: Vec<PathBuf> = repos
+            .into_iter()
+            .filter(|repo| followed.insert(repo.clone()))
+            .collect();
+        if new.is_empty() {
+            return;
+        }
+        // Re-read rather than reuse the launch copy: the batcher has saved
+        // newer checkpoints since, though none for a repo it never followed.
+        let saved = Checkpoints::load(&self.checkpoints_file);
+        handles.retain(|handle| !handle.is_finished());
+        for repo in new {
+            let source = Arc::clone(&self.source);
+            let tx = reports.clone();
+            let stop = Arc::clone(&self.stop);
             let checkpoint = saved.repos.get(&repo).cloned();
             handles.push(thread::spawn(move || {
                 follow_repo(source.as_ref(), &repo, checkpoint, &tx, &stop);
             }));
         }
-        drop(tx);
-        handles.push(thread::spawn(move || {
-            let mut deliver = deliver;
-            batch_reports(&rx, &checkpoints_file, saved, &mut deliver);
-        }));
-        Watcher {
-            stop,
-            source,
-            handles,
-        }
     }
 
     /// Stop every follower (killing its `bd` child) and join all threads.
-    pub fn stop(self) {
+    pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        let handles = {
+            let mut followers = self.followers.lock().expect("watch followers poisoned");
+            followers.reports = None;
+            std::mem::take(&mut followers.handles)
+        };
         self.source.interrupt();
-        for handle in self.handles {
+        for handle in handles {
             let _ = handle.join();
         }
     }
@@ -974,5 +1027,65 @@ mod tests {
         batch_reports(&rx, &file, saved, &mut |msg| delivered.push(msg));
         assert_eq!(delivered, vec![Msg::WatchChanged(RefreshScope::Full)]);
         assert!(Checkpoints::load(&file).repos.is_empty());
+    }
+
+    /// A journal whose follows stay open until the watcher stops, recording
+    /// which repo each one was for and where it resumed.
+    struct ParkedJournal {
+        follows: Mutex<Sender<String>>,
+    }
+
+    impl JournalSource for ParkedJournal {
+        fn probe(&self, _repo: &Path, _since: u64) -> ProbeOutput {
+            ok(&record(7, "t7"))
+        }
+
+        fn follow(
+            &self,
+            repo: &Path,
+            since: u64,
+            stop: &AtomicBool,
+            _on_line: &mut dyn FnMut(&str),
+        ) {
+            let _ = self
+                .follows
+                .lock()
+                .unwrap()
+                .send(format!("{} {since}", repo.display()));
+            while !stop.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn interrupt(&self) {}
+    }
+
+    #[test]
+    fn watcher_follows_repos_added_after_start_once_each() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("events_checkpoints.json");
+        // /b was watched in an earlier session: it resumes, not replays.
+        let mut saved = Checkpoints::default();
+        saved.repos.insert(PathBuf::from("/b"), cp(7, "t7"));
+        saved.save(&file).unwrap();
+        let (tx, follows) = mpsc::channel();
+        let source = Arc::new(ParkedJournal {
+            follows: Mutex::new(tx),
+        });
+        let watcher = Watcher::start(source, vec![PathBuf::from("/a")], file, |_| {});
+
+        watcher.follow([PathBuf::from("/a"), PathBuf::from("/b")]);
+        let mut seen: Vec<String> = (0..2)
+            .map(|_| follows.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        seen.sort();
+        assert_eq!(seen, ["/a 0", "/b 7"]);
+
+        watcher.stop();
+        watcher.follow([PathBuf::from("/c")]);
+        assert!(
+            follows.try_recv().is_err(),
+            "no second /a follower, and nothing new after stop"
+        );
     }
 }
