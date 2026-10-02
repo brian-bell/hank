@@ -125,10 +125,6 @@ fn run() -> Result<(), CliError> {
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
 
-    if !matches!(&cli.command, Some(Command::Doctor | Command::Reset)) {
-        cli::prepare_legacy_state(&paths, &mut stderr)?;
-    }
-
     // Load the roster per command, not up front: `reset` needs only `Paths`, and
     // `doctor` loads it itself so it can report a bad config instead of aborting.
     // Only `snapshot` treats a malformed config as fatal.
