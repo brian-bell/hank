@@ -58,7 +58,9 @@ when `bd` is missing.
   sends `Msg::WatchChanged(RefreshScope)`; the runtime runs a scoped refresh
   (`refresh::run_scoped`) that exports only those repos and carries the others'
   verified prefixes. A pruned checkpoint (`events_journal_truncated`) widens to
-  a full refresh. Sync is not journaled, so launch and `r` stay full refreshes.
+  a full refresh. A failed watcher refresh is retried with backoff
+  (`Effect::RetryWatch`). Sync is not journaled, so launch and `r` stay full
+  refreshes.
 - **Pure state core**: the TUI is `reduce(&mut App, Msg) -> Vec<Effect>` with
   no I/O, clock, or threads inside; the runtime performs effects. `view::draw`
   is pure over `(App, now)` and tested with ratatui's `TestBackend`.

@@ -14,11 +14,16 @@ pub mod view;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::bd::ShowDetail;
 use crate::refresh::AttributionGeneration;
 use crate::snapshot::{Row, Snapshot};
+
+/// First delay before retrying a watcher refresh that failed; doubles per
+/// consecutive failure up to [`WATCH_RETRY_MAX`].
+const WATCH_RETRY_BASE: Duration = Duration::from_secs(5);
+const WATCH_RETRY_MAX: Duration = Duration::from_secs(300);
 
 /// Rows advanced by PageDown/PageUp in the detail pane. The view applies the
 /// final content-height clamp because the pure app core does not know dimensions.
@@ -199,6 +204,13 @@ pub enum Effect {
     WriteClipboard(String),
     /// Persist one newly confirmed repository view.
     PersistRepoView(RepoFilter),
+    /// A watcher refresh failed (another Hank held the hub lock, a sync
+    /// failed, ...): send `Msg::WatchChanged(scope)` again after `after`, so
+    /// the change the journal reported is not lost until the next write.
+    RetryWatch {
+        scope: RefreshScope,
+        after: Duration,
+    },
 }
 
 /// What a refresh re-exports before the hub sync.
@@ -485,6 +497,11 @@ pub struct App {
     /// A watcher refresh requested while another refresh was in flight. Runs
     /// when that cycle completes, merged with any later requests.
     pending_refresh: Option<RefreshScope>,
+    /// The scope of the in-flight refresh when the watcher started it (`None`
+    /// for launch and `r`), retried if that refresh fails.
+    watch_in_flight: Option<RefreshScope>,
+    /// Consecutive failed watcher refreshes, for the retry backoff.
+    watch_failures: u32,
     /// When the shown snapshot was fetched (injected upstream; Slice 9 renders
     /// its age against a `now`). `None` before the first snapshot.
     fetched_at: Option<SystemTime>,
@@ -557,6 +574,8 @@ impl App {
             watching: false,
             watch_warnings: Vec::new(),
             pending_refresh: None,
+            watch_in_flight: None,
+            watch_failures: 0,
             fetched_at: None,
             detail: None,
             detail_row: None,
@@ -605,6 +624,13 @@ impl App {
                 self.stale = true;
             }
             Msg::RefreshCompleted { snapshot, warnings } => {
+                let failed_watch = match (snapshot.is_some(), self.watch_in_flight.take()) {
+                    (false, scope) => scope,
+                    (true, _) => {
+                        self.watch_failures = 0;
+                        None
+                    }
+                };
                 if let Some(snapshot) = snapshot {
                     self.apply_snapshot(snapshot);
                 }
@@ -617,8 +643,20 @@ impl App {
                 // Changes the watcher saw mid-cycle may postdate this cycle's
                 // exports, so they get a cycle of their own.
                 if let Some(scope) = self.pending_refresh.take() {
+                    let scope = match failed_watch {
+                        Some(failed) => scope.merge(failed),
+                        None => scope,
+                    };
                     self.stale = true;
+                    self.watch_in_flight = Some(scope.clone());
                     return vec![Effect::Refresh(scope)];
+                }
+                if let Some(scope) = failed_watch {
+                    let after = WATCH_RETRY_BASE
+                        .saturating_mul(1 << self.watch_failures.min(6))
+                        .min(WATCH_RETRY_MAX);
+                    self.watch_failures = self.watch_failures.saturating_add(1);
+                    return vec![Effect::RetryWatch { scope, after }];
                 }
             }
             // `j`/`k` move the selection of the active browsing list (ready in
@@ -727,6 +765,7 @@ impl App {
                     return Vec::new();
                 }
                 self.stale = true;
+                self.watch_in_flight = Some(scope.clone());
                 return vec![Effect::Refresh(scope)];
             }
             Msg::WatchWarning(warning) => {
@@ -3280,5 +3319,63 @@ mod tests {
         app.reduce(completed(Vec::new()));
         assert_eq!(app.watch_warnings(), ["journal off for /a".to_string()]);
         assert!(app.status_warnings().is_empty());
+    }
+
+    fn failed() -> Msg {
+        Msg::RefreshCompleted {
+            snapshot: None,
+            warnings: vec!["another hank is refreshing this hub".into()],
+        }
+    }
+
+    #[test]
+    fn a_failed_watch_refresh_is_retried_with_backoff() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        app.reduce(Msg::WatchChanged(repos(&["/a"])));
+        assert_eq!(
+            app.reduce(failed()),
+            vec![Effect::RetryWatch {
+                scope: repos(&["/a"]),
+                after: Duration::from_secs(5)
+            }]
+        );
+        app.reduce(Msg::WatchChanged(repos(&["/a"])));
+        assert_eq!(
+            app.reduce(failed()),
+            vec![Effect::RetryWatch {
+                scope: repos(&["/a"]),
+                after: Duration::from_secs(10)
+            }],
+            "consecutive failures back off"
+        );
+        app.reduce(Msg::WatchChanged(repos(&["/a"])));
+        assert!(app.reduce(completed(vec![row("ra", "ra-1", 1)])).is_empty());
+        app.reduce(Msg::WatchChanged(repos(&["/a"])));
+        assert_eq!(
+            app.reduce(failed()),
+            vec![Effect::RetryWatch {
+                scope: repos(&["/a"]),
+                after: Duration::from_secs(5)
+            }],
+            "a success resets the backoff"
+        );
+    }
+
+    #[test]
+    fn a_failed_watch_refresh_folds_into_a_queued_one() {
+        let mut app = app_with(Vec::new());
+        app.reduce(Msg::WatchChanged(repos(&["/a"])));
+        app.reduce(Msg::WatchChanged(repos(&["/b"])));
+        assert_eq!(
+            app.reduce(failed()),
+            vec![Effect::Refresh(repos(&["/a", "/b"]))]
+        );
+    }
+
+    #[test]
+    fn a_failed_manual_refresh_is_not_retried() {
+        let mut app = app_with(Vec::new());
+        app.reduce(Msg::Refresh);
+        assert!(app.reduce(failed()).is_empty());
     }
 }

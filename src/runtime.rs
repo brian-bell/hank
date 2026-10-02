@@ -346,6 +346,16 @@ fn execute_effect(
             write_clipboard(&payload);
             return;
         }
+        // Detached on purpose: a sleeping retry must not hold up shutdown, and
+        // its send simply fails once the UI loop is gone.
+        Effect::RetryWatch { scope, after } => {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                thread::sleep(after);
+                let _ = tx.send(Msg::WatchChanged(scope).into());
+            });
+            return;
+        }
         Effect::PersistRepoView(repo) => {
             let result = ui_state::save(paths.ui_state_file(), &repo)
                 .map_err(|error| sanitize(&format!("couldn't save repository view: {error}")));
