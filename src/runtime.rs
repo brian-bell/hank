@@ -493,11 +493,18 @@ fn refresh_worker_with_state(
         RefreshScope::Repos(repos) => Some(repos.into_iter().collect::<HashSet<_>>()),
     };
     let mut metrics = PipelineMetrics::default();
-    let (snapshot, warnings) =
-        gather_snapshot_with_metrics(bd, &roster, &paths, &state, only.as_ref(), &mut metrics);
-    if let Some(snapshot) = &snapshot {
-        let _ = cache::save(paths.cache_file(), snapshot, &roster);
-    }
+    let (verified, warnings) =
+        gather_verified_snapshot(bd, &roster, &paths, &state, only.as_ref(), &mut metrics);
+    let snapshot = verified.map(|(snapshot, hub_token)| {
+        // Cache only while the hub this snapshot was read from is still current:
+        // a `hank reset` (or a newer refresh's hub) since the sync must win over
+        // this worker's late, lock-free write, or the next launch would paint the
+        // discarded hub's rows from disk.
+        let _ = cache::save_if(paths.cache_file(), &snapshot, &roster, || {
+            refresh::read_hub_generation(&paths).ok().flatten().as_ref() == Some(&hub_token)
+        });
+        snapshot
+    });
     let _ = tx.send(Msg::RefreshCompleted { snapshot, warnings }.into());
 }
 
@@ -889,6 +896,21 @@ fn gather_snapshot_with_metrics(
     only: Option<&HashSet<PathBuf>>,
     metrics: &mut PipelineMetrics,
 ) -> (Option<Snapshot>, Vec<String>) {
+    let (verified, warnings) = gather_verified_snapshot(bd, roster, paths, state, only, metrics);
+    (verified.map(|(snapshot, _)| snapshot), warnings)
+}
+
+/// [`gather_snapshot_with_metrics`], also returning the hub generation token
+/// the snapshot was read under, so a caller can tell whether that hub is still
+/// current before persisting the snapshot.
+fn gather_verified_snapshot(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    state: &RuntimeRefreshState,
+    only: Option<&HashSet<PathBuf>>,
+    metrics: &mut PipelineMetrics,
+) -> (Option<(Snapshot, HubGenerationToken)>, Vec<String>) {
     let total_started = std::time::Instant::now();
     let mut warnings = Vec::new();
 
@@ -980,7 +1002,7 @@ fn gather_snapshot_with_metrics(
     let generation = AttributionGeneration::new(generation_state.next_generation);
     let verified = VerifiedAttribution {
         generation,
-        hub_token,
+        hub_token: hub_token.clone(),
         candidate: synced.candidate().clone(),
     };
     state.register_map(generation, Arc::clone(&verified.candidate.prefix_map));
@@ -990,11 +1012,14 @@ fn gather_snapshot_with_metrics(
     metrics.calls.ready = 1;
     let result = match bd.ready(&hub) {
         Ok(issues) => (
-            Some(snapshot::attribute_with_generation(
-                issues,
-                &synced.outcome().prefix_map,
-                synced.outcome().synced_at,
-                generation,
+            Some((
+                snapshot::attribute_with_generation(
+                    issues,
+                    &synced.outcome().prefix_map,
+                    synced.outcome().synced_at,
+                    generation,
+                ),
+                hub_token,
             )),
             warnings,
         ),
@@ -1590,6 +1615,36 @@ mod tests {
         assert_eq!(
             cached, serializable_snapshot,
             "the cache preserves every serialized snapshot field"
+        );
+    }
+
+    #[test]
+    fn refresh_task_does_not_resurrect_the_cache_after_a_concurrent_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let cache_file = paths.cache_file().to_path_buf();
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        // `hank reset` in another terminal lands while this refresh's lock-free
+        // `bd ready` is still running, i.e. after sync but before the cache write.
+        let reset_paths = paths.clone();
+        let bd = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "Ready one")])
+            .with_call_hook(move |call| {
+                if matches!(call, crate::bd::Call::Ready(_)) {
+                    crate::cli::run_reset(&reset_paths, &mut io::sink()).unwrap();
+                }
+            });
+        let cfg = roster(&[&ra]);
+        let (tx, rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || refresh_worker(bd, cfg, paths, tx));
+        assert_eq!(recv_msg(&rx), Msg::RefreshStarted);
+        assert!(matches!(recv_msg(&rx), Msg::RefreshCompleted { .. }));
+        handle.join().unwrap();
+
+        assert!(
+            !cache_file.exists(),
+            "a refresh that read the pre-reset hub must not write the cache after reset cleared it"
         );
     }
 
