@@ -158,6 +158,26 @@ pub enum Msg {
     /// A live-refresh problem worth surfacing (a repo's journal is off, `bd`
     /// can't follow it). Kept across refresh cycles; shown once per text.
     WatchWarning(String),
+    /// How each roster repo fared in a refresh whose hub sync succeeded (runtime
+    /// worker → app), sent just before that cycle's [`Msg::RefreshCompleted`].
+    /// `synced_at` is the sync's wall-clock time. Folded into
+    /// [`App::repo_health`]; never touches the in-flight flag.
+    RepoSyncs {
+        synced_at: SystemTime,
+        repos: Vec<RepoSync>,
+    },
+    /// Open or close the sync-health panel (`h`). Opening runs `hank doctor`
+    /// through [`Effect::CheckHealth`].
+    ToggleHealth,
+    /// Scroll the open health panel by this many rows (negative scrolls up).
+    HealthScroll(i16),
+    /// The health panel's `hank doctor` run concluded. `token` echoes
+    /// [`Effect::CheckHealth`] so a run from an earlier opening is dropped;
+    /// `report` is doctor's output, or a pre-formatted, sanitized failure.
+    HealthReport {
+        token: u64,
+        report: Result<String, String>,
+    },
     /// Leave the current sub-mode back to the list (`Esc`). No-op in `List`;
     /// Slices 10/11 return from `Detail`/`Search`.
     Back,
@@ -204,6 +224,9 @@ pub enum Effect {
     WriteClipboard(String),
     /// Persist one newly confirmed repository view.
     PersistRepoView(RepoFilter),
+    /// Run `hank doctor` off the UI thread for the health panel and send its
+    /// output back as [`Msg::HealthReport`] echoing `token`.
+    CheckHealth { token: u64 },
     /// A watcher refresh failed (another Hank held the hub lock, a sync
     /// failed, ...): send `Msg::WatchChanged(scope)` again after `after`, so
     /// the change the journal reported is not lost until the next write.
@@ -236,6 +259,74 @@ impl RefreshScope {
     }
 }
 
+/// How one roster repo fared in a refresh cycle, as the runtime reports it.
+/// Failures are pre-formatted so this core stays free of `refresh` error types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoSync {
+    /// The resolved roster path.
+    pub path: PathBuf,
+    /// The repo's id prefix (what [`Row::repo_id`] carries), when known.
+    pub prefix: Option<String>,
+    pub outcome: RepoSyncOutcome,
+}
+
+/// The result of one repo's part in a refresh cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoSyncOutcome {
+    /// Exported cleanly; the hub now holds its latest issues.
+    Exported,
+    /// A scoped (live) refresh skipped it because its journal reported no
+    /// change, so its last export is still current.
+    Carried,
+    /// It failed this cycle; the hub keeps whatever it last exported. The
+    /// message is pre-formatted and sanitized.
+    Failed(String),
+}
+
+/// One roster repo's freshness, accumulated across refresh cycles, for the
+/// health panel and the stale-repo flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoHealth {
+    /// The resolved roster path.
+    pub path: PathBuf,
+    /// The repo's id prefix, when known.
+    pub prefix: Option<String>,
+    /// When the hub last took a clean export of this repo (that cycle's sync
+    /// time). `None` if it has not exported cleanly since launch.
+    pub synced_at: Option<SystemTime>,
+    /// Why the latest attempt failed; `None` after a clean one.
+    pub problem: Option<String>,
+}
+
+impl RepoHealth {
+    /// Whether the hub's copy of this repo is behind: its latest refresh failed,
+    /// so it shows an older export (or nothing).
+    pub fn is_stale(&self) -> bool {
+        self.problem.is_some()
+    }
+}
+
+/// The `hank doctor` part of the health panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DoctorState {
+    /// Doctor is running.
+    Running,
+    /// Doctor's output.
+    Done(String),
+    /// Doctor could not run; pre-formatted and sanitized.
+    Failed(String),
+}
+
+/// The open sync-health panel.
+#[derive(Debug, Clone)]
+struct HealthPanel {
+    /// The generation of this opening's doctor run.
+    token: u64,
+    doctor: DoctorState,
+    /// Vertical scroll offset (rows); the view clamps it to the content.
+    scroll: u16,
+}
+
 /// Which screen the app is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
@@ -256,6 +347,7 @@ pub enum InputContext {
     Normal,
     SearchEditing,
     RepoPicker,
+    Health,
 }
 
 /// The detail pane's state for one issue id.
@@ -494,6 +586,12 @@ pub struct App {
     watching: bool,
     /// Live-refresh warnings; unlike `status_warnings` these outlive a cycle.
     watch_warnings: Vec<String>,
+    /// Per-repo freshness from the latest successful sync, in roster order.
+    repo_health: Vec<RepoHealth>,
+    /// The sync-health panel overlay, `Some` while open.
+    health: Option<HealthPanel>,
+    /// A monotonic generation stamped on each health-panel doctor run.
+    health_seq: u64,
     /// A watcher refresh requested while another refresh was in flight. Runs
     /// when that cycle completes, merged with any later requests.
     pending_refresh: Option<RefreshScope>,
@@ -573,6 +671,9 @@ impl App {
             status_warnings: Vec::new(),
             watching: false,
             watch_warnings: Vec::new(),
+            repo_health: Vec::new(),
+            health: None,
+            health_seq: 0,
             pending_refresh: None,
             watch_in_flight: None,
             watch_failures: 0,
@@ -615,6 +716,10 @@ impl App {
         // underlying detail/search mode.
         if self.repo_picker.is_some() && matches!(&msg, Msg::Back) {
             self.repo_picker = None;
+            return Vec::new();
+        }
+        if self.health.is_some() && matches!(&msg, Msg::Back) {
+            self.health = None;
             return Vec::new();
         }
         match msg {
@@ -703,7 +808,11 @@ impl App {
                 }
             }
             Msg::DetailScrollBounds { max_scroll } => {
-                if self.view_mode == ViewMode::Detail {
+                // The view reports the bounds of whatever scrolls on top: the
+                // health panel when open, else the detail pane.
+                if let Some(health) = &mut self.health {
+                    health.scroll = health.scroll.min(max_scroll);
+                } else if self.view_mode == ViewMode::Detail {
                     self.detail_scroll = self.detail_scroll.min(max_scroll);
                 }
             }
@@ -771,6 +880,35 @@ impl App {
             Msg::WatchWarning(warning) => {
                 if !self.watch_warnings.contains(&warning) {
                     self.watch_warnings.push(warning);
+                }
+            }
+            Msg::RepoSyncs { synced_at, repos } => self.apply_repo_syncs(synced_at, repos),
+            Msg::ToggleHealth => {
+                if self.health.take().is_some() {
+                    return Vec::new();
+                }
+                self.health_seq += 1;
+                let token = self.health_seq;
+                self.health = Some(HealthPanel {
+                    token,
+                    doctor: DoctorState::Running,
+                    scroll: 0,
+                });
+                return vec![Effect::CheckHealth { token }];
+            }
+            Msg::HealthScroll(delta) => {
+                if let Some(health) = &mut self.health {
+                    health.scroll = health.scroll.saturating_add_signed(delta);
+                }
+            }
+            Msg::HealthReport { token, report } => {
+                if let Some(health) = &mut self.health
+                    && health.token == token
+                {
+                    health.doctor = match report {
+                        Ok(output) => DoctorState::Done(output),
+                        Err(message) => DoctorState::Failed(message),
+                    };
                 }
             }
             Msg::OpenDetail => {
@@ -964,6 +1102,43 @@ impl App {
             Msg::Quit => self.done = true,
         }
         Vec::new()
+    }
+
+    /// Fold one successful sync's per-repo results into [`App::repo_health`].
+    /// The new list follows the reported roster, so a removed repo drops out.
+    /// A clean export is fresh as of `synced_at`; a failure keeps the last
+    /// clean time; a carried-over repo is as fresh as before, and current as of
+    /// `synced_at` unless its last attempt failed.
+    fn apply_repo_syncs(&mut self, synced_at: SystemTime, repos: Vec<RepoSync>) {
+        let mut previous: HashMap<PathBuf, RepoHealth> = self
+            .repo_health
+            .drain(..)
+            .map(|health| (health.path.clone(), health))
+            .collect();
+        self.repo_health = repos
+            .into_iter()
+            .map(|repo| {
+                let before = previous.remove(&repo.path);
+                let last_clean = before.as_ref().and_then(|health| health.synced_at);
+                let (synced_at, problem) = match repo.outcome {
+                    RepoSyncOutcome::Exported => (Some(synced_at), None),
+                    RepoSyncOutcome::Carried => match before {
+                        Some(RepoHealth {
+                            problem: Some(problem),
+                            ..
+                        }) => (last_clean, Some(problem)),
+                        _ => (Some(synced_at), None),
+                    },
+                    RepoSyncOutcome::Failed(message) => (last_clean, Some(message)),
+                };
+                RepoHealth {
+                    path: repo.path,
+                    prefix: repo.prefix,
+                    synced_at,
+                    problem,
+                }
+            })
+            .collect();
     }
 
     /// Move the selection of the list behind the open detail pane (`j`/`k` in
@@ -1389,6 +1564,8 @@ impl App {
     pub fn input_context(&self) -> InputContext {
         if self.repo_picker.is_some() {
             InputContext::RepoPicker
+        } else if self.health.is_some() {
+            InputContext::Health
         } else if self.search_editing() {
             InputContext::SearchEditing
         } else {
@@ -1422,12 +1599,39 @@ impl App {
     pub fn copy_flash(&self) -> Option<&str> {
         self.copy_flash.as_deref()
     }
+
+    /// Per-repo freshness from the latest successful sync, in roster order.
+    /// Empty until the first sync completes.
+    pub fn repo_health(&self) -> &[RepoHealth] {
+        &self.repo_health
+    }
+
+    /// The repos whose latest refresh failed, so the hub shows an older export.
+    pub fn stale_repos(&self) -> impl Iterator<Item = &RepoHealth> {
+        self.repo_health.iter().filter(|health| health.is_stale())
+    }
+
+    /// Whether the sync-health panel is open.
+    pub fn health_open(&self) -> bool {
+        self.health.is_some()
+    }
+
+    /// The health panel's doctor state, when the panel is open.
+    pub fn health_doctor(&self) -> Option<&DoctorState> {
+        self.health.as_ref().map(|health| &health.doctor)
+    }
+
+    /// The health panel's requested scroll offset (0 when closed).
+    pub fn health_scroll(&self) -> u16 {
+        self.health.as_ref().map_or(0, |health| health.scroll)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bd::Issue;
+    use std::path::Path;
     use std::time::{Duration, UNIX_EPOCH};
 
     fn row(repo: &str, id: &str, priority: i64) -> Row {
@@ -3377,5 +3581,147 @@ mod tests {
         let mut app = app_with(Vec::new());
         app.reduce(Msg::Refresh);
         assert!(app.reduce(failed()).is_empty());
+    }
+
+    fn sync(path: &str, outcome: RepoSyncOutcome) -> RepoSync {
+        RepoSync {
+            path: PathBuf::from(path),
+            prefix: Some(path.trim_start_matches('/').to_string()),
+            outcome,
+        }
+    }
+
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn health<'a>(app: &'a App, path: &str) -> &'a RepoHealth {
+        app.repo_health()
+            .iter()
+            .find(|health| health.path == Path::new(path))
+            .expect("repo reported")
+    }
+
+    #[test]
+    fn repo_syncs_track_freshness_and_failures_across_cycles() {
+        let mut app = app_with(Vec::new());
+        app.reduce(Msg::RepoSyncs {
+            synced_at: at(100),
+            repos: vec![
+                sync("/a", RepoSyncOutcome::Exported),
+                sync("/b", RepoSyncOutcome::Exported),
+            ],
+        });
+        assert_eq!(app.stale_repos().count(), 0);
+        assert_eq!(health(&app, "/b").synced_at, Some(at(100)));
+
+        // /b fails: the hub keeps its older export, so it is stale since 100.
+        app.reduce(Msg::RepoSyncs {
+            synced_at: at(200),
+            repos: vec![
+                sync("/a", RepoSyncOutcome::Exported),
+                sync("/b", RepoSyncOutcome::Failed("export failed".into())),
+            ],
+        });
+        assert_eq!(health(&app, "/a").synced_at, Some(at(200)));
+        let b = health(&app, "/b");
+        assert_eq!(b.synced_at, Some(at(100)), "last clean sync kept");
+        assert_eq!(b.problem.as_deref(), Some("export failed"));
+        assert_eq!(app.stale_repos().count(), 1);
+
+        // A live refresh that carries /b over leaves it stale; one that
+        // carries a healthy /a keeps it current.
+        app.reduce(Msg::RepoSyncs {
+            synced_at: at(300),
+            repos: vec![
+                sync("/a", RepoSyncOutcome::Carried),
+                sync("/b", RepoSyncOutcome::Carried),
+            ],
+        });
+        assert_eq!(health(&app, "/a").synced_at, Some(at(300)));
+        assert!(health(&app, "/b").is_stale(), "carrying over never clears");
+        assert_eq!(health(&app, "/b").synced_at, Some(at(100)));
+
+        // /b recovers; a repo removed from the roster drops out.
+        app.reduce(Msg::RepoSyncs {
+            synced_at: at(400),
+            repos: vec![sync("/b", RepoSyncOutcome::Exported)],
+        });
+        assert_eq!(app.repo_health().len(), 1);
+        assert_eq!(health(&app, "/b").synced_at, Some(at(400)));
+        assert_eq!(app.stale_repos().count(), 0);
+    }
+
+    #[test]
+    fn a_repo_failing_its_first_sync_was_never_synced() {
+        let mut app = app_with(Vec::new());
+        app.reduce(Msg::RepoSyncs {
+            synced_at: at(100),
+            repos: vec![sync("/a", RepoSyncOutcome::Failed("gone".into()))],
+        });
+        let a = health(&app, "/a");
+        assert_eq!(a.synced_at, None);
+        assert!(a.is_stale());
+    }
+
+    #[test]
+    fn repo_syncs_leave_the_refresh_in_flight() {
+        let mut app = app_with(Vec::new());
+        app.reduce(Msg::Refresh);
+        app.reduce(Msg::RepoSyncs {
+            synced_at: at(100),
+            repos: vec![sync("/a", RepoSyncOutcome::Exported)],
+        });
+        assert!(app.is_stale(), "only RefreshCompleted ends the cycle");
+        assert!(app.reduce(Msg::Refresh).is_empty(), "still deduped");
+    }
+
+    #[test]
+    fn health_panel_opens_runs_doctor_and_closes() {
+        let mut app = app_with(Vec::new());
+        assert_eq!(
+            app.reduce(Msg::ToggleHealth),
+            vec![Effect::CheckHealth { token: 1 }]
+        );
+        assert!(app.health_open());
+        assert_eq!(app.input_context(), InputContext::Health);
+        assert_eq!(app.health_doctor(), Some(&DoctorState::Running));
+
+        app.reduce(Msg::HealthReport {
+            token: 1,
+            report: Ok("gate: OK".into()),
+        });
+        assert_eq!(
+            app.health_doctor(),
+            Some(&DoctorState::Done("gate: OK".into()))
+        );
+
+        assert!(app.reduce(Msg::Back).is_empty());
+        assert!(!app.health_open(), "esc closes the panel");
+        assert_eq!(app.view_mode(), ViewMode::List, "and nothing beneath it");
+        assert_eq!(app.input_context(), InputContext::Normal);
+
+        // A late report from the closed opening is dropped by the reopened one.
+        app.reduce(Msg::ToggleHealth);
+        app.reduce(Msg::HealthReport {
+            token: 1,
+            report: Err("late".into()),
+        });
+        assert_eq!(app.health_doctor(), Some(&DoctorState::Running));
+        assert!(app.reduce(Msg::ToggleHealth).is_empty(), "h closes it too");
+        assert!(!app.health_open());
+    }
+
+    #[test]
+    fn health_panel_scroll_saturates_and_is_clamped_by_the_view() {
+        let mut app = app_with(Vec::new());
+        app.reduce(Msg::ToggleHealth);
+        app.reduce(Msg::HealthScroll(-1));
+        assert_eq!(app.health_scroll(), 0);
+        app.reduce(Msg::HealthScroll(10));
+        app.reduce(Msg::DetailScrollBounds { max_scroll: 4 });
+        assert_eq!(app.health_scroll(), 4);
+        app.reduce(Msg::HealthScroll(-1));
+        assert_eq!(app.health_scroll(), 3);
     }
 }

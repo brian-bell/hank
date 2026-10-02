@@ -112,6 +112,7 @@ every launch is also a full refresh.
 | `y`            | Copy `cd <repo> && bd show <id>` for the selected issue   |
 | `Y`            | Copy a markdown block (title / id / repo / description)   |
 | `r`            | Refresh (re-export every repo, re-sync the hub)           |
+| `h`            | Open / close the sync-health panel                        |
 | `Esc`          | Leave the current sub-mode (detail / search) → list       |
 | `q`            | Quit                                                      |
 
@@ -120,6 +121,14 @@ results. Move its pending choice with `j`/`k` or the arrow keys, confirm with
 `Enter`, or cancel with `Esc`. A confirmed repository view applies globally to
 both ready and search results and is restored on the next launch. `All repos`
 is used on first run and whenever saved UI state is missing or invalid.
+
+The sync-health panel (`h`) lists each roster repo with how fresh the hub's
+copy is ("synced 3m ago") and, when a repo's latest refresh failed, flags it
+**STALE** with the reason; the hub keeps that repo's last good export until a
+refresh succeeds. Below that it shows `hank doctor`'s findings (bd version gate,
+paths, per-repo prefix and journal state), run fresh each time the panel opens.
+Stale repos are also flagged on their list headers and counted in the status
+bar. Scroll the panel with `j`/`k` or `PgUp`/`PgDn`; close it with `Esc` or `h`.
 
 `y`/`Y` place the text on your system clipboard via an **OSC 52** terminal
 escape — no native clipboard dependency, and it works over ssh. For an
