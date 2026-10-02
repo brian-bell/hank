@@ -50,9 +50,11 @@ when `bd` is missing.
 - **Repo attribution**: bd's JSON has no source-repo field, so Hank maps issue
   ids to repos by longest id prefix (from each repo's effective `bd` prefix),
   flagging collisions.
-- **Refresh**: async and TUI-owned — export each repo + one hub sync on a
-  worker thread; an advisory lock on `<hub>/.hank.lock` serializes concurrent
-  Hank instances.
+- **Refresh**: async and TUI-owned — re-read the roster, export each repo +
+  one hub sync on a worker thread (so `repos add`/`remove` in another terminal
+  apply to an open TUI's next refresh); an advisory lock on `<hub>/.hank.lock`
+  serializes concurrent Hank instances. The `--watch` watcher still follows the
+  repos in the launch roster.
 - **Live refresh (opt-in)**: `hank --watch` or `watch = true` in
   `config.toml`. `watch` follows each repo's events journal (bd >= 1.3.0) and
   sends `Msg::WatchChanged(RefreshScope)`; the runtime runs a scoped refresh
