@@ -465,6 +465,12 @@ pub fn run_repos_remove(
 ) -> Result<(), CliError> {
     let canonical = store_path(path);
     let expanded = expand_tilde(path);
+    let matches = |p: &Path| store_path(p) == canonical || p == expanded;
+    // Gate bd before touching the roster, so an unsupported bd fails closed with
+    // nothing changed. A hub that does not track the repo needs no bd at all.
+    if !hub::tracked_repos_matching(paths, matches)?.is_empty() {
+        version_gate(&bd.version()?).map_err(CliError::VersionGate)?;
+    }
     let mut roster = load_roster(paths)?;
     let before = roster.repos.len();
     roster
@@ -484,12 +490,7 @@ pub fn run_repos_remove(
             sanitize(&expanded.display().to_string())
         )?;
     }
-    prune_hub(
-        bd,
-        paths,
-        |p| store_path(p) == canonical || p == expanded,
-        out,
-    )
+    prune_hub(bd, paths, matches, out)
 }
 
 /// Drop the hub repos `matches` selects, under the hub lock. Skips the lock (and
@@ -1317,7 +1318,7 @@ mod tests {
         let mut out = Vec::new();
         run_repos_remove(&bd, &paths, &ra, &mut out).expect("remove ok");
 
-        assert_eq!(bd.calls(), vec![Call::RepoRemove(hub, ra)]);
+        assert_eq!(bd.calls(), vec![Call::Version, Call::RepoRemove(hub, ra)]);
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("dropped"), "the prune is reported: {out}");
         assert!(!out.contains("hank reset"), "no reset hint: {out}");
@@ -1350,7 +1351,7 @@ mod tests {
         let mut out = Vec::new();
         run_repos_remove(&bd, &paths, &ra, &mut out).expect("remove ok");
 
-        assert_eq!(bd.calls(), vec![Call::RepoRemove(hub, ra)]);
+        assert_eq!(bd.calls(), vec![Call::Version, Call::RepoRemove(hub, ra)]);
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("not in the roster"), "{out}");
         assert!(out.contains("dropped"), "{out}");
@@ -1369,12 +1370,35 @@ mod tests {
         let mut out = Vec::new();
         run_repos_remove(&bd, &paths, &ra, &mut out).expect("a busy hub is not fatal");
 
-        assert!(bd.calls().is_empty(), "hub untouched: {:?}", bd.calls());
+        assert!(
+            !bd.calls().iter().any(|c| matches!(c, Call::RepoRemove(..))),
+            "hub untouched: {:?}",
+            bd.calls()
+        );
         assert!(reload(&paths).repos.is_empty(), "roster still updated");
         assert!(
             String::from_utf8(out).unwrap().contains("re-run"),
             "says how to finish the prune"
         );
+    }
+
+    #[test]
+    fn remove_gates_bd_before_changing_anything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        run_repos_add(&paths, &ra, &mut Vec::new()).unwrap();
+        seed_hub(&paths, &[&ra.canonicalize().unwrap()]);
+        let bd = FakeBdClient::new().with_version(version("1.0.0", 1));
+
+        let result = run_repos_remove(&bd, &paths, &ra, &mut Vec::new());
+
+        assert!(
+            matches!(result, Err(CliError::VersionGate(_))),
+            "{result:?}"
+        );
+        assert_eq!(bd.calls(), vec![Call::Version], "no hub mutation");
+        assert_eq!(reload(&paths).repos.len(), 1, "roster unchanged");
     }
 
     #[test]
