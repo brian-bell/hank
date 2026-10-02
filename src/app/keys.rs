@@ -23,6 +23,14 @@ pub fn map_key(event: KeyEvent, context: InputContext) -> Option<Msg> {
     if event.kind == KeyEventKind::Release {
         return None;
     }
+    if context == InputContext::TriageConfirm {
+        return match event.code {
+            KeyCode::Enter => Some(Msg::ConfirmTriage),
+            KeyCode::Esc => Some(Msg::CancelTriage),
+            KeyCode::Char('q') => Some(Msg::Quit),
+            _ => None,
+        };
+    }
     if context == InputContext::SearchEditing {
         return match event.code {
             KeyCode::Char(c) => Some(Msg::SearchInput(c)),
@@ -268,6 +276,24 @@ mod tests {
         assert_eq!(map_key(press(KeyCode::Char('r')), context), None);
         assert_eq!(map_key(press(KeyCode::Char('p')), context), None);
         assert_eq!(map_key(press(KeyCode::Char('/')), context), None);
+    }
+
+    #[test]
+    fn triage_confirm_context_only_confirms_cancels_or_quits() {
+        let context = InputContext::TriageConfirm;
+        assert_eq!(
+            map_key(press(KeyCode::Enter), context),
+            Some(Msg::ConfirmTriage)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Esc), context),
+            Some(Msg::CancelTriage)
+        );
+        assert_eq!(map_key(press(KeyCode::Char('q')), context), Some(Msg::Quit));
+        assert_eq!(map_key(press(KeyCode::Char('y')), context), None);
+        assert_eq!(map_key(press(KeyCode::Char('r')), context), None);
+        assert_eq!(map_key(press(KeyCode::Char('j')), context), None);
+        assert_eq!(map_key(press(KeyCode::Char('p')), context), None);
     }
 
     #[test]
