@@ -5,6 +5,7 @@
 //! Grouping is a view concern (Slice 9): rows merely *carry* `repo_name` so a
 //! view can group by it. See `plans/slices/slice-5.md`.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;
@@ -54,7 +55,7 @@ pub struct Snapshot {
 /// Fetch the hub's ready issues, attribute each to its source repo via
 /// `prefix_map`, and sort for display: priority ascending (0 = highest, first),
 /// then `dependent_count` descending (unblocks-the-most-work first, absent
-/// last), then `updated_at` descending (newest first, absent last), then id
+/// last), then `updated_at` descending (newest instant first, absent last), then id
 /// ascending (a total, deterministic order for the serialized output).
 ///
 /// `fetched_at` is supplied by the caller (typically `RefreshOutcome::synced_at`
@@ -149,15 +150,115 @@ fn attribute_with_optional_generation(
             // the most downstream work. Reversed operands => descending;
             // `None` (bd omitted the count) sorts last, same as updated_at.
             .then_with(|| b.issue.dependent_count.cmp(&a.issue.dependent_count))
-            // `updated_at` is bd's RFC3339 UTC-`Z`, whole-second timestamp, and
-            // every row in one `bd ready` call shares that format, so a lexical
-            // string compare orders them chronologically. Reversed operands =>
-            // newest first; `None` (omitted) sorts last.
-            .then_with(|| b.issue.updated_at.cmp(&a.issue.updated_at))
+            // Newest `updated_at` first, compared as instants rather than
+            // strings so fractional seconds and non-`Z` offsets still order
+            // chronologically; `None` (omitted) sorts last.
+            .then_with(|| cmp_updated_desc(&a.issue.updated_at, &b.issue.updated_at))
             .then_with(|| a.issue.id.cmp(&b.issue.id))
     });
 
     Snapshot { rows, fetched_at }
+}
+
+/// Order two `updated_at` values newest first. Parseable RFC3339 timestamps
+/// compare as instants; a present-but-unparseable value sorts after every
+/// parseable one (falling back to a reversed string compare among themselves),
+/// and `None` sorts last.
+fn cmp_updated_desc(a: &Option<String>, b: &Option<String>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => match (parse_rfc3339(a), parse_rfc3339(b)) {
+            (Some(ta), Some(tb)) => tb.cmp(&ta),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => b.cmp(a),
+        },
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Parse an RFC3339 timestamp (`YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM)`) into a
+/// UTC instant as `(unix seconds, nanoseconds)`, or `None` if malformed.
+/// Fractional digits past nanosecond precision are truncated. Hand-rolled to
+/// avoid a date-time dependency for a sort key.
+fn parse_rfc3339(s: &str) -> Option<(i64, u32)> {
+    let b = s.as_bytes();
+    let num = |range: std::ops::Range<usize>| -> Option<i64> {
+        let digits = b.get(range)?;
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(digits.iter().fold(0, |n, d| n * 10 + i64::from(d - b'0')))
+    };
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !matches!(b[10], b'T' | b't' | b' ')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    // 60 admits a leap second; it orders just after :59, which is all a sort
+    // key needs.
+    if !(1..=month_days).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let mut i = 19;
+    let mut nanos: u32 = 0;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        let start = i;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            if i - start < 9 {
+                nanos = nanos * 10 + u32::from(b[i] - b'0');
+            }
+            i += 1;
+        }
+        let digits = i - start;
+        if digits == 0 {
+            return None;
+        }
+        nanos *= 10u32.pow(9u32.saturating_sub(digits as u32));
+    }
+
+    let offset_secs = match b.get(i)? {
+        b'Z' | b'z' if i + 1 == b.len() => 0,
+        sign @ (b'+' | b'-') if i + 6 == b.len() && b[i + 3] == b':' => {
+            let (oh, om) = (num(i + 1..i + 3)?, num(i + 4..i + 6)?);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let offset = oh * 3600 + om * 60;
+            if *sign == b'-' { -offset } else { offset }
+        }
+        _ => return None,
+    };
+
+    // Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+    // `days_from_civil`).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second - offset_secs;
+    Some((secs, nanos))
 }
 
 /// A path's final component as a string, falling back to the full path string
@@ -292,6 +393,96 @@ mod tests {
             vec!["rb-p0", "rb-new", "rb-old"],
             "P0 first, then P1s newest-updated first"
         );
+    }
+
+    #[test]
+    fn sorts_updated_at_chronologically_across_formats() {
+        // Lexically these would sort "...12:00:00Z" > "...11:00:00.5Z" >
+        // "...10:30:00-02:00", but as instants the offset one (12:30Z) is
+        // newest and the fractional one (11:00:00.5Z) is newer than whole-second
+        // 11:00:00Z.
+        let issues = vec![
+            issue("rb-whole", 1, Some("2026-07-11T11:00:00Z")),
+            issue("rb-frac", 1, Some("2026-07-11T11:00:00.5Z")),
+            issue("rb-noon", 1, Some("2026-07-11T12:00:00Z")),
+            issue("rb-offset", 1, Some("2026-07-11T10:30:00-02:00")),
+            issue("rb-none", 1, None),
+        ];
+        let bd = FakeBdClient::new().with_ready(issues);
+        let map = prefix_map(&[("rb", "/dev/repo-b")]);
+
+        let snap = fetch(&bd, Path::new("/hub"), &map, at(0)).expect("fetch ok");
+
+        let order: Vec<&str> = snap.rows.iter().map(|r| r.issue.id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["rb-offset", "rb-noon", "rb-frac", "rb-whole", "rb-none"],
+            "newest instant first regardless of format; missing updated_at last"
+        );
+    }
+
+    #[test]
+    fn unparseable_updated_at_sorts_after_parseable_before_missing() {
+        let issues = vec![
+            issue("rb-none", 1, None),
+            issue("rb-junk", 1, Some("yesterday")),
+            issue("rb-old", 1, Some("2020-01-01T00:00:00Z")),
+        ];
+        let bd = FakeBdClient::new().with_ready(issues);
+        let map = prefix_map(&[("rb", "/dev/repo-b")]);
+
+        let snap = fetch(&bd, Path::new("/hub"), &map, at(0)).expect("fetch ok");
+
+        let order: Vec<&str> = snap.rows.iter().map(|r| r.issue.id.as_str()).collect();
+        assert_eq!(order, vec!["rb-old", "rb-junk", "rb-none"]);
+    }
+
+    #[test]
+    fn parses_rfc3339_variants_to_utc_instants() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some((0, 0)));
+        assert_eq!(
+            parse_rfc3339("2026-07-11T12:41:25Z"),
+            Some((1_783_773_685, 0))
+        );
+        assert_eq!(
+            parse_rfc3339("2026-07-11T12:41:25.123456789Z"),
+            Some((1_783_773_685, 123_456_789))
+        );
+        assert_eq!(
+            parse_rfc3339("2026-07-11T12:41:25.5Z"),
+            Some((1_783_773_685, 500_000_000))
+        );
+        // Precision past nanoseconds is truncated, not rejected.
+        assert_eq!(
+            parse_rfc3339("2026-07-11T12:41:25.1234567891Z"),
+            Some((1_783_773_685, 123_456_789))
+        );
+        assert_eq!(
+            parse_rfc3339("2026-07-11T14:41:25+02:00"),
+            parse_rfc3339("2026-07-11T12:41:25Z")
+        );
+        assert_eq!(
+            parse_rfc3339("2026-07-11T07:11:25-05:30"),
+            parse_rfc3339("2026-07-11T12:41:25Z")
+        );
+        assert_eq!(
+            parse_rfc3339("2024-02-29T00:00:00Z"),
+            Some((1_709_164_800, 0))
+        );
+        for bad in [
+            "",
+            "2026-07-11",
+            "2026-07-11T12:41:25",
+            "2026-07-11T12:41:25.Z",
+            "2026-13-01T00:00:00Z",
+            "2025-02-29T00:00:00Z",
+            "2026-07-11T24:00:00Z",
+            "2026-07-11T12:41:25+0200",
+            "2026-07-11T12:41:25Zjunk",
+            "not a timestamp at all",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad:?} should not parse");
+        }
     }
 
     #[test]
