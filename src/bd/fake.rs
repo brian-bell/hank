@@ -27,6 +27,7 @@ pub enum Call {
     Export(PathBuf, PathBuf),
     IssuePrefix(PathBuf),
     EventsJournal(PathBuf),
+    SetEventsJournal(PathBuf, bool),
     RepoSync(PathBuf),
     Ready(PathBuf),
     Show(PathBuf, String),
@@ -65,6 +66,10 @@ pub struct FakeBdClient {
     export_contents: HashMap<PathBuf, Vec<u8>>,
     issue_prefixes: HashMap<PathBuf, String>,
     events_journals: HashMap<PathBuf, Result<bool, BdError>>,
+    set_events_journal: Option<Result<(), BdError>>,
+    /// Successful `set_events_journal` writes, read back by
+    /// `events_journal_enabled` ahead of the programmed values.
+    journal_writes: Mutex<HashMap<PathBuf, bool>>,
 }
 
 impl std::fmt::Debug for FakeBdClient {
@@ -204,6 +209,13 @@ impl FakeBdClient {
         self
     }
 
+    /// Program every `set_events_journal` call to fail. Unset, it succeeds and
+    /// the new value reads back through `events_journal_enabled`.
+    pub fn with_set_events_journal_err(mut self, err: BdError) -> Self {
+        self.set_events_journal = Some(Err(err));
+        self
+    }
+
     /// Run a thread-safe observer after each call is recorded. Tests use this
     /// for barriers, bounds, and panic injection without wall-clock sleeps.
     pub fn with_call_hook(mut self, hook: impl Fn(&Call) + Send + Sync + 'static) -> Self {
@@ -308,7 +320,25 @@ impl BdClient for FakeBdClient {
 
     fn events_journal_enabled(&self, repo: &Path) -> Result<bool, BdError> {
         self.record(Call::EventsJournal(repo.to_path_buf()));
+        if let Some(on) = self
+            .journal_writes
+            .lock()
+            .expect("fake journal writes poisoned")
+            .get(repo)
+        {
+            return Ok(*on);
+        }
         self.events_journals.get(repo).cloned().unwrap_or(Ok(false))
+    }
+
+    fn set_events_journal(&self, repo: &Path, on: bool) -> Result<(), BdError> {
+        self.record(Call::SetEventsJournal(repo.to_path_buf(), on));
+        resolve(&self.set_events_journal, || ())?;
+        self.journal_writes
+            .lock()
+            .expect("fake journal writes poisoned")
+            .insert(repo.to_path_buf(), on);
+        Ok(())
     }
 
     fn repo_sync(&self, hub: &Path) -> Result<RepoSyncReport, BdError> {
@@ -479,6 +509,12 @@ mod tests {
             FakeBdClient::new()
                 .with_events_journal_err("/tmp/ra", err())
                 .events_journal_enabled(Path::new("/tmp/ra"))
+                .is_err()
+        );
+        assert!(
+            FakeBdClient::new()
+                .with_set_events_journal_err(err())
+                .set_events_journal(Path::new("/tmp/ra"), true)
                 .is_err()
         );
         assert!(

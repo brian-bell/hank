@@ -10,6 +10,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoEntry {
     pub path: PathBuf,
+    /// Set by `hank repos unwatch`: live refresh must never turn this repo's
+    /// events journal back on. Omitted from `config.toml` while off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unwatched: bool,
+}
+
+impl RepoEntry {
+    /// A roster entry live refresh may manage (not opted out).
+    pub fn new(path: PathBuf) -> Self {
+        RepoEntry {
+            path,
+            unwatched: false,
+        }
+    }
 }
 
 /// The roster of beads repositories hank federates. Source of truth is
@@ -532,12 +546,8 @@ mod tests {
         let original = Config {
             watch: false,
             repos: vec![
-                RepoEntry {
-                    path: PathBuf::from("/a"),
-                },
-                RepoEntry {
-                    path: PathBuf::from("/b/c"),
-                },
+                RepoEntry::new(PathBuf::from("/a")),
+                RepoEntry::new(PathBuf::from("/b/c")),
             ],
         };
 
@@ -562,9 +572,7 @@ mod tests {
 
         let original = Config {
             watch: false,
-            repos: vec![RepoEntry {
-                path: PathBuf::from("/x"),
-            }],
+            repos: vec![RepoEntry::new(PathBuf::from("/x"))],
         };
 
         original.save(&path).unwrap();
@@ -598,9 +606,7 @@ mod tests {
         let legacy = dir.path().join("federated-beads/config.toml");
         let expected = Config {
             watch: false,
-            repos: vec![RepoEntry {
-                path: PathBuf::from("/legacy/repo"),
-            }],
+            repos: vec![RepoEntry::new(PathBuf::from("/legacy/repo"))],
         };
         expected.save(&legacy).unwrap();
 
@@ -658,13 +664,9 @@ mod tests {
         Config {
             watch: false,
             repos: vec![
-                RepoEntry { path: "~".into() },
-                RepoEntry {
-                    path: "~/repo".into(),
-                },
-                RepoEntry {
-                    path: "~user/repo".into(),
-                },
+                RepoEntry::new("~".into()),
+                RepoEntry::new("~/repo".into()),
+                RepoEntry::new("~user/repo".into()),
             ],
         }
         .save(&legacy)
@@ -725,9 +727,7 @@ mod tests {
         let paths = Paths::with_base(dir.path());
         let canonical = Config {
             watch: false,
-            repos: vec![RepoEntry {
-                path: PathBuf::from("/canonical"),
-            }],
+            repos: vec![RepoEntry::new(PathBuf::from("/canonical"))],
         };
         canonical.save(paths.config_file()).unwrap();
         crate::ui_state::save(
@@ -872,9 +872,7 @@ mod tests {
         let legacy = dir.path().join("federated-beads/config.toml");
         let expected = Config {
             watch: false,
-            repos: vec![RepoEntry {
-                path: PathBuf::from("/concurrent"),
-            }],
+            repos: vec![RepoEntry::new(PathBuf::from("/concurrent"))],
         };
         expected.save(&legacy).unwrap();
 
@@ -930,18 +928,14 @@ mod tests {
 
         Config {
             watch: false,
-            repos: vec![RepoEntry {
-                path: PathBuf::from("/first"),
-            }],
+            repos: vec![RepoEntry::new(PathBuf::from("/first"))],
         }
         .save(&path)
         .unwrap();
 
         let second = Config {
             watch: false,
-            repos: vec![RepoEntry {
-                path: PathBuf::from("/second"),
-            }],
+            repos: vec![RepoEntry::new(PathBuf::from("/second"))],
         };
         second.save(&path).unwrap();
 
@@ -963,6 +957,29 @@ mod tests {
         assert!(!fs::read_to_string(&path).unwrap().contains("watch"));
         fs::write(&path, "repos = []\n").unwrap();
         assert!(!Config::load(&path).unwrap().watch, "absent means off");
+    }
+
+    #[test]
+    fn unwatched_opt_out_roundtrips_and_stays_out_of_the_file_when_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut opted_out = RepoEntry::new(PathBuf::from("/quiet"));
+        opted_out.unwatched = true;
+        let roster = Config {
+            repos: vec![RepoEntry::new(PathBuf::from("/live")), opted_out],
+            watch: true,
+        };
+        roster.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), roster);
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("unwatched").count(), 1, "{text}");
+
+        fs::write(&path, "[[repos]]\npath = \"/old\"\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().repos,
+            [RepoEntry::new(PathBuf::from("/old"))],
+            "a config written before the opt-out existed loads unchanged"
+        );
     }
 
     #[test]

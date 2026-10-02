@@ -274,10 +274,16 @@ pub fn run_doctor(bd: &impl BdClient, paths: &Paths, out: &mut impl Write) -> Re
                         .issue_prefix(&entry.path)
                         .unwrap_or_else(|_| "?".to_string());
                     // Live refresh follows only repos with the journal on;
-                    // a failed or unparseable read counts as off.
+                    // a failed or unparseable read counts as off. An
+                    // `unwatched` repo is one live refresh won't turn on.
                     let journal = match bd.events_journal_enabled(&entry.path) {
                         Ok(true) => "on",
                         Ok(false) | Err(_) => "off",
+                    };
+                    let journal = if entry.unwatched {
+                        format!("{journal} (unwatched)")
+                    } else {
+                        journal.to_string()
                     };
                     writeln!(
                         out,
@@ -416,7 +422,15 @@ fn save_roster(roster: &Config, paths: &Paths) -> Result<(), CliError> {
 /// Rejects a directory without a `.beads/` subdir (naming the path and pointing at
 /// `bd init`); a path already present (by canonical form) is reported and left as a
 /// single entry rather than duplicated.
-pub fn run_repos_add(paths: &Paths, path: &Path, out: &mut impl Write) -> Result<(), CliError> {
+///
+/// With live refresh on (`watch = true`), the new repo's events journal is
+/// turned on too (see [`enable_journal_for_added`]).
+pub fn run_repos_add(
+    bd: &impl BdClient,
+    paths: &Paths,
+    path: &Path,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
     let expanded = expand_tilde(path);
     if !expanded.join(".beads").is_dir() {
         return Err(CliError::Roster(format!(
@@ -442,16 +456,14 @@ pub fn run_repos_add(paths: &Paths, path: &Path, out: &mut impl Write) -> Result
         )?;
         return Ok(());
     }
-    roster.repos.push(RepoEntry {
-        path: canonical.clone(),
-    });
+    roster.repos.push(RepoEntry::new(canonical.clone()));
     save_roster(&roster, paths)?;
     writeln!(
         out,
         "added {} to the roster",
         sanitize(&canonical.display().to_string())
     )?;
-    Ok(())
+    enable_journal_for_added(bd, &roster, std::slice::from_ref(&canonical), out)
 }
 
 /// `hank repos remove <path>`: drop the entry naming `path` from the roster, then
@@ -566,6 +578,7 @@ pub fn run_repos_list(paths: &Paths, out: &mut impl Write) -> Result<(), CliErro
 /// Preview-first by design (see slice-7 plan): a bare `discover` mutates nothing, so
 /// the user sees what a scan turned up before opting into the change with `--add`.
 pub fn run_repos_discover(
+    bd: &impl BdClient,
     paths: &Paths,
     root: &Path,
     add: bool,
@@ -608,7 +621,7 @@ pub fn run_repos_discover(
 
     if add {
         for path in &found {
-            roster.repos.push(RepoEntry { path: path.clone() });
+            roster.repos.push(RepoEntry::new(path.clone()));
         }
         save_roster(&roster, paths)?;
         writeln!(
@@ -620,6 +633,7 @@ pub fn run_repos_discover(
         for path in &found {
             writeln!(out, "  {}", sanitize(&path.display().to_string()))?;
         }
+        enable_journal_for_added(bd, &roster, &found, out)?;
     } else {
         writeln!(
             out,
@@ -631,6 +645,178 @@ pub fn run_repos_discover(
             writeln!(out, "  {}", sanitize(&path.display().to_string()))?;
         }
         writeln!(out, "re-run with --add to add them")?;
+    }
+    Ok(())
+}
+
+/// The minimum bd whose events journal live refresh can follow.
+const MIN_EVENTS_BD_VERSION: (u64, u64, u64) = (1, 3, 0);
+
+/// Whether `bd` is new enough to have an events journal, with an actionable
+/// message when it is not.
+fn events_gate(bd: &impl BdClient) -> Result<(), String> {
+    let v = bd.version().map_err(|e| e.to_string())?;
+    version_gate(&v)?;
+    if parse_version(&v.version).is_some_and(|got| got >= MIN_EVENTS_BD_VERSION) {
+        return Ok(());
+    }
+    let (maj, min, pat) = MIN_EVENTS_BD_VERSION;
+    Err(format!(
+        "live refresh needs bd >= {maj}.{min}.{pat} for the events journal, but found bd {}",
+        v.version
+    ))
+}
+
+/// The file `bd config set events-journal` edits in `repo`, for the line that
+/// announces the write before it happens.
+fn journal_config_file(repo: &Path) -> String {
+    sanitize(
+        &repo
+            .join(".beads")
+            .join("config.yaml")
+            .display()
+            .to_string(),
+    )
+}
+
+/// After `repos add`/`discover --add`: with live refresh on, turn on the
+/// events journal in each newly added repo so it is followed without a manual
+/// step. Never fails the add: a bd that is too old or a failed write is a
+/// printed note, and the TUI's watcher retries the enable on its next launch.
+fn enable_journal_for_added(
+    bd: &impl BdClient,
+    roster: &Config,
+    added: &[PathBuf],
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    if !roster.watch || added.is_empty() {
+        return Ok(());
+    }
+    if let Err(reason) = events_gate(bd) {
+        writeln!(
+            out,
+            "note: events journal not turned on: {}",
+            sanitize(&reason)
+        )?;
+        return Ok(());
+    }
+    for repo in added {
+        match bd.set_events_journal(repo, true) {
+            Ok(()) => writeln!(
+                out,
+                "live refresh is on: turned on the events journal in {} (`hank repos unwatch` undoes it)",
+                journal_config_file(repo)
+            )?,
+            Err(e) => writeln!(
+                out,
+                "note: couldn't turn on the events journal in {}: {}",
+                sanitize(&repo.display().to_string()),
+                sanitize(&e.to_string())
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// `hank repos watch|unwatch <path>` (or `--all` with `path` `None`): turn the
+/// events journal on or off in roster repos, so live refresh follows them or
+/// stops. This edits each repo's git-tracked `.beads/config.yaml` through bd,
+/// so every write is announced first and read back after.
+///
+/// `unwatch` also marks the roster entry `unwatched`, which stops live refresh
+/// from turning the journal back on; `watch` clears it. The roster is saved
+/// before bd runs, so a TUI that reloads it mid-command already sees the
+/// opt-out. A path that is not on the roster is refused.
+pub fn run_repos_watch(
+    bd: &impl BdClient,
+    paths: &Paths,
+    path: Option<&Path>,
+    on: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let mut roster = load_roster(paths)?;
+    let selected: Vec<usize> = match path {
+        Some(path) => {
+            let canonical = store_path(path);
+            let expanded = expand_tilde(path);
+            let found: Vec<usize> = roster
+                .repos
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| store_path(&r.path) == canonical || r.path == expanded)
+                .map(|(index, _)| index)
+                .collect();
+            if found.is_empty() {
+                return Err(CliError::Roster(format!(
+                    "not in the roster: {} — add it with `hank repos add` first",
+                    sanitize(&expanded.display().to_string())
+                )));
+            }
+            found
+        }
+        None => (0..roster.repos.len()).collect(),
+    };
+    if selected.is_empty() {
+        writeln!(
+            out,
+            "roster is empty; add repos with `hank repos add <path>`"
+        )?;
+        return Ok(());
+    }
+    if on {
+        events_gate(bd).map_err(CliError::VersionGate)?;
+    } else {
+        version_gate(&bd.version()?).map_err(CliError::VersionGate)?;
+    }
+
+    let mut changed = false;
+    for &index in &selected {
+        let entry = &mut roster.repos[index];
+        if entry.unwatched == on {
+            entry.unwatched = !on;
+            changed = true;
+        }
+    }
+    if changed {
+        save_roster(&roster, paths)?;
+    }
+
+    let state = if on { "on" } else { "off" };
+    for &index in &selected {
+        let repo = &roster.repos[index].path;
+        writeln!(
+            out,
+            "turning the events journal {state} in {}",
+            journal_config_file(repo)
+        )?;
+        bd.set_events_journal(repo, on)?;
+        match bd.events_journal_enabled(repo) {
+            Ok(now) if now == on => {}
+            Ok(_) => writeln!(
+                out,
+                "warning: bd still reports the events journal {} in {}",
+                if on { "off" } else { "on" },
+                sanitize(&repo.display().to_string())
+            )?,
+            Err(e) => writeln!(
+                out,
+                "warning: couldn't read the events journal setting back: {}",
+                sanitize(&e.to_string())
+            )?,
+        }
+    }
+    if on {
+        writeln!(
+            out,
+            "live refresh (`hank --watch` or `watch = true`) follows {} repo(s) from their next refresh",
+            selected.len()
+        )?;
+    } else {
+        writeln!(
+            out,
+            "live refresh will leave {} repo(s) alone until `hank repos watch`",
+            selected.len()
+        )?;
     }
     Ok(())
 }
@@ -697,9 +883,7 @@ mod tests {
             watch: false,
             repos: paths
                 .iter()
-                .map(|p| RepoEntry {
-                    path: p.to_path_buf(),
-                })
+                .map(|p| RepoEntry::new(p.to_path_buf()))
                 .collect(),
         }
     }
@@ -1115,9 +1299,7 @@ mod tests {
         fs::create_dir_all(&launch_dir).unwrap();
         Config {
             watch: false,
-            repos: vec![RepoEntry {
-                path: PathBuf::from("repo"),
-            }],
+            repos: vec![RepoEntry::new(PathBuf::from("repo"))],
         }
         .save(paths.config_file())
         .unwrap();
@@ -1269,7 +1451,7 @@ mod tests {
         let ra = seed_repo(tmp.path(), "ra", "ra");
         let mut out = Vec::new();
 
-        run_repos_add(&paths, &ra, &mut out).expect("add ok");
+        run_repos_add(&FakeBdClient::new(), &paths, &ra, &mut out).expect("add ok");
         assert_eq!(reload(&paths).repos.len(), 1, "one entry after first add");
         assert!(
             String::from_utf8(out).unwrap().contains("added"),
@@ -1278,7 +1460,7 @@ mod tests {
 
         // Adding the same path again must not duplicate it.
         let mut out2 = Vec::new();
-        run_repos_add(&paths, &ra, &mut out2).expect("second add ok");
+        run_repos_add(&FakeBdClient::new(), &paths, &ra, &mut out2).expect("second add ok");
         assert_eq!(
             reload(&paths).repos.len(),
             1,
@@ -1300,7 +1482,8 @@ mod tests {
         fs::create_dir_all(&plain).unwrap();
         let mut out = Vec::new();
 
-        let e = run_repos_add(&paths, &plain, &mut out).expect_err("rejects non-repo");
+        let e = run_repos_add(&FakeBdClient::new(), &paths, &plain, &mut out)
+            .expect_err("rejects non-repo");
         let msg = match &e {
             CliError::Roster(m) => m.clone(),
             other => panic!("expected Roster error, got {other:?}"),
@@ -1323,8 +1506,8 @@ mod tests {
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
         let rb = seed_repo(tmp.path(), "rb", "rb");
-        run_repos_add(&paths, &ra, &mut Vec::new()).unwrap();
-        run_repos_add(&paths, &rb, &mut Vec::new()).unwrap();
+        run_repos_add(&FakeBdClient::new(), &paths, &ra, &mut Vec::new()).unwrap();
+        run_repos_add(&FakeBdClient::new(), &paths, &rb, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
         run_repos_remove(&FakeBdClient::new(), &paths, &ra, &mut out).expect("remove ok");
@@ -1362,8 +1545,8 @@ mod tests {
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
         let rb = seed_repo(tmp.path(), "rb", "rb");
-        run_repos_add(&paths, &ra, &mut Vec::new()).unwrap();
-        run_repos_add(&paths, &rb, &mut Vec::new()).unwrap();
+        run_repos_add(&FakeBdClient::new(), &paths, &ra, &mut Vec::new()).unwrap();
+        run_repos_add(&FakeBdClient::new(), &paths, &rb, &mut Vec::new()).unwrap();
         let (ra, rb) = (ra.canonicalize().unwrap(), rb.canonicalize().unwrap());
         let hub = seed_hub(&paths, &[&ra, &rb]);
         fs::create_dir_all(paths.cache_file().parent().unwrap()).unwrap();
@@ -1385,7 +1568,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
-        run_repos_add(&paths, &ra, &mut Vec::new()).unwrap();
+        run_repos_add(&FakeBdClient::new(), &paths, &ra, &mut Vec::new()).unwrap();
         let bd = FakeBdClient::new();
 
         run_repos_remove(&bd, &paths, &ra, &mut Vec::new()).expect("remove ok");
@@ -1417,7 +1600,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
-        run_repos_add(&paths, &ra, &mut Vec::new()).unwrap();
+        run_repos_add(&FakeBdClient::new(), &paths, &ra, &mut Vec::new()).unwrap();
         let hub = seed_hub(&paths, &[&ra.canonicalize().unwrap()]);
         let _held = HubLock::try_acquire(&hub).unwrap().expect("lock free");
         let bd = FakeBdClient::new();
@@ -1442,7 +1625,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
-        run_repos_add(&paths, &ra, &mut Vec::new()).unwrap();
+        run_repos_add(&FakeBdClient::new(), &paths, &ra, &mut Vec::new()).unwrap();
         seed_hub(&paths, &[&ra.canonicalize().unwrap()]);
         let bd = FakeBdClient::new().with_version(version("1.0.0", 1));
 
@@ -1461,7 +1644,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
-        run_repos_add(&paths, &ra, &mut Vec::new()).unwrap();
+        run_repos_add(&FakeBdClient::new(), &paths, &ra, &mut Vec::new()).unwrap();
         seed_hub(&paths, &[&ra.canonicalize().unwrap()]);
         let bd = FakeBdClient::new().with_repo_remove_err(BdError {
             command: "bd repo remove".into(),
@@ -1508,8 +1691,8 @@ mod tests {
 
         let ra = seed_repo(tmp.path(), "ra", "ra");
         let rb = seed_repo(tmp.path(), "rb", "rb");
-        run_repos_add(&paths, &ra, &mut Vec::new()).unwrap();
-        run_repos_add(&paths, &rb, &mut Vec::new()).unwrap();
+        run_repos_add(&FakeBdClient::new(), &paths, &ra, &mut Vec::new()).unwrap();
+        run_repos_add(&FakeBdClient::new(), &paths, &rb, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
         run_repos_list(&paths, &mut out).expect("list ok");
@@ -1538,7 +1721,8 @@ mod tests {
         let (root, x, y) = discovery_tree(tmp.path());
         let mut out = Vec::new();
 
-        run_repos_discover(&paths, &root, false, &mut out).expect("discover ok");
+        run_repos_discover(&FakeBdClient::new(), &paths, &root, false, &mut out)
+            .expect("discover ok");
 
         let stdout = String::from_utf8(out).unwrap();
         assert!(
@@ -1565,10 +1749,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let (root, x, y) = discovery_tree(tmp.path());
-        run_repos_add(&paths, &x, &mut Vec::new()).unwrap();
+        run_repos_add(&FakeBdClient::new(), &paths, &x, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
-        run_repos_discover(&paths, &root, false, &mut out).expect("discover ok");
+        run_repos_discover(&FakeBdClient::new(), &paths, &root, false, &mut out)
+            .expect("discover ok");
 
         let stdout = String::from_utf8(out).unwrap();
         assert!(
@@ -1588,7 +1773,8 @@ mod tests {
         let (root, x, y) = discovery_tree(tmp.path());
         let mut out = Vec::new();
 
-        run_repos_discover(&paths, &root, true, &mut out).expect("discover --add ok");
+        run_repos_discover(&FakeBdClient::new(), &paths, &root, true, &mut out)
+            .expect("discover --add ok");
 
         let saved: Vec<PathBuf> = reload(&paths).repos.into_iter().map(|r| r.path).collect();
         assert!(
@@ -1609,7 +1795,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let repo = seed_repo(tmp.path(), "doomed", "dm");
-        run_repos_add(&paths, &repo, &mut Vec::new()).unwrap();
+        run_repos_add(&FakeBdClient::new(), &paths, &repo, &mut Vec::new()).unwrap();
         fs::remove_dir_all(&repo).unwrap();
 
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1647,9 +1833,7 @@ mod tests {
         // Persist a roster whose entry is relative to the config directory.
         Config {
             watch: false,
-            repos: vec![RepoEntry {
-                path: PathBuf::from("r"),
-            }],
+            repos: vec![RepoEntry::new(PathBuf::from("r"))],
         }
         .save(paths.config_file())
         .unwrap();
@@ -1659,7 +1843,12 @@ mod tests {
         std::env::set_current_dir(launch_dir).unwrap();
         let mut out = Vec::new();
         // Add by the canonical absolute path.
-        let result = run_repos_add(&paths, &repo.canonicalize().unwrap(), &mut out);
+        let result = run_repos_add(
+            &FakeBdClient::new(),
+            &paths,
+            &repo.canonicalize().unwrap(),
+            &mut out,
+        );
         std::env::set_current_dir(prev).unwrap();
         result.expect("add ok");
 
@@ -1688,7 +1877,7 @@ mod tests {
         let rel_x = PathBuf::from("..").join(x.strip_prefix(tmp.path()).expect("x is under base"));
         Config {
             watch: false,
-            repos: vec![RepoEntry { path: rel_x }],
+            repos: vec![RepoEntry::new(rel_x)],
         }
         .save(paths.config_file())
         .unwrap();
@@ -1697,7 +1886,7 @@ mod tests {
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
         let mut out = Vec::new();
-        let result = run_repos_discover(&paths, &root, false, &mut out);
+        let result = run_repos_discover(&FakeBdClient::new(), &paths, &root, false, &mut out);
         std::env::set_current_dir(prev).unwrap();
         result.expect("discover ok");
 
@@ -1721,7 +1910,7 @@ mod tests {
         // SAFETY: ENV_LOCK serializes HOME/cwd mutation across tests; restored below.
         unsafe { std::env::set_var("HOME", &home) };
         let mut out = Vec::new();
-        let result = run_repos_add(&paths, Path::new("~/r"), &mut out);
+        let result = run_repos_add(&FakeBdClient::new(), &paths, Path::new("~/r"), &mut out);
         match prev {
             Some(v) => unsafe { std::env::set_var("HOME", v) },
             None => unsafe { std::env::remove_var("HOME") },
@@ -1759,5 +1948,245 @@ mod tests {
             !stderr.contains('\u{1b}') && !stderr.contains('\u{07}'),
             "warning output carries no raw terminal-control bytes: {stderr:?}"
         );
+    }
+
+    /// A bd new enough for the events journal.
+    fn events_bd() -> FakeBdClient {
+        FakeBdClient::new().with_version(version("1.3.0", 1))
+    }
+
+    fn journal_writes(bd: &FakeBdClient) -> Vec<(PathBuf, bool)> {
+        bd.calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::SetEventsJournal(repo, on) => Some((repo, on)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn save_watch_roster(paths: &Paths, repos: &[&Path], watch: bool) {
+        let mut config = roster(repos);
+        config.watch = watch;
+        config.save(paths.config_file()).unwrap();
+    }
+
+    #[test]
+    fn repos_watch_turns_the_journal_on_and_names_the_file_it_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra").canonicalize().unwrap();
+        let mut config = roster(&[&ra]);
+        config.repos[0].unwatched = true;
+        config.save(paths.config_file()).unwrap();
+        let bd = events_bd();
+        let mut out = Vec::new();
+
+        run_repos_watch(&bd, &paths, Some(ra.as_path()), true, &mut out).expect("watch ok");
+
+        assert_eq!(journal_writes(&bd), [(ra.clone(), true)]);
+        assert!(
+            !reload(&paths).repos[0].unwatched,
+            "watch clears the opt-out"
+        );
+        let stdout = String::from_utf8(out).unwrap();
+        let file = ra.join(".beads").join("config.yaml");
+        assert!(
+            stdout.contains(&format!(
+                "turning the events journal on in {}",
+                file.display()
+            )),
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("warning"),
+            "the setting read back on: {stdout}"
+        );
+    }
+
+    #[test]
+    fn repos_unwatch_turns_the_journal_off_and_records_the_opt_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra").canonicalize().unwrap();
+        let rb = seed_repo(tmp.path(), "rb", "rb").canonicalize().unwrap();
+        save_watch_roster(&paths, &[&ra, &rb], true);
+        let bd = events_bd().with_events_journal(&ra, true);
+
+        run_repos_watch(&bd, &paths, Some(ra.as_path()), false, &mut Vec::new())
+            .expect("unwatch ok");
+
+        assert_eq!(journal_writes(&bd), [(ra.clone(), false)]);
+        let saved = reload(&paths);
+        assert!(saved.repos[0].unwatched, "{saved:?}");
+        assert!(!saved.repos[1].unwatched, "only the named repo opts out");
+    }
+
+    #[test]
+    fn repos_watch_refuses_a_path_not_on_the_roster() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let stranger = seed_repo(tmp.path(), "stranger", "st");
+        save_watch_roster(&paths, &[&ra], true);
+        let bd = events_bd();
+
+        let error = run_repos_watch(&bd, &paths, Some(stranger.as_path()), true, &mut Vec::new())
+            .expect_err("refused");
+
+        assert!(
+            matches!(&error, CliError::Roster(msg) if msg.contains("not in the roster")),
+            "{error}"
+        );
+        assert!(
+            journal_writes(&bd).is_empty(),
+            "bd never touched the stranger"
+        );
+    }
+
+    #[test]
+    fn repos_watch_all_covers_every_roster_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra").canonicalize().unwrap();
+        let rb = seed_repo(tmp.path(), "rb", "rb").canonicalize().unwrap();
+        save_watch_roster(&paths, &[&ra, &rb], false);
+        let bd = events_bd();
+
+        run_repos_watch(&bd, &paths, None, true, &mut Vec::new()).expect("watch --all ok");
+
+        assert_eq!(journal_writes(&bd), [(ra, true), (rb, true)]);
+    }
+
+    #[test]
+    fn repos_watch_needs_a_bd_with_the_events_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        save_watch_roster(&paths, &[&ra], true);
+        let bd = FakeBdClient::new().with_version(version("1.2.0", 1));
+
+        let error = run_repos_watch(&bd, &paths, Some(ra.as_path()), true, &mut Vec::new())
+            .expect_err("gated");
+
+        assert!(
+            matches!(&error, CliError::VersionGate(msg) if msg.contains("1.3.0")),
+            "{error}"
+        );
+        assert!(journal_writes(&bd).is_empty());
+    }
+
+    #[test]
+    fn repos_watch_fails_when_bd_cannot_write_the_setting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra").canonicalize().unwrap();
+        save_watch_roster(&paths, &[&ra], true);
+        let bd = events_bd().with_set_events_journal_err(BdError {
+            command: "bd config set events-journal true".into(),
+            stderr: "read-only".into(),
+            kind: BdErrorKind::NonZeroExit { code: Some(1) },
+        });
+
+        let error = run_repos_watch(&bd, &paths, Some(ra.as_path()), true, &mut Vec::new())
+            .expect_err("a failed write fails the command");
+
+        assert!(matches!(error, CliError::Bd(_)), "{error}");
+    }
+
+    #[test]
+    fn repos_add_turns_the_journal_on_only_with_live_refresh_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let rb = seed_repo(tmp.path(), "rb", "rb");
+
+        let bd = events_bd();
+        run_repos_add(&bd, &paths, &ra, &mut Vec::new()).unwrap();
+        assert!(journal_writes(&bd).is_empty(), "watch off: hands off");
+
+        let mut config = reload(&paths);
+        config.watch = true;
+        config.save(paths.config_file()).unwrap();
+        let mut out = Vec::new();
+        run_repos_add(&bd, &paths, &rb, &mut out).unwrap();
+
+        let rb = rb.canonicalize().unwrap();
+        assert_eq!(journal_writes(&bd), [(rb.clone(), true)]);
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(stdout.contains("turned on the events journal"), "{stdout}");
+        assert!(
+            stdout.contains(&rb.join(".beads").join("config.yaml").display().to_string()),
+            "{stdout}"
+        );
+    }
+
+    #[test]
+    fn repos_add_with_live_refresh_never_fails_on_the_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let rb = seed_repo(tmp.path(), "rb", "rb");
+        Config {
+            repos: Vec::new(),
+            watch: true,
+        }
+        .save(paths.config_file())
+        .unwrap();
+
+        let old_bd = FakeBdClient::new().with_version(version("1.2.0", 1));
+        let mut out = Vec::new();
+        run_repos_add(&old_bd, &paths, &ra, &mut out).expect("old bd: still added");
+        assert!(journal_writes(&old_bd).is_empty());
+        assert!(String::from_utf8(out).unwrap().contains("note:"));
+
+        let failing = events_bd().with_set_events_journal_err(BdError {
+            command: "bd config set events-journal true".into(),
+            stderr: "boom".into(),
+            kind: BdErrorKind::NonZeroExit { code: Some(1) },
+        });
+        let mut out = Vec::new();
+        run_repos_add(&failing, &paths, &rb, &mut out).expect("failed write: still added");
+        assert!(String::from_utf8(out).unwrap().contains("note:"));
+        assert_eq!(reload(&paths).repos.len(), 2);
+    }
+
+    #[test]
+    fn discover_add_turns_the_journal_on_for_each_new_repo_with_live_refresh_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let (root, x, y) = discovery_tree(tmp.path());
+        Config {
+            repos: Vec::new(),
+            watch: true,
+        }
+        .save(paths.config_file())
+        .unwrap();
+        let bd = events_bd();
+
+        run_repos_discover(&bd, &paths, &root, true, &mut Vec::new()).expect("discover --add");
+
+        let mut written: Vec<PathBuf> = journal_writes(&bd).into_iter().map(|(p, _)| p).collect();
+        written.sort();
+        assert_eq!(
+            written,
+            [x.canonicalize().unwrap(), y.canonicalize().unwrap()]
+        );
+    }
+
+    #[test]
+    fn doctor_marks_unwatched_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra").canonicalize().unwrap();
+        let mut config = roster(&[&ra]);
+        config.repos[0].unwatched = true;
+        config.save(paths.config_file()).unwrap();
+        let mut out = Vec::new();
+
+        run_doctor(&FakeBdClient::new(), &paths, &mut out).expect("ok");
+
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(stdout.contains("journal: off (unwatched)"), "{stdout}");
     }
 }

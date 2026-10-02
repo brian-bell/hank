@@ -64,6 +64,11 @@ pub trait BdClient: Sync {
     /// events journal is on, i.e. whether live refresh can follow it. Any value
     /// other than `"true"` (including unset) reads as off.
     fn events_journal_enabled(&self, repo: &Path) -> Result<bool, BdError>;
+    /// `bd -C <repo> config set events-journal <true|false>` — turn the repo's
+    /// events journal on or off. This edits the repo's git-tracked
+    /// `.beads/config.yaml`, so only `hank repos watch`/`unwatch` and live
+    /// refresh (for repos not opted out) ever call it.
+    fn set_events_journal(&self, repo: &Path, on: bool) -> Result<(), BdError>;
     /// `bd -C <hub> repo sync` — hydrate the hub from registered repos' exports.
     fn repo_sync(&self, hub: &Path) -> Result<RepoSyncReport, BdError>;
     /// `bd -C <hub> ready --json` — issues with no open blockers.

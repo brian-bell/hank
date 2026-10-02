@@ -32,7 +32,7 @@ use crate::hub::{ReconcileWitness, ensure_hub, hub_dir, reconcile_witness};
 use crate::refresh::{self, AttributionGeneration, HubGenerationToken, RefreshError};
 use crate::snapshot::{self, Row, Snapshot};
 use crate::ui_state;
-use crate::watch::{BdJournal, Watcher};
+use crate::watch::{BdJournal, WatchList, Watcher};
 
 /// How long the event thread blocks on `event::poll` before re-checking the stop
 /// flag, so a quit is observed promptly without a busy loop.
@@ -113,7 +113,7 @@ impl RuntimeRefreshState {
     /// Follow any `roster` repo the watcher (if running) doesn't follow yet.
     fn watch_roster(&self, paths: &Paths, roster: &Config) {
         if let Some(watcher) = self.watcher.get() {
-            watcher.follow(watched_repos(paths, roster));
+            watcher.follow(watch_list(paths, roster));
         }
     }
 
@@ -221,7 +221,7 @@ fn event_loop(
         let tx = tx.clone();
         let watcher = Watcher::start(
             Arc::new(BdJournal::new()),
-            watched_repos(paths, roster),
+            watch_list(paths, roster),
             paths.events_checkpoints_file().to_path_buf(),
             move |msg| {
                 let _ = tx.send(msg.into());
@@ -442,6 +442,20 @@ fn reloading_refresh_worker(
                 .into(),
             );
         }
+    }
+}
+
+/// The watcher's view of `roster`: [`watched_repos`] plus the repos marked
+/// `unwatched`, normalized the same way, whose journal it must not turn on.
+fn watch_list(paths: &Paths, roster: &Config) -> WatchList {
+    WatchList {
+        repos: watched_repos(paths, roster),
+        opted_out: roster
+            .repos
+            .iter()
+            .filter(|entry| entry.unwatched)
+            .map(|entry| refresh::normalize_path(&paths.resolve_roster_path(&entry.path)))
+            .collect(),
     }
 }
 
@@ -1219,9 +1233,7 @@ mod tests {
             watch: false,
             repos: paths
                 .iter()
-                .map(|p| RepoEntry {
-                    path: p.to_path_buf(),
-                })
+                .map(|p| RepoEntry::new(p.to_path_buf()))
                 .collect(),
         }
     }
@@ -1507,6 +1519,26 @@ mod tests {
         }
 
         fn interrupt(&self) {}
+
+        fn enable(&self, _repo: &Path) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn watch_list_carries_the_roster_opt_outs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let rb = seed_repo(tmp.path(), "rb", "rb");
+        let mut config = roster(&[&ra, &rb]);
+        config.repos[1].unwatched = true;
+
+        let list = watch_list(&paths, &config);
+
+        assert_eq!(list.repos, watched_repos(&paths, &config), "both followed");
+        assert_eq!(list.opted_out.len(), 1, "{list:?}");
+        assert!(list.opted_out.iter().all(|p| p.ends_with("rb")), "{list:?}");
     }
 
     #[test]

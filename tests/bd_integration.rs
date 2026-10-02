@@ -13,10 +13,10 @@ use std::time::{Duration, SystemTime};
 
 use hank::app::{Msg, RefreshScope};
 use hank::bd::{BdCli, BdClient, RepoSyncReport};
-use hank::cli::{load_roster, run_repos_add, run_repos_remove, run_snapshot};
+use hank::cli::{load_roster, run_repos_add, run_repos_remove, run_repos_watch, run_snapshot};
 use hank::config::{Config, Paths, RepoEntry};
 use hank::hub::{ensure_hub, hub_dir, read_hub_roster};
-use hank::watch::{BdJournal, Checkpoints, Watcher};
+use hank::watch::{BdJournal, Checkpoints, WatchList, Watcher};
 use hank::{refresh, snapshot};
 use helpers::{
     bd_available, bd_has_events, bd_in, build_ready_fixture_repo,
@@ -83,10 +83,7 @@ fn ensure_hub_end_to_end() {
     let paths = Paths::with_base(tmp.path());
     let roster = Config {
         watch: false,
-        repos: vec![
-            RepoEntry { path: ra.clone() },
-            RepoEntry { path: rb.clone() },
-        ],
+        repos: vec![RepoEntry::new(ra.clone()), RepoEntry::new(rb.clone())],
     };
 
     let status = ensure_hub(&BdCli::new(), &paths, &roster).expect("ensure_hub");
@@ -140,10 +137,7 @@ fn refresh_two_repos() {
     let paths = Paths::with_base(tmp.path());
     let roster = Config {
         watch: false,
-        repos: vec![
-            RepoEntry { path: ra.clone() },
-            RepoEntry { path: rb.clone() },
-        ],
+        repos: vec![RepoEntry::new(ra.clone()), RepoEntry::new(rb.clone())],
     };
 
     // The hub must be registered before a refresh can sync it.
@@ -225,7 +219,7 @@ fn unchanged_refresh_preserves_export_mtime_and_uses_sync_cache() {
     let paths = Paths::with_base(tmp.path());
     let roster = Config {
         watch: false,
-        repos: vec![RepoEntry { path: repo.clone() }],
+        repos: vec![RepoEntry::new(repo.clone())],
     };
     ensure_hub(&BdCli::new(), &paths, &roster).expect("ensure hub");
 
@@ -268,7 +262,7 @@ fn refresh_attributes_hyphenated_repo() {
     let paths = Paths::with_base(tmp.path());
     let roster = Config {
         watch: false,
-        repos: vec![RepoEntry { path: repo.clone() }],
+        repos: vec![RepoEntry::new(repo.clone())],
     };
 
     ensure_hub(&BdCli::new(), &paths, &roster).expect("ensure_hub");
@@ -319,10 +313,7 @@ fn snapshot_command_end_to_end() {
     let paths = Paths::with_base(tmp.path());
     let roster = Config {
         watch: false,
-        repos: vec![
-            RepoEntry { path: ra.clone() },
-            RepoEntry { path: rb.clone() },
-        ],
+        repos: vec![RepoEntry::new(ra.clone()), RepoEntry::new(rb.clone())],
     };
 
     // Drive the full ensure_hub -> refresh -> fetch -> print path via the real
@@ -369,8 +360,8 @@ fn repos_remove_prunes_the_hub_end_to_end() {
     build_ready_fixture_repo_with_prefix(&rb, "rb");
 
     let paths = Paths::with_base(tmp.path());
-    run_repos_add(&paths, &ra, &mut Vec::new()).expect("add ra");
-    run_repos_add(&paths, &rb, &mut Vec::new()).expect("add rb");
+    run_repos_add(&BdCli::new(), &paths, &ra, &mut Vec::new()).expect("add ra");
+    run_repos_add(&BdCli::new(), &paths, &rb, &mut Vec::new()).expect("add rb");
     let roster = load_roster(&paths).expect("roster");
     run_snapshot(
         &roster,
@@ -447,10 +438,7 @@ fn search_end_to_end() {
     let paths = Paths::with_base(tmp.path());
     let roster = Config {
         watch: false,
-        repos: vec![
-            RepoEntry { path: ra.clone() },
-            RepoEntry { path: rb.clone() },
-        ],
+        repos: vec![RepoEntry::new(ra.clone()), RepoEntry::new(rb.clone())],
     };
 
     // Hydrate the hub from both repos.
@@ -514,7 +502,7 @@ fn expect_msg(rx: &mpsc::Receiver<Msg>, timeout: Duration, want: impl Fn(&Msg) -
 }
 
 fn start_watcher(
-    repos: Vec<std::path::PathBuf>,
+    repos: impl Into<WatchList>,
     file: std::path::PathBuf,
 ) -> (Watcher, mpsc::Receiver<Msg>) {
     let (tx, rx) = mpsc::channel();
@@ -540,14 +528,12 @@ fn watcher_follows_the_events_journal_end_to_end() {
     bd_in(&live, &["config", "set", "events-journal", "true"]);
     let checkpoints = tmp.path().join("events_checkpoints.json");
 
-    let (watcher, rx) = start_watcher(vec![live.clone(), off.clone()], checkpoints.clone());
-    let warning = expect_msg(&rx, Duration::from_secs(20), |m| {
-        matches!(m, Msg::WatchWarning(_))
-    });
-    assert!(
-        matches!(&warning, Msg::WatchWarning(w) if w.contains("off") && w.contains("events-journal")),
-        "a repo with the journal off is reported, not followed: {warning:?}"
-    );
+    // `off` is opted out (`hank repos unwatch`): its journal stays off.
+    let list = WatchList {
+        repos: vec![live.clone(), off.clone()],
+        opted_out: [off.clone()].into(),
+    };
+    let (watcher, rx) = start_watcher(list, checkpoints.clone());
 
     bd_in(&live, &["create", "Arrives live", "-p", "1"]);
     let changed = expect_msg(&rx, Duration::from_secs(20), |m| {
@@ -562,7 +548,7 @@ fn watcher_follows_the_events_journal_end_to_end() {
     // Hank's own refresh (export + hub sync) must not feed the journal back.
     let paths = Paths::with_base(tmp.path());
     let roster = Config {
-        repos: vec![RepoEntry { path: live.clone() }],
+        repos: vec![RepoEntry::new(live.clone())],
         watch: true,
     };
     ensure_hub(&BdCli::new(), &paths, &roster).expect("hub");
@@ -581,6 +567,10 @@ fn watcher_follows_the_events_journal_end_to_end() {
     let saved = Checkpoints::load(&checkpoints);
     assert!(saved.repos.contains_key(&live), "{saved:?}");
     assert!(!saved.repos.contains_key(&off));
+    assert!(
+        !BdCli::new().events_journal_enabled(&off).expect("read off"),
+        "an opted-out repo's journal is left off"
+    );
 
     // Resuming from the verified checkpoint replays nothing already seen.
     let (watcher, rx) = start_watcher(vec![live.clone()], checkpoints.clone());
@@ -657,4 +647,68 @@ fn events_journal_setting_reads_back_after_toggle() {
     assert!(bd.events_journal_enabled(&repo).expect("read on"));
     bd_in(&repo, &["config", "set", "events-journal", "false"]);
     assert!(!bd.events_journal_enabled(&repo).expect("read off"));
+}
+
+#[test]
+fn watcher_turns_on_an_off_journal_and_follows_it() {
+    if !bd_available() || !bd_has_events() {
+        eprintln!("SKIP: bd with `events` (>= 1.3.0) not installed");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("auto");
+    std::fs::create_dir_all(&repo).unwrap();
+    build_ready_fixture_repo_with_prefix(&repo, "wa");
+    let bd = BdCli::new();
+    assert!(!bd.events_journal_enabled(&repo).expect("read default"));
+
+    let (watcher, rx) = start_watcher(vec![repo.clone()], tmp.path().join("cp.json"));
+    let notice = expect_msg(&rx, Duration::from_secs(20), |m| {
+        matches!(m, Msg::WatchWarning(_))
+    });
+    assert!(
+        matches!(&notice, Msg::WatchWarning(w) if w.contains("turned on the events journal")),
+        "the write is announced: {notice:?}"
+    );
+    assert!(bd.events_journal_enabled(&repo).expect("read on"));
+    let config = std::fs::read_to_string(repo.join(".beads").join("config.yaml")).unwrap();
+    assert!(config.contains("events-journal"), "{config}");
+
+    bd_in(&repo, &["create", "Arrives after enable", "-p", "1"]);
+    let changed = expect_msg(&rx, Duration::from_secs(20), |m| {
+        matches!(m, Msg::WatchChanged(_))
+    });
+    assert_eq!(
+        changed,
+        Msg::WatchChanged(RefreshScope::Repos([repo.clone()].into()))
+    );
+    watcher.stop();
+}
+
+#[test]
+fn repos_watch_and_unwatch_round_trip_end_to_end() {
+    if !bd_available() || !bd_has_events() {
+        eprintln!("SKIP: bd with `events` (>= 1.3.0) not installed");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::with_base(tmp.path());
+    let repo = tmp.path().join("toggle");
+    std::fs::create_dir_all(&repo).unwrap();
+    build_ready_fixture_repo_with_prefix(&repo, "rt");
+    let bd = BdCli::new();
+    run_repos_add(&bd, &paths, &repo, &mut Vec::new()).expect("add");
+
+    run_repos_watch(&bd, &paths, Some(repo.as_path()), true, &mut Vec::new()).expect("watch");
+    assert!(bd.events_journal_enabled(&repo).expect("read on"));
+
+    run_repos_watch(&bd, &paths, Some(repo.as_path()), false, &mut Vec::new()).expect("unwatch");
+    assert!(!bd.events_journal_enabled(&repo).expect("read off"));
+    assert!(load_roster(&paths).unwrap().repos[0].unwatched);
+
+    let stranger = tmp.path().join("stranger");
+    std::fs::create_dir_all(&stranger).unwrap();
+    build_ready_fixture_repo_with_prefix(&stranger, "rs");
+    assert!(run_repos_watch(&bd, &paths, Some(stranger.as_path()), true, &mut Vec::new()).is_err());
+    assert!(!bd.events_journal_enabled(&stranger).expect("read stranger"));
 }

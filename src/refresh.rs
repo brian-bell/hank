@@ -551,9 +551,7 @@ fn normalized_jobs(roster: &Config, paths: &Paths) -> Vec<SourceJob> {
             seen.insert(normalize_path(&resolved_path))
                 .then_some(SourceJob {
                     roster_index,
-                    entry: RepoEntry {
-                        path: resolved_path,
-                    },
+                    entry: RepoEntry::new(resolved_path),
                 })
         })
         .collect()
@@ -1004,9 +1002,7 @@ mod tests {
             watch: false,
             repos: paths
                 .iter()
-                .map(|p| RepoEntry {
-                    path: p.to_path_buf(),
-                })
+                .map(|p| RepoEntry::new(p.to_path_buf()))
                 .collect(),
         }
     }
@@ -1053,9 +1049,7 @@ mod tests {
         let repo = seed_repo(config_dir, "repo", "repo");
         let config = Config {
             watch: false,
-            repos: vec![RepoEntry {
-                path: PathBuf::from("repo"),
-            }],
+            repos: vec![RepoEntry::new(PathBuf::from("repo"))],
         };
         let fake = FakeBdClient::new();
 
