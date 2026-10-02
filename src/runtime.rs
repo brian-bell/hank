@@ -76,6 +76,9 @@ pub(crate) struct RuntimeRefreshState {
     reconciled: Mutex<Option<ReconcileWitness>>,
     hub_access: RwLock<HubGenerationState>,
     maps: Mutex<HashMap<AttributionGeneration, Arc<refresh::PrefixMap>>>,
+    /// The `--watch` watcher, if live refresh is on. Each refresh hands it the
+    /// roster it reloaded, so a repo added mid-session gets a follower too.
+    watcher: OnceLock<Watcher>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +108,13 @@ impl RuntimeRefreshState {
             .lock()
             .expect("attribution map registry poisoned")
             .insert(generation, map);
+    }
+
+    /// Follow any `roster` repo the watcher (if running) doesn't follow yet.
+    fn watch_roster(&self, paths: &Paths, roster: &Config) {
+        if let Some(watcher) = self.watcher.get() {
+            watcher.follow(watched_repos(paths, roster));
+        }
     }
 
     fn prune(&self, retained: &HashSet<AttributionGeneration>) {
@@ -153,9 +163,10 @@ impl From<Msg> for Incoming {
 /// loop, and always restores the terminal before returning — even on error, so a
 /// failure never leaves the user's terminal wedged. `roster` is the launch roster,
 /// used to validate the on-disk cache that paints the first frame and to pick the
-/// repos a `watch` [`Watcher`] follows; every refresh re-reads `config.toml` (see
-/// [`reloading_refresh_worker`]). With `watch`, the watcher follows each repo's
-/// events journal and refreshes just the repos that change.
+/// repos a `watch` [`Watcher`] starts following; every refresh re-reads
+/// `config.toml` (see [`reloading_refresh_worker`]) and the watcher follows any
+/// repo added since. With `watch`, the watcher follows each repo's events
+/// journal and refreshes just the repos that change.
 pub fn run(paths: &Paths, roster: Config, watch: bool) -> Result<(), CliError> {
     let mut terminal = setup_terminal().map_err(CliError::Io)?;
     let loop_result = event_loop(&mut terminal, paths, &roster, watch);
@@ -209,18 +220,21 @@ fn event_loop(
     ));
     // Started after the launch refresh is spawned: anything the watcher reports
     // from here on queues behind that full refresh (the app is born stale).
-    let watcher = watch.then(|| {
+    // Later refreshes add repos that join the roster mid-session.
+    if watch {
         app.set_watching(true);
         let tx = tx.clone();
-        Watcher::start(
+        let watcher = Watcher::start(
             Arc::new(BdJournal::new()),
             watched_repos(paths, roster),
             paths.events_checkpoints_file().to_path_buf(),
             move |msg| {
                 let _ = tx.send(msg.into());
             },
-        )
-    });
+        );
+        // Only ever set here, so this cannot already hold a watcher.
+        let _ = refresh_state.watcher.set(watcher);
+    }
 
     // Run the render/reduce loop, then join threads *unconditionally* — for a
     // clean quit and for every error return alike — so a terminal write failure
@@ -236,7 +250,7 @@ fn event_loop(
         &refresh_state,
     );
     stop.store(true, Ordering::SeqCst);
-    if let Some(watcher) = watcher {
+    if let Some(watcher) = refresh_state.watcher.get() {
         watcher.stop();
     }
     let _ = input_handle.join();
@@ -398,7 +412,8 @@ fn spawn_refresh(
 /// honored by an already-open TUI, instead of its launch roster re-adding a
 /// removed repo to the hub. The reloaded roster also drives export, prefix
 /// attribution (so search, copy, and the repo picker follow it), and the cache
-/// key. An unreadable roster keeps the current view: one warning, no bd call.
+/// key, and with `--watch` the watcher picks up any repo it doesn't follow yet.
+/// An unreadable roster keeps the current view: one warning, no bd call.
 fn reloading_refresh_worker(
     bd: &impl BdClient,
     paths: Paths,
@@ -407,7 +422,10 @@ fn reloading_refresh_worker(
     scope: RefreshScope,
 ) {
     match load_roster(&paths) {
-        Ok(roster) => refresh_worker_with_state(bd, roster, paths, tx, state, scope),
+        Ok(roster) => {
+            state.watch_roster(&paths, &roster);
+            refresh_worker_with_state(bd, roster, paths, tx, state, scope)
+        }
         Err(error) => {
             let _ = tx.send(Msg::RefreshStarted.into());
             let warning = sanitize(&format!(
@@ -1432,6 +1450,68 @@ mod tests {
         assert_eq!(
             rb_row.repo_name, "rb",
             "rb's rows are attributed through the reloaded roster's prefix map"
+        );
+    }
+
+    /// A journal whose follows stay open until the watcher stops, reporting
+    /// each repo it is asked to follow.
+    struct ParkedJournal(Mutex<Sender<PathBuf>>);
+
+    impl crate::watch::JournalSource for ParkedJournal {
+        fn probe(&self, _repo: &Path, _since: u64) -> crate::watch::ProbeOutput {
+            crate::watch::ProbeOutput {
+                success: true,
+                ..Default::default()
+            }
+        }
+
+        fn follow(
+            &self,
+            repo: &Path,
+            _since: u64,
+            stop: &AtomicBool,
+            _on_line: &mut dyn FnMut(&str),
+        ) {
+            let _ = self.0.lock().unwrap().send(repo.to_path_buf());
+            while !stop.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn interrupt(&self) {}
+    }
+
+    #[test]
+    fn refresh_hands_a_repo_added_after_launch_to_the_watcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let rb = seed_repo(tmp.path(), "rb", "rb");
+        let state = Arc::new(RuntimeRefreshState::default());
+        seed_initialized_hub(&paths, &[&ra]);
+        let launch = roster(&[&ra]);
+        let (tx, follows) = mpsc::channel();
+        let watcher = Watcher::start(
+            Arc::new(ParkedJournal(Mutex::new(tx))),
+            watched_repos(&paths, &launch),
+            paths.events_checkpoints_file().to_path_buf(),
+            |_| {},
+        );
+        assert!(state.watcher.set(watcher).is_ok());
+        let next = || follows.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(next().ends_with("ra"), "the launch roster is followed");
+        // `hank repos add rb` ran in another terminal after launch.
+        roster(&[&ra, &rb]).save(paths.config_file()).unwrap();
+
+        let bd = FakeBdClient::new().with_ready(vec![issue("ra-1", 1, "Ready one")]);
+        let (snapshot, _warnings, _calls) = reloading_refresh(bd, &paths, &state);
+
+        assert!(snapshot.is_some());
+        assert!(next().ends_with("rb"), "the added repo is followed too");
+        state.watcher.get().unwrap().stop();
+        assert!(
+            follows.try_recv().is_err(),
+            "ra keeps its one follower: no duplicate on reload"
         );
     }
 
