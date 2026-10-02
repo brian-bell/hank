@@ -1530,7 +1530,7 @@ mod tests {
 
         fn interrupt(&self) {}
 
-        fn enable(&self, _repo: &Path) -> Result<(), String> {
+        fn set_journal(&self, _repo: &Path, _on: bool) -> Result<(), String> {
             Ok(())
         }
     }

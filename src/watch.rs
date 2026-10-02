@@ -298,9 +298,9 @@ pub trait JournalSource: Send + Sync + 'static {
     fn follow(&self, repo: &Path, since: u64, stop: &AtomicBool, on_line: &mut dyn FnMut(&str));
     /// Interrupt every running `follow` (shutdown).
     fn interrupt(&self);
-    /// `bd -C <repo> config set events-journal true`, returning bd's error
+    /// `bd -C <repo> config set events-journal <on>`, returning bd's error
     /// text on failure.
-    fn enable(&self, repo: &Path) -> Result<(), String>;
+    fn set_journal(&self, repo: &Path, on: bool) -> Result<(), String>;
 }
 
 /// The real [`JournalSource`]: spawns `bd` from PATH.
@@ -395,9 +395,9 @@ impl JournalSource for BdJournal {
         }
     }
 
-    fn enable(&self, repo: &Path) -> Result<(), String> {
+    fn set_journal(&self, repo: &Path, on: bool) -> Result<(), String> {
         BdCli::new()
-            .set_events_journal(repo, true)
+            .set_events_journal(repo, on)
             .map_err(|error| error.to_string())
     }
 }
@@ -467,7 +467,22 @@ fn follow_repo_with_backoff(
                         // opted it out, and `hank doctor` still lists it.
                         if !enable_tried && may_enable() {
                             enable_tried = true;
-                            match source.enable(repo) {
+                            match source.set_journal(repo, true) {
+                                // `hank repos unwatch` saves its opt-out before
+                                // turning the journal off, so if it ran between
+                                // the check and the write, re-checking now sees
+                                // it: undo the write, and allow a fresh attempt
+                                // should the repo be watched again.
+                                Ok(()) if !may_enable() => {
+                                    enable_tried = false;
+                                    if let Err(detail) = source.set_journal(repo, false) {
+                                        let _ = reports.send(Report::Warning(format!(
+                                            "{} was unwatched as live refresh turned its events journal on, and turning it back off failed: {}",
+                                            repo_label(repo),
+                                            first_line(&detail)
+                                        )));
+                                    }
+                                }
                                 Ok(()) => {
                                     let _ = reports.send(Report::Warning(format!(
                                         "live refresh turned on the events journal for {} (.beads/config.yaml; `hank repos unwatch` undoes it)",
@@ -1020,11 +1035,12 @@ mod tests {
 
         fn interrupt(&self) {}
 
-        fn enable(&self, _repo: &Path) -> Result<(), String> {
-            self.calls.lock().unwrap().push("enable".to_string());
+        fn set_journal(&self, _repo: &Path, on: bool) -> Result<(), String> {
+            let call = if on { "enable" } else { "disable" };
+            self.calls.lock().unwrap().push(call.to_string());
             match &self.enable_error {
-                Some(error) => Err(error.clone()),
-                None => Ok(()),
+                Some(error) if on => Err(error.clone()),
+                _ => Ok(()),
             }
         }
     }
@@ -1158,6 +1174,39 @@ mod tests {
     }
 
     #[test]
+    fn enable_racing_an_unwatch_is_undone_quietly() {
+        // Off, then on: the follower's enable landed after `hank repos
+        // unwatch` turned the journal off, so the undo is all that keeps it off.
+        let source = FakeJournal::default()
+            .probe(disabled())
+            .probe(ok(""))
+            .stream(&[&record(1, "t1")]);
+        let allowed = std::cell::Cell::new(true);
+        let may_enable = || allowed.replace(false);
+        let (tx, rx) = mpsc::channel();
+        follow_repo_with_backoff(
+            &source,
+            Path::new("/r"),
+            None,
+            &may_enable,
+            &tx,
+            &AtomicBool::new(false),
+            Duration::ZERO,
+        );
+        drop(tx);
+        let reports: Vec<Report> = rx.into_iter().collect();
+        assert_eq!(
+            reports,
+            vec![changed(1)],
+            "no announcement for an undone write"
+        );
+        assert_eq!(
+            source.calls()[..5],
+            ["probe 0", "enable", "disable", "probe 0", "follow 0"]
+        );
+    }
+
+    #[test]
     fn failed_enable_warns_once_and_keeps_rechecking() {
         let source = FakeJournal::default()
             .failing_enable("config.yaml is read-only")
@@ -1269,7 +1318,7 @@ mod tests {
 
         fn interrupt(&self) {}
 
-        fn enable(&self, _repo: &Path) -> Result<(), String> {
+        fn set_journal(&self, _repo: &Path, _on: bool) -> Result<(), String> {
             Ok(())
         }
     }
@@ -1329,8 +1378,10 @@ mod tests {
 
         fn interrupt(&self) {}
 
-        fn enable(&self, repo: &Path) -> Result<(), String> {
-            self.enables.lock().unwrap().push(repo.to_path_buf());
+        fn set_journal(&self, repo: &Path, on: bool) -> Result<(), String> {
+            if on {
+                self.enables.lock().unwrap().push(repo.to_path_buf());
+            }
             Ok(())
         }
     }
