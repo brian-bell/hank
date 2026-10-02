@@ -179,10 +179,11 @@ fn cmp_updated_desc(a: &Option<String>, b: &Option<String>) -> Ordering {
 }
 
 /// Parse an RFC3339 timestamp (`YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM)`) into a
-/// UTC instant as `(unix seconds, nanoseconds)`, or `None` if malformed.
-/// Fractional digits past nanosecond precision are truncated. Hand-rolled to
+/// UTC instant as `(unix seconds, fractional digits)`, or `None` if malformed.
+/// The fraction keeps every digit with trailing zeros trimmed, so for equal
+/// seconds a plain string compare orders it at any precision. Hand-rolled to
 /// avoid a date-time dependency for a sort key.
-fn parse_rfc3339(s: &str) -> Option<(i64, u32)> {
+fn parse_rfc3339(s: &str) -> Option<(i64, &str)> {
     let b = s.as_bytes();
     let num = |range: std::ops::Range<usize>| -> Option<i64> {
         let digits = b.get(range)?;
@@ -217,21 +218,17 @@ fn parse_rfc3339(s: &str) -> Option<(i64, u32)> {
     }
 
     let mut i = 19;
-    let mut nanos: u32 = 0;
+    let mut fraction = "";
     if b.get(i) == Some(&b'.') {
         i += 1;
         let start = i;
         while b.get(i).is_some_and(u8::is_ascii_digit) {
-            if i - start < 9 {
-                nanos = nanos * 10 + u32::from(b[i] - b'0');
-            }
             i += 1;
         }
-        let digits = i - start;
-        if digits == 0 {
+        if i == start {
             return None;
         }
-        nanos *= 10u32.pow(9u32.saturating_sub(digits as u32));
+        fraction = s[start..i].trim_end_matches('0');
     }
 
     let offset_secs = match b.get(i)? {
@@ -258,7 +255,7 @@ fn parse_rfc3339(s: &str) -> Option<(i64, u32)> {
     let days = era * 146_097 + doe - 719_468;
 
     let secs = days * 86_400 + hour * 3600 + minute * 60 + second - offset_secs;
-    Some((secs, nanos))
+    Some((secs, fraction))
 }
 
 /// A path's final component as a string, falling back to the full path string
@@ -439,24 +436,25 @@ mod tests {
 
     #[test]
     fn parses_rfc3339_variants_to_utc_instants() {
-        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some((0, 0)));
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some((0, "")));
         assert_eq!(
             parse_rfc3339("2026-07-11T12:41:25Z"),
-            Some((1_783_773_685, 0))
+            Some((1_783_773_685, ""))
         );
         assert_eq!(
             parse_rfc3339("2026-07-11T12:41:25.123456789Z"),
-            Some((1_783_773_685, 123_456_789))
+            Some((1_783_773_685, "123456789"))
         );
         assert_eq!(
-            parse_rfc3339("2026-07-11T12:41:25.5Z"),
-            Some((1_783_773_685, 500_000_000))
+            parse_rfc3339("2026-07-11T12:41:25.500Z"),
+            Some((1_783_773_685, "5"))
         );
-        // Precision past nanoseconds is truncated, not rejected.
-        assert_eq!(
-            parse_rfc3339("2026-07-11T12:41:25.1234567891Z"),
-            Some((1_783_773_685, 123_456_789))
+        // Precision past nanoseconds is kept, so it still orders.
+        assert!(
+            parse_rfc3339("2026-07-11T12:41:25.1234567892Z")
+                > parse_rfc3339("2026-07-11T12:41:25.1234567891Z")
         );
+        assert!(parse_rfc3339("2026-07-11T12:41:25.5Z") > parse_rfc3339("2026-07-11T12:41:25.12Z"));
         assert_eq!(
             parse_rfc3339("2026-07-11T14:41:25+02:00"),
             parse_rfc3339("2026-07-11T12:41:25Z")
@@ -467,7 +465,7 @@ mod tests {
         );
         assert_eq!(
             parse_rfc3339("2024-02-29T00:00:00Z"),
-            Some((1_709_164_800, 0))
+            Some((1_709_164_800, ""))
         );
         for bad in [
             "",
