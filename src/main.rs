@@ -117,11 +117,11 @@ fn run() -> Result<(), CliError> {
         }
         Some(Command::Reset) => cli::run_reset(&paths, &mut stdout),
         Some(Command::Doctor) => cli::run_doctor(&bd, &paths, &mut stdout),
-        // Roster editing is pure config I/O — no bd, no hub. Each runner loads and
-        // saves the roster itself.
+        // Roster editing is config I/O; only `remove` touches bd, to prune the hub.
+        // Each runner loads and saves the roster itself.
         Some(Command::Repos { action }) => match action {
             ReposAction::Add { path } => cli::run_repos_add(&paths, &path, &mut stdout),
-            ReposAction::Remove { path } => cli::run_repos_remove(&paths, &path, &mut stdout),
+            ReposAction::Remove { path } => cli::run_repos_remove(&bd, &paths, &path, &mut stdout),
             ReposAction::List => cli::run_repos_list(&paths, &mut stdout),
             ReposAction::Discover { root, add } => {
                 cli::run_repos_discover(&paths, &root, add, &mut stdout)

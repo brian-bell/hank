@@ -83,8 +83,10 @@ Module map (`src/`):
   parsers, migration logic, and public interfaces.
 - serde forward-compatibility: any key bd omits when empty is
   `Option`/`#[serde(default)]`; never add `#[serde(deny_unknown_fields)]`.
-- `bd repo list --json` is broken in bd 1.1.0 (ignores `--json`), so the hub's
+- `bd repo list --json` is broken in bd 1.1.0–1.3.0 (ignores `--json`), so the hub's
   roster is read from `<hub>/.beads/config.yaml` `repos.additional` instead.
+- `bd search` includes closed issues by default since bd 1.3.0; `BdCli::search`
+  drops them client-side so results match older bd and stay live work only.
 - Canonical user state lives at `<config_root>/hank/config.toml` and
   `<data_root>/hank/ui_state.json`. Startup safely migrates only those two
   user-owned legacy files from `federated-beads/`; it never copies the legacy

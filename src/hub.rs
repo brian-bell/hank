@@ -4,8 +4,9 @@
 //! The hub is a bd "hub" workspace under hank's data dir
 //! (`<data_dir>/hub`). [`ensure_hub`] initializes it once, then registers each
 //! roster repo the hub does not already track; missing roster paths warn rather
-//! than fail. [`reset`] deletes the hub dir, guarded so it can only ever remove
-//! a path inside the data dir.
+//! than fail. [`prune_repos`] unregisters repos dropped from the roster (and the
+//! issues hydrated from them). [`reset`] deletes the hub dir, guarded so it can
+//! only ever remove a path inside the data dir.
 //!
 //! Reading the hub's current roster goes through `<hub>/.beads/config.yaml`
 //! `repos.additional`, not `bd repo list --json`: bd 1.1.0 ignores `--json` for
@@ -210,6 +211,47 @@ pub fn ensure_hub(
     }
 
     Ok(HubStatus { warnings })
+}
+
+/// The hub's registered repos that `matches` selects, as `(stored, resolved)`
+/// pairs: `stored` is the `repos.additional` string bd matches on, `resolved` the
+/// path made absolute against the hub. Empty when the hub is not initialized.
+pub fn tracked_repos_matching(
+    paths: &Paths,
+    matches: impl Fn(&Path) -> bool,
+) -> Result<Vec<(PathBuf, PathBuf)>, HubError> {
+    let hub = hub_dir(paths);
+    if !is_initialized(&hub) {
+        return Ok(Vec::new());
+    }
+    Ok(read_hub_roster(&hub)?
+        .into_iter()
+        .map(|stored| {
+            let resolved = resolve_against(&hub, &stored);
+            (stored, resolved)
+        })
+        .filter(|(_, resolved)| matches(resolved))
+        .collect())
+}
+
+/// Unregister every hub repo that `matches` selects via `bd repo remove`, which
+/// also deletes the issues the hub hydrated from it. Returns the resolved paths
+/// removed (empty when the hub is not initialized or tracks no match).
+///
+/// The caller must hold the hub lock: this mutates the hub a concurrent refresh
+/// would otherwise be syncing.
+pub fn prune_repos(
+    bd: &impl BdClient,
+    paths: &Paths,
+    matches: impl Fn(&Path) -> bool,
+) -> Result<Vec<PathBuf>, HubError> {
+    let hub = hub_dir(paths);
+    let mut removed = Vec::new();
+    for (stored, resolved) in tracked_repos_matching(paths, matches)? {
+        bd.repo_remove(&hub, &stored)?;
+        removed.push(resolved);
+    }
+    Ok(removed)
 }
 
 /// Delete the hub directory, but only after proving it is inside the data dir.
@@ -571,6 +613,57 @@ mod tests {
         assert!(ensure_within(data, data).is_err());
         // Sibling with a shared string prefix must not pass.
         assert!(ensure_within(data, Path::new("/data/hank-evil")).is_err());
+    }
+
+    #[test]
+    fn prune_repos_removes_matching_entries_by_stored_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let hub = hub_dir(&paths);
+        let ra = make_repo(tmp.path(), "ra");
+        // `rb` sits beside the hub and is stored hub-relative, as bd may store it.
+        let rb = make_repo(paths.data_dir(), "rb");
+        let rb_relative = PathBuf::from("../rb");
+        fs::create_dir_all(&hub).unwrap();
+        seed_hub_config(&hub, &[&ra, &rb_relative]);
+        let bd = FakeBdClient::new();
+
+        let removed = prune_repos(&bd, &paths, |p| normalize(p) == normalize(&rb)).unwrap();
+
+        assert_eq!(removed, vec![hub.join(&rb_relative)]);
+        // bd matches the stored string exactly, so the relative spelling is passed.
+        assert_eq!(bd.calls(), vec![Call::RepoRemove(hub.clone(), rb_relative)]);
+    }
+
+    #[test]
+    fn prune_repos_is_a_noop_without_an_initialized_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let bd = FakeBdClient::new();
+
+        let removed = prune_repos(&bd, &paths, |_| true).unwrap();
+
+        assert!(removed.is_empty());
+        assert!(bd.calls().is_empty(), "no bd call: {:?}", bd.calls());
+    }
+
+    #[test]
+    fn prune_repos_propagates_bd_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let hub = hub_dir(&paths);
+        let ra = make_repo(tmp.path(), "ra");
+        fs::create_dir_all(&hub).unwrap();
+        seed_hub_config(&hub, &[&ra]);
+        let bd = FakeBdClient::new().with_repo_remove_err(BdError {
+            command: "bd repo remove".into(),
+            stderr: "boom".into(),
+            kind: crate::bd::BdErrorKind::NonZeroExit { code: Some(1) },
+        });
+
+        let err = prune_repos(&bd, &paths, |_| true).unwrap_err();
+
+        assert!(matches!(err, HubError::Bd(_)), "{err:?}");
     }
 
     #[test]

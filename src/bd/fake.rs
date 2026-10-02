@@ -22,6 +22,7 @@ pub enum Call {
     Version,
     Init(PathBuf, String),
     RepoAdd(PathBuf, PathBuf),
+    RepoRemove(PathBuf, PathBuf),
     RepoList(PathBuf),
     Export(PathBuf, PathBuf),
     IssuePrefix(PathBuf),
@@ -40,7 +41,7 @@ pub enum Call {
 /// without writing another fake. Each `with_*` response is **reused** across
 /// calls (not consumed). Unset slots default to something benign: the
 /// value-returning calls yield an empty list / bd 1.1.0 version / an empty show
-/// error, and the unit-returning calls (`init`/`repo_add`/`repo_sync`) yield
+/// error, and the unit-returning calls (`init`/`repo_add`/`repo_remove`/`repo_sync`) yield
 /// `Ok(())`. `export` is keyed **per repo path** so one repo can fail while the
 /// rest succeed. Every call is recorded and retrievable via
 /// [`FakeBdClient::calls`].
@@ -52,6 +53,7 @@ pub struct FakeBdClient {
     version: Option<Result<BdVersion, BdError>>,
     init: Option<Result<(), BdError>>,
     repo_add: Option<Result<(), BdError>>,
+    repo_remove: Option<Result<(), BdError>>,
     repo_list: Option<Result<serde_json::Value, BdError>>,
     repo_sync: Option<Result<RepoSyncReport, BdError>>,
     ready: Option<Result<Vec<Issue>, BdError>>,
@@ -94,6 +96,11 @@ impl FakeBdClient {
 
     pub fn with_repo_add_err(mut self, err: BdError) -> Self {
         self.repo_add = Some(Err(err));
+        self
+    }
+
+    pub fn with_repo_remove_err(mut self, err: BdError) -> Self {
+        self.repo_remove = Some(Err(err));
         self
     }
 
@@ -237,6 +244,11 @@ impl BdClient for FakeBdClient {
     fn repo_add(&self, hub: &Path, repo_path: &Path) -> Result<(), BdError> {
         self.record(Call::RepoAdd(hub.to_path_buf(), repo_path.to_path_buf()));
         resolve(&self.repo_add, || ())
+    }
+
+    fn repo_remove(&self, hub: &Path, repo_path: &Path) -> Result<(), BdError> {
+        self.record(Call::RepoRemove(hub.to_path_buf(), repo_path.to_path_buf()));
+        resolve(&self.repo_remove, || ())
     }
 
     fn repo_list(&self, hub: &Path) -> Result<serde_json::Value, BdError> {

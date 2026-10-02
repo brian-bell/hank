@@ -13,14 +13,14 @@ use std::time::{Duration, SystemTime};
 
 use hank::app::{Msg, RefreshScope};
 use hank::bd::{BdCli, BdClient, RepoSyncReport};
-use hank::cli::run_snapshot;
+use hank::cli::{load_roster, run_repos_add, run_repos_remove, run_snapshot};
 use hank::config::{Config, Paths, RepoEntry};
 use hank::hub::{ensure_hub, hub_dir, read_hub_roster};
 use hank::watch::{BdJournal, Checkpoints, Watcher};
 use hank::{refresh, snapshot};
 use helpers::{
     bd_available, bd_has_events, bd_in, build_ready_fixture_repo,
-    build_ready_fixture_repo_with_prefix,
+    build_ready_fixture_repo_with_prefix, create_closed_issue,
 };
 
 #[test]
@@ -354,6 +354,76 @@ fn snapshot_command_end_to_end() {
 }
 
 #[test]
+fn repos_remove_prunes_the_hub_end_to_end() {
+    if !bd_available() {
+        eprintln!("SKIP: bd not installed");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ra = tmp.path().join("ra");
+    let rb = tmp.path().join("rb");
+    std::fs::create_dir_all(&ra).expect("mkdir ra");
+    std::fs::create_dir_all(&rb).expect("mkdir rb");
+    build_ready_fixture_repo_with_prefix(&ra, "ra");
+    build_ready_fixture_repo_with_prefix(&rb, "rb");
+
+    let paths = Paths::with_base(tmp.path());
+    run_repos_add(&paths, &ra, &mut Vec::new()).expect("add ra");
+    run_repos_add(&paths, &rb, &mut Vec::new()).expect("add rb");
+    let roster = load_roster(&paths).expect("roster");
+    run_snapshot(
+        &roster,
+        &BdCli::new(),
+        &paths,
+        false,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
+    .expect("build and sync the hub");
+    let hub = hub_dir(&paths);
+    let ready = BdCli::new().ready(&hub).expect("bd ready on hub");
+    assert!(ready.iter().any(|i| i.id.starts_with("ra-")), "ra hydrated");
+
+    let mut out = Vec::new();
+    run_repos_remove(&BdCli::new(), &paths, &ra, &mut out).expect("remove ra");
+
+    let ra = std::fs::canonicalize(&ra).unwrap();
+    let rb = std::fs::canonicalize(&rb).unwrap();
+    assert_eq!(read_hub_roster(&hub).expect("hub roster"), vec![rb]);
+    let ready = BdCli::new().ready(&hub).expect("bd ready on hub");
+    assert!(
+        !ready.iter().any(|i| i.id.starts_with("ra-")),
+        "ra's hydrated issues are gone without a reset: {:?}",
+        ready.iter().map(|i| &i.id).collect::<Vec<_>>()
+    );
+    assert!(
+        ready.iter().any(|i| i.id.starts_with("rb-")),
+        "rb untouched"
+    );
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains(&format!("dropped {} from the hub", ra.display())),
+        "{out}"
+    );
+
+    // A follow-up snapshot (sync) must not resurrect the removed repo.
+    let roster = load_roster(&paths).expect("roster");
+    let mut stdout = Vec::new();
+    run_snapshot(
+        &roster,
+        &BdCli::new(),
+        &paths,
+        false,
+        &mut stdout,
+        &mut Vec::new(),
+    )
+    .expect("snapshot after remove");
+    let stdout = String::from_utf8(stdout).unwrap();
+    assert!(!stdout.contains("ra-"), "{stdout}");
+}
+
+#[test]
 fn search_end_to_end() {
     // The schema-drift tripwire for `bd search --json` (Slice 11): drive the exact
     // search-worker path — `bd search` on the hub, then the shared attribution —
@@ -370,6 +440,9 @@ fn search_end_to_end() {
     std::fs::create_dir_all(&rb).expect("mkdir rb");
     build_ready_fixture_repo_with_prefix(&ra, "ra");
     build_ready_fixture_repo_with_prefix(&rb, "rb");
+    // bd >= 1.3.0 includes closed issues in `bd search` by default; hank's search
+    // is for finding live work, so a closed match must not come back.
+    let closed = create_closed_issue(&ra, "Closed task");
 
     let paths = Paths::with_base(tmp.path());
     let roster = Config {
@@ -393,6 +466,16 @@ fn search_end_to_end() {
     assert!(
         !issues.is_empty(),
         "the fixture titles all contain 'task', so search finds them"
+    );
+    assert!(
+        issues
+            .iter()
+            .all(|i| i.id != closed && i.status != "closed"),
+        "closed issues are excluded from search: {:?}",
+        issues
+            .iter()
+            .map(|i| (&i.id, &i.status))
+            .collect::<Vec<_>>()
     );
     let snap = snapshot::attribute(issues, &refreshed.prefix_map, SystemTime::now());
 
