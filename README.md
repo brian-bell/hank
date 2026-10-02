@@ -68,7 +68,8 @@ bd -C ~/dev/megaclock config set events-journal true
 ```
 
 A repo with the journal off shows a status-bar note and is simply not
-followed. Hank saves the last journal position per repo in
+followed; `hank doctor` prints `journal: on|off` for every roster repo. Hank
+saves the last journal position per repo in
 `hank/events_checkpoints.json` under the data dir and resumes from it; if the
 journal has pruned past that position, Hank falls back to a full refresh.
 Syncs such as `bd dolt pull` are not journaled, so press `r` after pulling;
@@ -110,7 +111,7 @@ sequence and does not wrap it for tmux passthrough in v1.
 
 ```bash
 hank snapshot [--json]   # print the merged, attributed ready list (no TUI)
-hank doctor              # bd version + gate, config/hub paths, per-repo health
+hank doctor              # bd version + gate, config/hub paths, per-repo health + journal
 hank reset               # delete the hub DB; rebuilt on the next snapshot/launch
 hank repos add <path>    # add a beads repo to the roster
 hank repos remove <path> # drop a repo from the roster and the hub

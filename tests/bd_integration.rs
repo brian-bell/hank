@@ -636,3 +636,25 @@ fn watcher_rebaselines_a_pruned_checkpoint() {
         "the pruned checkpoint is forgotten"
     );
 }
+
+#[test]
+fn events_journal_setting_reads_back_after_toggle() {
+    if !bd_available() || !bd_has_events() {
+        eprintln!("SKIP: bd with `events` (>= 1.3.0) not installed");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("rj");
+    std::fs::create_dir_all(&repo).unwrap();
+    build_ready_fixture_repo_with_prefix(&repo, "rj");
+    let bd = BdCli::new();
+
+    assert!(
+        !bd.events_journal_enabled(&repo).expect("read default"),
+        "a fresh repo has the journal off"
+    );
+    bd_in(&repo, &["config", "set", "events-journal", "true"]);
+    assert!(bd.events_journal_enabled(&repo).expect("read on"));
+    bd_in(&repo, &["config", "set", "events-journal", "false"]);
+    assert!(!bd.events_journal_enabled(&repo).expect("read off"));
+}
