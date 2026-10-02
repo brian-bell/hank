@@ -122,6 +122,16 @@ fn argv_repo_add(hub: &Path, repo_path: &Path) -> Vec<OsString> {
     ]
 }
 
+fn argv_repo_remove(hub: &Path, repo_path: &Path) -> Vec<OsString> {
+    vec![
+        "-C".into(),
+        arg(hub),
+        "repo".into(),
+        "remove".into(),
+        arg(repo_path),
+    ]
+}
+
 fn argv_repo_list(hub: &Path) -> Vec<OsString> {
     vec![
         "-C".into(),
@@ -224,6 +234,10 @@ impl BdClient for BdCli {
         self.run_ok(argv_repo_add(hub, repo_path))
     }
 
+    fn repo_remove(&self, hub: &Path, repo_path: &Path) -> Result<(), BdError> {
+        self.run_ok(argv_repo_remove(hub, repo_path))
+    }
+
     fn repo_list(&self, hub: &Path) -> Result<serde_json::Value, BdError> {
         self.run_json(argv_repo_list(hub))
     }
@@ -297,6 +311,11 @@ mod tests {
         assert_eq!(
             argv_repo_add(Path::new("/tmp/hub"), Path::new("/tmp/ra")),
             os(&["-C", "/tmp/hub", "repo", "add", "/tmp/ra"])
+        );
+
+        assert_eq!(
+            argv_repo_remove(Path::new("/tmp/hub"), Path::new("/tmp/ra")),
+            os(&["-C", "/tmp/hub", "repo", "remove", "/tmp/ra"])
         );
 
         assert_eq!(

@@ -43,6 +43,10 @@ pub trait BdClient: Sync {
     fn init(&self, dir: &Path, prefix: &str) -> Result<(), BdError>;
     /// `bd -C <hub> repo add <repo_path>` — register a source repo with the hub.
     fn repo_add(&self, hub: &Path, repo_path: &Path) -> Result<(), BdError>;
+    /// `bd -C <hub> repo remove <repo_path>` — unregister a source repo and delete
+    /// the issues the hub hydrated from it. bd matches `repo_path` against the
+    /// stored `repos.additional` string exactly, so pass the entry as stored.
+    fn repo_remove(&self, hub: &Path, repo_path: &Path) -> Result<(), BdError>;
     /// `bd -C <hub> repo list --json` — the hub's registered repos. The shape is
     /// consumed in Slice 3; here it is returned as a tolerant JSON value.
     fn repo_list(&self, hub: &Path) -> Result<serde_json::Value, BdError>;

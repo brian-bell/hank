@@ -443,9 +443,9 @@ pub fn run_repos_add(paths: &Paths, path: &Path, out: &mut impl Write) -> Result
     Ok(())
 }
 
-/// `hank repos remove <path>`: drop the entry naming `path` and hint that the hub
-/// needs a `hank reset` to forget it. Removing an entry that is not present is a
-/// friendly no-op (idempotent), not an error.
+/// `hank repos remove <path>`: drop the entry naming `path` from the roster, then
+/// prune it from the hub so its issues disappear without a `hank reset`. Removing
+/// an entry that is not present is a friendly no-op (idempotent), not an error.
 ///
 /// Matching normalizes both the input and each stored entry through `store_path`, so
 /// a repo added by one spelling is removed by another (relative or `~`), and a repo
@@ -453,7 +453,16 @@ pub fn run_repos_add(paths: &Paths, path: &Path, out: &mut impl Write) -> Result
 /// fallback. A raw path-string equality is kept as a last resort. The one gap is a
 /// repo added via a now-dangling symlink (see `store_path`); remove it by the
 /// canonical path from `hank repos list`.
-pub fn run_repos_remove(paths: &Paths, path: &Path, out: &mut impl Write) -> Result<(), CliError> {
+///
+/// The hub is pruned by the same match whether or not the roster held the entry, so
+/// re-running `remove` finishes a prune that an earlier run could not (e.g. while
+/// another hank held the hub lock).
+pub fn run_repos_remove(
+    bd: &impl BdClient,
+    paths: &Paths,
+    path: &Path,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
     let canonical = store_path(path);
     let expanded = expand_tilde(path);
     let mut roster = load_roster(paths)?;
@@ -467,21 +476,57 @@ pub fn run_repos_remove(paths: &Paths, path: &Path, out: &mut impl Write) -> Res
             "not in the roster: {}",
             sanitize(&expanded.display().to_string())
         )?;
+    } else {
+        save_roster(&roster, paths)?;
+        writeln!(
+            out,
+            "removed {} from the roster",
+            sanitize(&expanded.display().to_string())
+        )?;
+    }
+    prune_hub(
+        bd,
+        paths,
+        |p| store_path(p) == canonical || p == expanded,
+        out,
+    )
+}
+
+/// Drop the hub repos `matches` selects, under the hub lock. Skips the lock (and
+/// any output) when the hub tracks no match; when another hank holds the lock, says
+/// how to finish the prune rather than blocking.
+fn prune_hub(
+    bd: &impl BdClient,
+    paths: &Paths,
+    matches: impl Fn(&Path) -> bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    if hub::tracked_repos_matching(paths, &matches)?.is_empty() {
         return Ok(());
     }
-    save_roster(&roster, paths)?;
-    writeln!(
-        out,
-        "removed {} from the roster",
-        sanitize(&expanded.display().to_string())
-    )?;
-    // The hub (Slice 3) is additive-only and keeps a removed repo until rebuilt, so
-    // point the user at the disposable-rebuild path. Hooks federated-beads-dxh.15
-    // without pruning the hub here.
-    writeln!(
-        out,
-        "note: run `hank reset` so the hub drops this repo (the hub is rebuilt from the roster)",
-    )?;
+    let Some(_lock) = refresh::HubLock::try_acquire(&hub_dir(paths))? else {
+        writeln!(
+            out,
+            "note: another hank is refreshing the hub; re-run this command to drop the repo from the hub",
+        )?;
+        return Ok(());
+    };
+    let pruned = hub::prune_repos(bd, paths, &matches)?;
+    if pruned.is_empty() {
+        return Ok(());
+    }
+    // The hub's contents changed: retire the published generation so a running TUI
+    // re-verifies before searching, and drop the snapshot cache so the next launch
+    // never paints the removed repo's rows.
+    refresh::publish_hub_generation(paths, &refresh::HubGenerationToken::fresh())?;
+    cache::clear(paths.cache_file())?;
+    for repo in pruned {
+        writeln!(
+            out,
+            "dropped {} from the hub",
+            sanitize(&repo.display().to_string())
+        )?;
+    }
     Ok(())
 }
 
@@ -581,7 +626,7 @@ pub fn run_repos_discover(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bd::{BdErrorKind, FakeBdClient, Issue};
+    use crate::bd::{BdErrorKind, Call, FakeBdClient, Issue};
     use crate::config::RepoEntry;
     use crate::refresh::HubLock;
     use std::fs;
@@ -1226,7 +1271,7 @@ mod tests {
         run_repos_add(&paths, &rb, &mut Vec::new()).unwrap();
 
         let mut out = Vec::new();
-        run_repos_remove(&paths, &ra, &mut out).expect("remove ok");
+        run_repos_remove(&FakeBdClient::new(), &paths, &ra, &mut out).expect("remove ok");
 
         let remaining = reload(&paths);
         assert_eq!(remaining.repos.len(), 1, "one entry left");
@@ -1241,19 +1286,113 @@ mod tests {
         );
     }
 
+    /// Seed an initialized hub (as `bd init` + `bd repo add` leave it) tracking
+    /// `additional`, stored verbatim.
+    fn seed_hub(paths: &Paths, additional: &[&Path]) -> PathBuf {
+        let hub = hub_dir(paths);
+        let beads = hub.join(".beads");
+        fs::create_dir_all(beads.join("embeddeddolt")).unwrap();
+        let mut yaml = String::from("repos:\n  primary: \".\"\n  additional:\n");
+        for p in additional {
+            yaml.push_str(&format!("    - \"{}\"\n", p.display()));
+        }
+        fs::write(beads.join("config.yaml"), yaml).unwrap();
+        hub
+    }
+
     #[test]
-    fn remove_hints_reset() {
+    fn remove_prunes_the_repo_from_the_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let rb = seed_repo(tmp.path(), "rb", "rb");
+        run_repos_add(&paths, &ra, &mut Vec::new()).unwrap();
+        run_repos_add(&paths, &rb, &mut Vec::new()).unwrap();
+        let (ra, rb) = (ra.canonicalize().unwrap(), rb.canonicalize().unwrap());
+        let hub = seed_hub(&paths, &[&ra, &rb]);
+        fs::create_dir_all(paths.cache_file().parent().unwrap()).unwrap();
+        fs::write(paths.cache_file(), "{}").unwrap();
+        let bd = FakeBdClient::new();
+
+        let mut out = Vec::new();
+        run_repos_remove(&bd, &paths, &ra, &mut out).expect("remove ok");
+
+        assert_eq!(bd.calls(), vec![Call::RepoRemove(hub, ra)]);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("dropped"), "the prune is reported: {out}");
+        assert!(!out.contains("hank reset"), "no reset hint: {out}");
+        assert!(!paths.cache_file().exists(), "stale snapshot cache cleared");
+    }
+
+    #[test]
+    fn remove_skips_the_hub_when_it_was_never_built() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
         run_repos_add(&paths, &ra, &mut Vec::new()).unwrap();
+        let bd = FakeBdClient::new();
+
+        run_repos_remove(&bd, &paths, &ra, &mut Vec::new()).expect("remove ok");
+
+        assert!(bd.calls().is_empty(), "no bd call: {:?}", bd.calls());
+    }
+
+    #[test]
+    fn remove_rerun_finishes_a_prune_after_the_roster_entry_is_gone() {
+        // A first remove dropped the roster entry but could not prune (e.g. the hub
+        // was locked); re-running must still drop the repo from the hub.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra").canonicalize().unwrap();
+        let hub = seed_hub(&paths, &[&ra]);
+        let bd = FakeBdClient::new();
 
         let mut out = Vec::new();
-        run_repos_remove(&paths, &ra, &mut out).expect("remove ok");
+        run_repos_remove(&bd, &paths, &ra, &mut out).expect("remove ok");
+
+        assert_eq!(bd.calls(), vec![Call::RepoRemove(hub, ra)]);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("not in the roster"), "{out}");
+        assert!(out.contains("dropped"), "{out}");
+    }
+
+    #[test]
+    fn remove_defers_the_prune_while_another_hank_holds_the_hub_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        run_repos_add(&paths, &ra, &mut Vec::new()).unwrap();
+        let hub = seed_hub(&paths, &[&ra.canonicalize().unwrap()]);
+        let _held = HubLock::try_acquire(&hub).unwrap().expect("lock free");
+        let bd = FakeBdClient::new();
+
+        let mut out = Vec::new();
+        run_repos_remove(&bd, &paths, &ra, &mut out).expect("a busy hub is not fatal");
+
+        assert!(bd.calls().is_empty(), "hub untouched: {:?}", bd.calls());
+        assert!(reload(&paths).repos.is_empty(), "roster still updated");
         assert!(
-            String::from_utf8(out).unwrap().contains("hank reset"),
-            "remove hints that the hub needs a reset (federated-beads-dxh.15)"
+            String::from_utf8(out).unwrap().contains("re-run"),
+            "says how to finish the prune"
         );
+    }
+
+    #[test]
+    fn remove_surfaces_a_failed_prune() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        run_repos_add(&paths, &ra, &mut Vec::new()).unwrap();
+        seed_hub(&paths, &[&ra.canonicalize().unwrap()]);
+        let bd = FakeBdClient::new().with_repo_remove_err(BdError {
+            command: "bd repo remove".into(),
+            stderr: "boom".into(),
+            kind: BdErrorKind::NonZeroExit { code: Some(1) },
+        });
+
+        let result = run_repos_remove(&bd, &paths, &ra, &mut Vec::new());
+
+        assert!(matches!(result, Err(CliError::Hub(_))), "{result:?}");
     }
 
     #[test]
@@ -1263,7 +1402,8 @@ mod tests {
         let ghost = tmp.path().join("never-added");
         let mut out = Vec::new();
 
-        run_repos_remove(&paths, &ghost, &mut out).expect("missing remove is not fatal");
+        run_repos_remove(&FakeBdClient::new(), &paths, &ghost, &mut out)
+            .expect("missing remove is not fatal");
         assert!(
             String::from_utf8(out)
                 .unwrap()
@@ -1398,7 +1538,7 @@ mod tests {
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
         let mut out = Vec::new();
-        let result = run_repos_remove(&paths, Path::new("doomed"), &mut out);
+        let result = run_repos_remove(&FakeBdClient::new(), &paths, Path::new("doomed"), &mut out);
         std::env::set_current_dir(prev).unwrap();
         result.expect("remove ok");
 
