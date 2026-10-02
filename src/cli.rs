@@ -203,7 +203,7 @@ pub fn run_snapshot(
 }
 
 /// Report environment health: bd version + gate status, config/hub paths, and
-/// per-repo roster existence + prefix. Deliberately **not** version-gated.
+/// per-repo roster existence + prefix + events-journal state. Deliberately **not** version-gated.
 ///
 /// Doctor loads the roster itself (rather than being handed one) precisely so a
 /// malformed config becomes a *reported* diagnostic instead of an error that
@@ -273,7 +273,18 @@ pub fn run_doctor(bd: &impl BdClient, paths: &Paths, out: &mut impl Write) -> Re
                     let prefix = bd
                         .issue_prefix(&entry.path)
                         .unwrap_or_else(|_| "?".to_string());
-                    writeln!(out, "  {}  OK  [prefix: {}]", shown, sanitize(&prefix))?;
+                    // Live refresh follows only repos with the journal on;
+                    // a failed or unparseable read counts as off.
+                    let journal = match bd.events_journal_enabled(&entry.path) {
+                        Ok(true) => "on",
+                        Ok(false) | Err(_) => "off",
+                    };
+                    writeln!(
+                        out,
+                        "  {}  OK  [prefix: {}]  journal: {journal}",
+                        shown,
+                        sanitize(&prefix)
+                    )?;
                 } else {
                     writeln!(out, "  {}  MISSING", shown)?;
                 }
@@ -966,6 +977,48 @@ mod tests {
         assert!(
             stdout.contains("MISSING"),
             "absent repo flagged MISSING: {stdout}"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_journal_on_or_off_per_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let on = seed_repo(tmp.path(), "ron", "ron");
+        let off = seed_repo(tmp.path(), "roff", "roff");
+        let broken = seed_repo(tmp.path(), "rbad", "rbad");
+        roster(&[&on, &off, &broken])
+            .save(paths.config_file())
+            .unwrap();
+        let bd = FakeBdClient::new()
+            .with_events_journal(&on, true)
+            .with_events_journal(&off, false)
+            .with_events_journal_err(
+                &broken,
+                BdError {
+                    command: "bd config get events-journal --json".into(),
+                    stderr: "boom".into(),
+                    kind: BdErrorKind::Parse,
+                },
+            );
+        let mut out = Vec::new();
+
+        run_doctor(&bd, &paths, &mut out).expect("ok");
+
+        let stdout = String::from_utf8(out).unwrap();
+        let line = |repo: &Path| {
+            let shown = repo.display().to_string();
+            stdout
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("{shown}  ")))
+                .unwrap_or_else(|| panic!("no roster line for {shown}: {stdout}"))
+                .to_string()
+        };
+        assert!(line(&on).ends_with("journal: on"), "{stdout}");
+        assert!(line(&off).ends_with("journal: off"), "{stdout}");
+        assert!(
+            line(&broken).ends_with("journal: off"),
+            "an unreadable setting reads as off: {stdout}"
         );
     }
 

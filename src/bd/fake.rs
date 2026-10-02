@@ -26,6 +26,7 @@ pub enum Call {
     RepoList(PathBuf),
     Export(PathBuf, PathBuf),
     IssuePrefix(PathBuf),
+    EventsJournal(PathBuf),
     RepoSync(PathBuf),
     Ready(PathBuf),
     Show(PathBuf, String),
@@ -63,6 +64,7 @@ pub struct FakeBdClient {
     export_errs: HashMap<PathBuf, BdError>,
     export_contents: HashMap<PathBuf, Vec<u8>>,
     issue_prefixes: HashMap<PathBuf, String>,
+    events_journals: HashMap<PathBuf, Result<bool, BdError>>,
 }
 
 impl std::fmt::Debug for FakeBdClient {
@@ -190,6 +192,18 @@ impl FakeBdClient {
         self
     }
 
+    /// Program `events_journal_enabled(repo)` for exactly this path; unset
+    /// paths report the journal off, as bd does for a repo never opted in.
+    pub fn with_events_journal(mut self, repo: impl Into<PathBuf>, enabled: bool) -> Self {
+        self.events_journals.insert(repo.into(), Ok(enabled));
+        self
+    }
+
+    pub fn with_events_journal_err(mut self, repo: impl Into<PathBuf>, err: BdError) -> Self {
+        self.events_journals.insert(repo.into(), Err(err));
+        self
+    }
+
     /// Run a thread-safe observer after each call is recorded. Tests use this
     /// for barriers, bounds, and panic injection without wall-clock sleeps.
     pub fn with_call_hook(mut self, hook: impl Fn(&Call) + Send + Sync + 'static) -> Self {
@@ -290,6 +304,11 @@ impl BdClient for FakeBdClient {
             stderr: detail,
             kind: super::BdErrorKind::NonZeroExit { code: Some(1) },
         })
+    }
+
+    fn events_journal_enabled(&self, repo: &Path) -> Result<bool, BdError> {
+        self.record(Call::EventsJournal(repo.to_path_buf()));
+        self.events_journals.get(repo).cloned().unwrap_or(Ok(false))
     }
 
     fn repo_sync(&self, hub: &Path) -> Result<RepoSyncReport, BdError> {
@@ -454,6 +473,12 @@ mod tests {
             FakeBdClient::new()
                 .with_show_issue_err(err())
                 .show_issue(hub, "ra-1")
+                .is_err()
+        );
+        assert!(
+            FakeBdClient::new()
+                .with_events_journal_err("/tmp/ra", err())
+                .events_journal_enabled(Path::new("/tmp/ra"))
                 .is_err()
         );
         assert!(

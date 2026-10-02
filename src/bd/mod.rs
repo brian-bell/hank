@@ -60,6 +60,10 @@ pub trait BdClient: Sync {
     /// auto-detected and not written to `.beads/config.yaml`; unlike
     /// `metadata.json`'s `dolt_database`, it is not underscore-sanitized.
     fn issue_prefix(&self, repo: &Path) -> Result<String, BdError>;
+    /// `bd -C <repo> config get events-journal --json` — whether the repo's
+    /// events journal is on, i.e. whether live refresh can follow it. Any value
+    /// other than `"true"` (including unset) reads as off.
+    fn events_journal_enabled(&self, repo: &Path) -> Result<bool, BdError>;
     /// `bd -C <hub> repo sync` — hydrate the hub from registered repos' exports.
     fn repo_sync(&self, hub: &Path) -> Result<RepoSyncReport, BdError>;
     /// `bd -C <hub> ready --json` — issues with no open blockers.

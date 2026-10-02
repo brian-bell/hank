@@ -174,6 +174,17 @@ fn argv_issue_prefix(repo: &Path) -> Vec<OsString> {
     ]
 }
 
+fn argv_events_journal(repo: &Path) -> Vec<OsString> {
+    vec![
+        "-C".into(),
+        arg(repo),
+        "config".into(),
+        "get".into(),
+        "events-journal".into(),
+        "--json".into(),
+    ]
+}
+
 fn argv_ready(hub: &Path) -> Vec<OsString> {
     // `--limit 0` = unlimited; bd's `ready` otherwise caps output at 100, which
     // would silently truncate a large cross-repo hub.
@@ -221,6 +232,12 @@ struct ConfigValue {
     value: String,
 }
 
+/// bd stores `events-journal` as the string `"true"`/`"false"`; anything but
+/// `"true"` (unset, empty, garbage) means the journal is off.
+fn journal_flag(value: &str) -> bool {
+    value.trim() == "true"
+}
+
 impl BdClient for BdCli {
     fn version(&self) -> Result<BdVersion, BdError> {
         self.run_json(argv_version())
@@ -249,6 +266,11 @@ impl BdClient for BdCli {
     fn issue_prefix(&self, repo: &Path) -> Result<String, BdError> {
         let config: ConfigValue = self.run_json(argv_issue_prefix(repo))?;
         Ok(config.value)
+    }
+
+    fn events_journal_enabled(&self, repo: &Path) -> Result<bool, BdError> {
+        let config: ConfigValue = self.run_json(argv_events_journal(repo))?;
+        Ok(journal_flag(&config.value))
     }
 
     fn repo_sync(&self, hub: &Path) -> Result<RepoSyncReport, BdError> {
@@ -348,6 +370,11 @@ mod tests {
         assert_eq!(
             argv_issue_prefix(Path::new("/tmp/ra")),
             os(&["-C", "/tmp/ra", "config", "get", "issue_prefix", "--json"])
+        );
+
+        assert_eq!(
+            argv_events_journal(Path::new("/tmp/ra")),
+            os(&["-C", "/tmp/ra", "config", "get", "events-journal", "--json"])
         );
 
         // `--limit 0` (unlimited) defeats bd's default 100-result cap.
@@ -457,6 +484,15 @@ esac
             shown.contains("(truncated)"),
             "expected truncation marker in: {shown}"
         );
+    }
+
+    #[test]
+    fn journal_flag_is_on_only_for_true() {
+        assert!(journal_flag("true"));
+        assert!(journal_flag("true\n"));
+        for off in ["false", "", "yes", "TRUE", "1", "(not set)"] {
+            assert!(!journal_flag(off), "{off:?} reads as off");
+        }
     }
 
     #[test]
