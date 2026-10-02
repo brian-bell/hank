@@ -584,7 +584,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hank"
+name = "hank-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
