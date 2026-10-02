@@ -626,9 +626,11 @@ pub struct Watcher {
     source: Arc<dyn JournalSource>,
     checkpoints_file: PathBuf,
     followers: Mutex<Followers>,
-    /// The latest roster's opt-outs, read by each follower when it finds its
-    /// journal off, so an `unwatch` run mid-session is honored.
-    opted_out: Arc<Mutex<BTreeSet<PathBuf>>>,
+    /// The repos whose journal Hank may turn on: those in the latest roster
+    /// and not opted out. Read by each follower when it finds its journal off,
+    /// so an `unwatch` or `repos remove` run mid-session is honored even though
+    /// the follower itself lives on until exit.
+    enable_allowed: Arc<Mutex<BTreeSet<PathBuf>>>,
 }
 
 /// The mutable half of a [`Watcher`], behind one lock so a late
@@ -668,21 +670,28 @@ impl Watcher {
                 followed: BTreeSet::new(),
                 handles: vec![batcher],
             }),
-            opted_out: Arc::default(),
+            enable_allowed: Arc::default(),
         };
         watcher.follow(repos);
         watcher
     }
 
     /// Start a follower for each of `repos` not already followed, and adopt
-    /// its opt-outs for every follower. Each resumes from its saved checkpoint,
+    /// its membership and opt-outs for every follower's enable decision. Each resumes from its saved checkpoint,
     /// so a repo watched in an earlier session picks up where it left off. A
     /// no-op once stopped. Repos are never unfollowed: a repo dropped from the
     /// roster keeps its follower until shutdown, and its reports only ask for a
     /// refresh the reloaded roster no longer runs.
     pub fn follow(&self, repos: impl Into<WatchList>) {
         let WatchList { repos, opted_out } = repos.into();
-        *self.opted_out.lock().expect("watch opt-outs poisoned") = opted_out;
+        *self
+            .enable_allowed
+            .lock()
+            .expect("watch enable set poisoned") = repos
+            .iter()
+            .filter(|repo| !opted_out.contains(*repo))
+            .cloned()
+            .collect();
         let mut followers = self.followers.lock().expect("watch followers poisoned");
         let Followers {
             reports,
@@ -708,12 +717,12 @@ impl Watcher {
             let tx = reports.clone();
             let stop = Arc::clone(&self.stop);
             let checkpoint = saved.repos.get(&repo).cloned();
-            let opted_out = Arc::clone(&self.opted_out);
+            let enable_allowed = Arc::clone(&self.enable_allowed);
             handles.push(thread::spawn(move || {
                 let may_enable = || {
-                    !opted_out
+                    enable_allowed
                         .lock()
-                        .expect("watch opt-outs poisoned")
+                        .expect("watch enable set poisoned")
                         .contains(&repo)
                 };
                 follow_repo(source.as_ref(), &repo, checkpoint, &may_enable, &tx, &stop);
@@ -1270,6 +1279,65 @@ mod tests {
         assert!(
             follows.try_recv().is_err(),
             "no second /a follower, and nothing new after stop"
+        );
+    }
+
+    /// A journal that is always off, whose first probe waits for the test's
+    /// go-ahead, recording every enable.
+    struct GatedOffJournal {
+        gate: Mutex<Option<Receiver<()>>>,
+        enables: Mutex<Vec<PathBuf>>,
+    }
+
+    impl JournalSource for GatedOffJournal {
+        fn probe(&self, _repo: &Path, _since: u64) -> ProbeOutput {
+            if let Some(gate) = self.gate.lock().unwrap().take() {
+                let _ = gate.recv_timeout(Duration::from_secs(5));
+            }
+            disabled()
+        }
+
+        fn follow(
+            &self,
+            _repo: &Path,
+            _since: u64,
+            _stop: &AtomicBool,
+            _on_line: &mut dyn FnMut(&str),
+        ) {
+        }
+
+        fn interrupt(&self) {}
+
+        fn enable(&self, repo: &Path) -> Result<(), String> {
+            self.enables.lock().unwrap().push(repo.to_path_buf());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn watcher_never_enables_a_repo_dropped_from_the_roster() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (go, gate) = mpsc::channel();
+        let source = Arc::new(GatedOffJournal {
+            gate: Mutex::new(Some(gate)),
+            enables: Mutex::new(Vec::new()),
+        });
+        let watcher = Watcher::start(
+            Arc::clone(&source) as Arc<dyn JournalSource>,
+            vec![PathBuf::from("/a")],
+            tmp.path().join("events_checkpoints.json"),
+            |_| {},
+        );
+
+        // `hank repos remove /a` ran; its follower lives on until exit.
+        watcher.follow(WatchList::default());
+        go.send(()).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        watcher.stop();
+
+        assert!(
+            source.enables.lock().unwrap().is_empty(),
+            "a repo no longer on the roster is never written to"
         );
     }
 }
