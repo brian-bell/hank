@@ -211,16 +211,11 @@ fn event_loop(
     // one; detail fetches are short and pruned likewise).
     let mut worker_handles: Vec<thread::JoinHandle<()>> = Vec::new();
     let refresh_state = Arc::new(RuntimeRefreshState::default());
-    // The App is born stale; launch immediately kicks off the first refresh.
-    worker_handles.push(spawn_refresh(
-        &tx,
-        paths,
-        Arc::clone(&refresh_state),
-        RefreshScope::Full,
-    ));
-    // Started after the launch refresh is spawned: anything the watcher reports
-    // from here on queues behind that full refresh (the app is born stale).
-    // Later refreshes add repos that join the roster mid-session.
+    // Installed before the launch refresh is spawned, so a repo that joins the
+    // roster between `main` loading it and that refresh reloading it is still
+    // handed to the watcher; later refreshes add repos that join mid-session.
+    // Anything the watcher reports queues behind the launch refresh: the app is
+    // born stale, holding the in-flight slot until that refresh completes.
     if watch {
         app.set_watching(true);
         let tx = tx.clone();
@@ -235,6 +230,14 @@ fn event_loop(
         // Only ever set here, so this cannot already hold a watcher.
         let _ = refresh_state.watcher.set(watcher);
     }
+
+    // The App is born stale; launch immediately kicks off the first refresh.
+    worker_handles.push(spawn_refresh(
+        &tx,
+        paths,
+        Arc::clone(&refresh_state),
+        RefreshScope::Full,
+    ));
 
     // Run the render/reduce loop, then join threads *unconditionally* — for a
     // clean quit and for every error return alike — so a terminal write failure
