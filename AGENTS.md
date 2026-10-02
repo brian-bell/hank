@@ -97,9 +97,8 @@ Module map (`src/`):
 - `bd search` includes closed issues by default since bd 1.3.0; `BdCli::search`
   drops them client-side so results match older bd and stay live work only.
 - Canonical user state lives at `<config_root>/hank/config.toml` and
-  `<data_root>/hank/ui_state.json`. Startup safely migrates only those two
-  user-owned legacy files from `federated-beads/`; it never copies the legacy
-  hub, cache, locks, or temp state. `hank reset` skips migration.
+  `<data_root>/hank/ui_state.json`. `hank reset` discards only derived hub and
+  cache state, never these files.
 - ratatui is pinned with the `unstable-rendered-line-info` feature for
   `Paragraph::line_count` (detail-pane scroll clamping); stay within 0.30.x.
 - Only `main.rs` resolves real paths, spawns the real `bd`, and wires

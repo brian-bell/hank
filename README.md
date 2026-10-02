@@ -146,8 +146,6 @@ The last confirmed repository view is stored independently at
 `hank/ui_state.json` under the platform data directory. `hank reset`
 does not remove this user preference; it only discards derived hub/cache data.
 
-Upgrading from the `fbd` RC? See [docs/upgrading-from-fbd.md](docs/upgrading-from-fbd.md).
-
 ## How it works
 
 Hank reads everything through a `bd` hub workspace that `bd` itself hydrates
@@ -178,7 +176,7 @@ The ignored, machine-dependent refresh matrix is available separately:
 cargo test refresh_performance_matrix -- --ignored --nocapture
 ```
 
-Recorded phase timings live in `docs/performance/federated-beads-9dt.md`.
+Recorded phase timings live in `docs/performance/refresh.md`.
 
 ## Not in v1 (planned)
 
