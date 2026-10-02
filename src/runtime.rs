@@ -584,23 +584,6 @@ fn spawn_search(
     thread::spawn(move || search_worker_with_state(BdCli::new(), paths, query, token, tx, state))
 }
 
-/// The search worker body: run the query, attribute the results, and send exactly
-/// one [`Msg::SearchResults`] echoing `token` (so a superseded response can be
-/// dropped). Owned args so it moves cleanly into a thread; unit-tested directly
-/// with a [`crate::bd::FakeBdClient`] and a channel.
-#[cfg(test)]
-pub(crate) fn search_worker(
-    bd: impl BdClient,
-    roster: Config,
-    paths: Paths,
-    query: String,
-    token: u64,
-    tx: Sender<Incoming>,
-) {
-    let rows = gather_search(&bd, &roster, &paths, &query);
-    let _ = tx.send(Msg::SearchResults { token, rows }.into());
-}
-
 fn search_worker_with_state(
     bd: impl BdClient,
     paths: Paths,
@@ -630,47 +613,6 @@ fn search_worker_with_state(
             );
         }
     }
-}
-
-/// Run `bd search <query> --json` against the hub and attribute the results
-/// through the **same** [`snapshot::attribute`] path as ready rows, so search rows
-/// carry `repo_name` identically. The prefix map is rebuilt from the roster via
-/// [`refresh::attribution_map`] (its per-repo prefix-read failures are non-fatal —
-/// those ids fall to the `unknown` bucket). A `bd search` failure maps to a
-/// [`sanitize`]d message. No version gate / `ensure_hub`: search is reachable only
-/// from the list, i.e. after a snapshot already hydrated the hub.
-#[cfg(test)]
-pub(crate) fn gather_search(
-    bd: &impl BdClient,
-    roster: &Config,
-    paths: &Paths,
-    query: &str,
-) -> Result<Vec<Row>, String> {
-    let hub = hub_dir(paths);
-    let issues = bd
-        .search(&hub, query)
-        .map_err(|e| sanitize(&format!("search failed: {e}")))?;
-    let (prefix_map, _errors) = refresh::attribution_map(bd, roster);
-    Ok(snapshot::attribute(issues, &prefix_map, SystemTime::now()).rows)
-}
-
-#[cfg(test)]
-fn gather_search_with_prefixes(
-    bd: &impl BdClient,
-    roster: &Config,
-    paths: &Paths,
-    query: &str,
-    prefixes: &HashMap<std::path::PathBuf, String>,
-) -> Result<Vec<Row>, String> {
-    if prefixes.is_empty() {
-        return gather_search(bd, roster, paths, query);
-    }
-    let hub = hub_dir(paths);
-    let issues = bd
-        .search(&hub, query)
-        .map_err(|e| sanitize(&format!("search failed: {e}")))?;
-    let prefix_map = cached_prefix_map(roster, prefixes);
-    Ok(snapshot::attribute(issues, &prefix_map, SystemTime::now()).rows)
 }
 
 fn gather_search_with_state(
@@ -742,85 +684,6 @@ fn spawn_copy(
     })
 }
 
-/// The copy worker body: build the clipboard payload + status summary off the UI
-/// thread (the id→repo-path resolution runs `bd`), then send exactly one
-/// [`Msg::Copied`]. `reduce` turns that into the UI-thread [`Effect::WriteClipboard`]
-/// so the escape write never races a draw. Owned args so it moves cleanly into a
-/// thread; unit-tested directly with a [`crate::bd::FakeBdClient`] and a channel.
-#[cfg(test)]
-pub(crate) fn copy_worker(
-    bd: impl BdClient,
-    roster: Config,
-    paths: Paths,
-    row: Row,
-    markdown: bool,
-    token: u64,
-    tx: Sender<Incoming>,
-) {
-    let (payload, summary) = build_copy(&bd, &roster, &paths, &row, markdown);
-    let _ = tx.send(
-        Msg::Copied {
-            token,
-            payload,
-            summary,
-        }
-        .into(),
-    );
-}
-
-/// Build the clipboard payload and its status-bar summary for `row`.
-///
-/// The command form (`markdown == false`) resolves the row's source-repo path
-/// from its issue id via [`refresh::attribution_map`] — the **same** prefix map
-/// search uses — and falls back to the hub (`bd -C <hub> show <id>`) for an
-/// unattributed id. The Markdown form refreshes the issue with one structured
-/// `bd show --json` call when copied, falling back to the pinned row if that
-/// refresh fails. This keeps detail navigation to one native `bd show` while
-/// avoiding stale copied metadata. All bd-sourced text is sanitized inside
-/// [`context`].
-#[cfg(test)]
-fn build_copy(
-    bd: &impl BdClient,
-    roster: &Config,
-    paths: &Paths,
-    row: &Row,
-    markdown: bool,
-) -> (String, String) {
-    let payload = if markdown {
-        let issue = bd
-            .show_issue(&hub_dir(paths), &row.issue.id)
-            .unwrap_or_else(|_| row.issue.clone());
-        context::markdown_block(&issue, &row.repo_name)
-    } else {
-        let (prefix_map, _errors) = refresh::attribution_map(bd, roster);
-        let repo = prefix_map.repo_for(&row.issue.id).map(|e| e.path.clone());
-        context::shell_command(repo.as_deref(), &hub_dir(paths), &row.issue.id)
-    };
-    let summary = context::summarize(&payload, COPY_SUMMARY_MAX);
-    (payload, summary)
-}
-
-#[cfg(test)]
-fn build_copy_with_prefixes(
-    bd: &impl BdClient,
-    roster: &Config,
-    paths: &Paths,
-    row: &Row,
-    markdown: bool,
-    prefixes: &HashMap<std::path::PathBuf, String>,
-) -> (String, String) {
-    if markdown || prefixes.is_empty() {
-        return build_copy(bd, roster, paths, row, markdown);
-    }
-    let prefix_map = cached_prefix_map(roster, prefixes);
-    let repo = prefix_map
-        .repo_for(&row.issue.id)
-        .map(|entry| entry.path.clone());
-    let payload = context::shell_command(repo.as_deref(), &hub_dir(paths), &row.issue.id);
-    let summary = context::summarize(&payload, COPY_SUMMARY_MAX);
-    (payload, summary)
-}
-
 fn build_copy_with_map(
     bd: &impl BdClient,
     paths: &Paths,
@@ -842,28 +705,6 @@ fn build_copy_with_map(
     };
     let summary = context::summarize(&payload, COPY_SUMMARY_MAX);
     (payload, summary)
-}
-
-#[cfg(test)]
-fn cached_prefix_map(
-    roster: &Config,
-    prefixes: &HashMap<std::path::PathBuf, String>,
-) -> refresh::PrefixMap {
-    let mut seen = HashSet::new();
-    let pairs = roster
-        .repos
-        .iter()
-        .filter_map(|entry| {
-            let normalized_path = refresh::normalize_path(&entry.path);
-            if !seen.insert(normalized_path.clone()) {
-                return None;
-            }
-            prefixes
-                .get(&normalized_path)
-                .map(|prefix| (prefix.clone(), entry.clone()))
-        })
-        .collect();
-    refresh::PrefixMap::from_pairs(pairs)
 }
 
 /// Write `payload` to the terminal clipboard via an OSC 52 escape. Called only on
@@ -1802,18 +1643,57 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// Run the real search worker against a state that has completed one refresh,
+    /// retrying while macOS still holds the refresh's advisory flock.
+    fn run_search_worker(
+        make_bd: impl Fn() -> FakeBdClient,
+        paths: &Paths,
+        state: &Arc<RuntimeRefreshState>,
+        token: u64,
+    ) -> Msg {
+        for _ in 0..100 {
+            let (tx, rx) = mpsc::channel();
+            search_worker_with_state(
+                make_bd(),
+                paths.clone(),
+                "foo".into(),
+                token,
+                tx,
+                Arc::clone(state),
+            );
+            let msg = recv_msg(&rx);
+            assert!(rx.recv().is_err(), "exactly one SearchResults, then closed");
+            match &msg {
+                Msg::SearchResults { rows: Err(e), .. }
+                    if e.contains("another hank is refreshing") =>
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                _ => return msg,
+            }
+        }
+        panic!("hub lock never released");
+    }
+
     #[test]
-    fn search_worker_sends_results_for_token() {
+    fn search_worker_sends_attributed_results_for_token() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
-        let bd = FakeBdClient::new().with_search(vec![issue("ra-1", 1, "Found one")]);
-        let (tx, rx) = mpsc::channel();
+        let make_bd = || {
+            FakeBdClient::new()
+                .with_ready(vec![issue("ra-1", 1, "ready")])
+                .with_search(vec![issue("ra-1", 1, "Found one")])
+                .with_export_content(&ra, b"{\"id\":\"ra-1\"}\n".to_vec())
+        };
+        let state = Arc::new(RuntimeRefreshState::default());
+        assert!(
+            gather_snapshot_with_state(&make_bd(), &roster(&[&ra]), &paths, &state)
+                .0
+                .is_some()
+        );
 
-        let handle =
-            thread::spawn(move || search_worker(bd, roster(&[&ra]), paths, "foo".into(), 7, tx));
-
-        match recv_msg(&rx) {
+        match run_search_worker(make_bd, &paths, &state, 7) {
             Msg::SearchResults { token, rows } => {
                 assert_eq!(token, 7, "the request token is echoed back");
                 let rows = rows.expect("results on success");
@@ -1823,28 +1703,32 @@ mod tests {
                     .expect("row present");
                 assert_eq!(
                     found.repo_name, "ra",
-                    "results are attributed via the roster prefix map"
+                    "results are attributed via the verified map"
                 );
             }
             other => panic!("expected SearchResults, got {other:?}"),
         }
-        // The worker's tx drops on return: exactly one message, then closed.
-        assert!(rx.recv().is_err(), "exactly one SearchResults, then closed");
-        handle.join().unwrap();
     }
 
     #[test]
-    fn search_worker_maps_error() {
+    fn search_worker_maps_bd_error() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
-        let bd = FakeBdClient::new().with_search_err(bd_err());
-        let (tx, rx) = mpsc::channel();
+        let make_bd = || {
+            FakeBdClient::new()
+                .with_ready(vec![issue("ra-1", 1, "ready")])
+                .with_search_err(bd_err())
+                .with_export_content(&ra, b"{\"id\":\"ra-1\"}\n".to_vec())
+        };
+        let state = Arc::new(RuntimeRefreshState::default());
+        assert!(
+            gather_snapshot_with_state(&make_bd(), &roster(&[&ra]), &paths, &state)
+                .0
+                .is_some()
+        );
 
-        let handle =
-            thread::spawn(move || search_worker(bd, roster(&[&ra]), paths, "foo".into(), 3, tx));
-
-        match recv_msg(&rx) {
+        match run_search_worker(make_bd, &paths, &state, 3) {
             Msg::SearchResults { token, rows } => {
                 assert_eq!(token, 3);
                 let msg = rows.expect_err("a message on failure");
@@ -1854,19 +1738,6 @@ mod tests {
                 );
             }
             other => panic!("expected SearchResults, got {other:?}"),
-        }
-        handle.join().unwrap();
-    }
-
-    /// The single `Msg::Copied` a copy worker sends: (token, payload, summary).
-    fn recv_copied(rx: &Receiver<Incoming>) -> (u64, String, String) {
-        match recv_msg(rx) {
-            Msg::Copied {
-                token,
-                payload,
-                summary,
-            } => (token, payload, summary),
-            other => panic!("expected Copied, got {other:?}"),
         }
     }
 
@@ -2441,118 +2312,18 @@ mod tests {
     }
 
     #[test]
-    fn cached_search_prefixes_deduplicate_duplicate_roster_entries() {
+    fn markdown_copy_refreshes_the_row_from_bd_show() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
-        let ra = seed_repo(tmp.path(), "ra", "ra");
-        let config = roster(&[&ra, &ra]);
-        let bd = FakeBdClient::new().with_search(vec![issue("ra-1", 1, "found")]);
-        let prefixes = HashMap::from([(refresh::normalize_path(&ra), "ra".to_string())]);
-
-        let rows = gather_search_with_prefixes(&bd, &config, &paths, "found", &prefixes)
-            .expect("search succeeds");
-
-        assert_eq!(
-            rows[0].repo_name, "ra",
-            "a duplicate roster entry must not turn one cached prefix into a collision"
-        );
-    }
-
-    #[test]
-    fn cached_copy_prefixes_deduplicate_duplicate_roster_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths::with_base(tmp.path());
-        let ra = seed_repo(tmp.path(), "ra", "ra");
-        let alias = ra.join(".");
-        let config = roster(&[&ra, &alias]);
-        let prefixes = HashMap::from([(refresh::normalize_path(&ra), "ra".to_string())]);
-        let row = copy_row("ra", "ra-1");
-
-        let (payload, _) = build_copy_with_prefixes(
-            &FakeBdClient::new(),
-            &config,
-            &paths,
-            &row,
-            false,
-            &prefixes,
-        );
-
-        assert_eq!(
-            payload,
-            format!("cd {} && bd show ra-1", ra.display()),
-            "a duplicate roster entry must not force command copy through the hub"
-        );
-    }
-
-    #[test]
-    fn copy_worker_builds_cd_for_attributed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths::with_base(tmp.path());
-        let ra = seed_repo(tmp.path(), "ra", "ra");
-        let bd = FakeBdClient::new();
-        let (tx, rx) = mpsc::channel();
-
-        let row = copy_row("ra", "ra-1");
-        let paths2 = paths.clone();
-        let ra2 = ra.clone();
-        let handle =
-            thread::spawn(move || copy_worker(bd, roster(&[&ra2]), paths2, row, false, 7, tx));
-
-        let (token, payload, summary) = recv_copied(&rx);
-        assert_eq!(token, 7, "the request token is echoed back");
-        assert_eq!(
-            payload,
-            format!("cd {} && bd show ra-1", ra.display()),
-            "attributed id resolves to its repo path"
-        );
-        assert!(
-            summary.starts_with("cd ") && summary.chars().count() <= COPY_SUMMARY_MAX,
-            "summary is the truncated command form: {summary}"
-        );
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn copy_worker_falls_back_to_hub_for_unattributed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths::with_base(tmp.path());
-        let ra = seed_repo(tmp.path(), "ra", "ra");
-        let bd = FakeBdClient::new();
-        let (tx, rx) = mpsc::channel();
-
-        // An id whose prefix (`zz`) matches no roster repo → hub fallback.
-        let row = copy_row("unknown", "zz-9");
-        let paths2 = paths.clone();
-        let handle =
-            thread::spawn(move || copy_worker(bd, roster(&[&ra]), paths2, row, false, 1, tx));
-
-        let (_, payload, _) = recv_copied(&rx);
-        assert_eq!(
-            payload,
-            format!("bd -C {} show zz-9", hub_dir(&paths).display()),
-            "an unattributed id uses the always-correct hub form"
-        );
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn copy_worker_markdown_block() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths::with_base(tmp.path());
-        let ra = seed_repo(tmp.path(), "ra", "ra");
         let mut fresh = issue("ra-1", 2, "Renamed after snapshot");
         fresh.description = Some("Current description from bd show --json".into());
         let bd = FakeBdClient::new().with_show_issue(fresh);
-        let (tx, rx) = mpsc::channel();
 
         // The row intentionally carries stale cached metadata. Markdown copy
         // refreshes it when requested instead of disagreeing with a freshly
         // loaded native detail pane.
         let row = copy_row("session-tui", "ra-1");
-        let handle =
-            thread::spawn(move || copy_worker(bd, roster(&[&ra]), paths, row, true, 1, tx));
-
-        let (_, payload, _) = recv_copied(&rx);
+        let (payload, _) = build_copy_with_map(&bd, &paths, &row, true, None);
         assert!(
             payload.contains("Renamed after snapshot"),
             "fresh markdown title: {payload:?}"
@@ -2566,7 +2337,6 @@ mod tests {
             payload.contains("session-tui"),
             "markdown repo: {payload:?}"
         );
-        handle.join().unwrap();
     }
 
     #[test]
