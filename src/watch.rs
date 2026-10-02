@@ -17,9 +17,13 @@
 //!
 //! A checkpoint below the retained window (`events_journal_truncated`) falls
 //! back to a full refresh and resumes from the reported head. A repo whose
-//! journal is off is reported once in the status bar and left unwatched; Hank is
-//! read-only and never turns the journal on. Syncs (`bd dolt pull`) are not
-//! journaled, so `r` (and every launch) remains a full refresh.
+//! journal is off gets it turned on (`bd config set events-journal true`, which
+//! edits the repo's git-tracked `.beads/config.yaml`), announced once in the
+//! status bar, unless the roster marks it `unwatched` (`hank repos unwatch`).
+//! An opted-out repo, or one whose enable failed, is reported once and
+//! re-checked on the backoff, so a journal turned on later is followed without
+//! a restart. Syncs (`bd dolt pull`) are not journaled, so `r` (and every
+//! launch) remains a full refresh.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -36,6 +40,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::app::{Msg, RefreshScope};
+use crate::bd::{BdCli, BdClient};
 use crate::cli::sanitize;
 
 /// How long the batcher keeps collecting after the first report of a burst, so
@@ -293,6 +298,9 @@ pub trait JournalSource: Send + Sync + 'static {
     fn follow(&self, repo: &Path, since: u64, stop: &AtomicBool, on_line: &mut dyn FnMut(&str));
     /// Interrupt every running `follow` (shutdown).
     fn interrupt(&self);
+    /// `bd -C <repo> config set events-journal <on>`, returning bd's error
+    /// text on failure.
+    fn set_journal(&self, repo: &Path, on: bool) -> Result<(), String>;
 }
 
 /// The real [`JournalSource`]: spawns `bd` from PATH.
@@ -386,23 +394,41 @@ impl JournalSource for BdJournal {
             let _ = child.lock().expect("journal child poisoned").kill();
         }
     }
+
+    fn set_journal(&self, repo: &Path, on: bool) -> Result<(), String> {
+        BdCli::new()
+            .set_events_journal(repo, on)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Follow one repo's journal until `stop` is set, sending [`Report`]s.
+/// `may_enable` is asked, each time the journal is found off, whether Hank may
+/// turn it on (false once the roster marks the repo `unwatched`).
 pub fn follow_repo(
     source: &dyn JournalSource,
     repo: &Path,
     saved: Option<Checkpoint>,
+    may_enable: &dyn Fn() -> bool,
     reports: &Sender<Report>,
     stop: &AtomicBool,
 ) {
-    follow_repo_with_backoff(source, repo, saved, reports, stop, INITIAL_BACKOFF);
+    follow_repo_with_backoff(
+        source,
+        repo,
+        saved,
+        may_enable,
+        reports,
+        stop,
+        INITIAL_BACKOFF,
+    );
 }
 
 fn follow_repo_with_backoff(
     source: &dyn JournalSource,
     repo: &Path,
     saved: Option<Checkpoint>,
+    may_enable: &dyn Fn() -> bool,
     reports: &Sender<Report>,
     stop: &AtomicBool,
     initial_backoff: Duration,
@@ -410,6 +436,10 @@ fn follow_repo_with_backoff(
     let mut current = saved;
     let mut backoff = initial_backoff;
     let mut warned = false;
+    // One enable attempt per follower: if bd still reports the journal off
+    // after it (or the write failed), re-checking is all that is left.
+    let mut enable_tried = false;
+    let mut warned_disabled = false;
     // Set when the previous stream ended on a truncation: we already know the
     // head to resume from, so skip the probe.
     let mut resume_at: Option<u64> = None;
@@ -433,11 +463,54 @@ fn follow_repo_with_backoff(
                         head
                     }
                     StartPoint::Disabled => {
-                        let _ = reports.send(Report::Warning(format!(
-                            "live refresh off for {}: run `bd config set events-journal true` there",
-                            repo_label(repo)
-                        )));
-                        return;
+                        // An `unwatched` repo is left alone, quietly: the user
+                        // opted it out, and `hank doctor` still lists it.
+                        if !enable_tried && may_enable() {
+                            enable_tried = true;
+                            match source.set_journal(repo, true) {
+                                // `hank repos unwatch` saves its opt-out before
+                                // turning the journal off, so if it ran between
+                                // the check and the write, re-checking now sees
+                                // it: undo the write, and allow a fresh attempt
+                                // should the repo be watched again.
+                                Ok(()) if !may_enable() => {
+                                    enable_tried = false;
+                                    if let Err(detail) = source.set_journal(repo, false) {
+                                        let _ = reports.send(Report::Warning(format!(
+                                            "{} was unwatched as live refresh turned its events journal on, and turning it back off failed: {}",
+                                            repo_label(repo),
+                                            first_line(&detail)
+                                        )));
+                                    }
+                                }
+                                Ok(()) => {
+                                    let _ = reports.send(Report::Warning(format!(
+                                        "live refresh turned on the events journal for {} (.beads/config.yaml; `hank repos unwatch` undoes it)",
+                                        repo_label(repo)
+                                    )));
+                                    continue;
+                                }
+                                Err(detail) => {
+                                    warned_disabled = true;
+                                    let _ = reports.send(Report::Warning(format!(
+                                        "live refresh off for {}: couldn't turn on its events journal: {}",
+                                        repo_label(repo),
+                                        first_line(&detail)
+                                    )));
+                                }
+                            }
+                        } else if !warned_disabled && may_enable() {
+                            // Turned on, yet bd still reports it off (for one,
+                            // `BD_EVENTS_JOURNAL=false` overrides the file).
+                            warned_disabled = true;
+                            let _ = reports.send(Report::Warning(format!(
+                                "live refresh off for {}: bd still reports its events journal off",
+                                repo_label(repo)
+                            )));
+                        }
+                        sleep_unless_stopped(backoff, stop);
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        continue;
                     }
                     StartPoint::Failed(detail) => {
                         if !warned {
@@ -542,6 +615,31 @@ pub fn batch_reports(
     }
 }
 
+/// The roster as the watcher sees it: the resolved repos to follow, and those
+/// the user opted out (`unwatched`), whose journal Hank must not turn on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchList {
+    pub repos: Vec<PathBuf>,
+    pub opted_out: BTreeSet<PathBuf>,
+}
+
+impl WatchList {
+    /// Whether Hank may turn on `repo`'s journal: on the roster, not opted out.
+    pub fn allows(&self, repo: &Path) -> bool {
+        self.repos.iter().any(|r| r == repo) && !self.opted_out.contains(repo)
+    }
+}
+
+impl From<Vec<PathBuf>> for WatchList {
+    /// Every repo followed, none opted out.
+    fn from(repos: Vec<PathBuf>) -> Self {
+        WatchList {
+            repos,
+            opted_out: BTreeSet::new(),
+        }
+    }
+}
+
 /// A running watcher: one follower per repo plus the batcher. Repos can join
 /// after start ([`Watcher::follow`]), so a roster that grows mid-session is
 /// watched without a restart.
@@ -550,7 +648,19 @@ pub struct Watcher {
     source: Arc<dyn JournalSource>,
     checkpoints_file: PathBuf,
     followers: Mutex<Followers>,
+    /// The repos whose journal Hank may turn on: those in the latest roster
+    /// and not opted out. Read by each follower when it finds its journal off,
+    /// so an `unwatch` or `repos remove` run mid-session is honored even though
+    /// the follower itself lives on until exit.
+    enable_allowed: Arc<Mutex<BTreeSet<PathBuf>>>,
+    /// Asked last, right before an enable: whether the roster on disk still
+    /// allows it. `enable_allowed` only changes when a refresh reloads the
+    /// roster, and `hank repos unwatch` doesn't trigger one.
+    roster_allows: Arc<RosterCheck>,
 }
+
+/// Re-reads the roster and answers [`WatchList::allows`] for one repo.
+pub type RosterCheck = dyn Fn(&Path) -> bool + Send + Sync;
 
 /// The mutable half of a [`Watcher`], behind one lock so a late
 /// [`Watcher::follow`] can never race [`Watcher::stop`].
@@ -565,10 +675,12 @@ struct Followers {
 impl Watcher {
     /// Start following `repos` (resolved, deduplicated roster paths), saving
     /// checkpoints to `checkpoints_file` and delivering messages via `deliver`.
+    /// `roster_allows` is consulted before every enable (see [`RosterCheck`]).
     pub fn start(
         source: Arc<dyn JournalSource>,
-        repos: Vec<PathBuf>,
+        repos: impl Into<WatchList>,
         checkpoints_file: PathBuf,
+        roster_allows: impl Fn(&Path) -> bool + Send + Sync + 'static,
         deliver: impl FnMut(Msg) + Send + 'static,
     ) -> Watcher {
         let saved = Checkpoints::load(&checkpoints_file);
@@ -589,17 +701,31 @@ impl Watcher {
                 followed: BTreeSet::new(),
                 handles: vec![batcher],
             }),
+            enable_allowed: Arc::default(),
+            roster_allows: Arc::new(roster_allows),
         };
         watcher.follow(repos);
         watcher
     }
 
-    /// Start a follower for each of `repos` not already followed. Each resumes
-    /// from its saved checkpoint, so a repo watched in an earlier session picks
-    /// up where it left off. A no-op once stopped. Repos are never unfollowed:
-    /// a repo dropped from the roster keeps its follower until shutdown, and
-    /// its reports only ask for a refresh the reloaded roster no longer runs.
-    pub fn follow(&self, repos: impl IntoIterator<Item = PathBuf>) {
+    /// Start a follower for each of `repos` not already followed, and adopt
+    /// its membership and opt-outs for every follower's enable decision. Each resumes from its saved checkpoint,
+    /// so a repo watched in an earlier session picks up where it left off. A
+    /// no-op once stopped. Repos are never unfollowed: a repo dropped from the
+    /// roster keeps its follower until shutdown, and its reports only ask for a
+    /// refresh the reloaded roster no longer runs.
+    pub fn follow(&self, repos: impl Into<WatchList>) {
+        let list = repos.into();
+        *self
+            .enable_allowed
+            .lock()
+            .expect("watch enable set poisoned") = list
+            .repos
+            .iter()
+            .filter(|repo| list.allows(repo))
+            .cloned()
+            .collect();
+        let repos = list.repos;
         let mut followers = self.followers.lock().expect("watch followers poisoned");
         let Followers {
             reports,
@@ -625,8 +751,17 @@ impl Watcher {
             let tx = reports.clone();
             let stop = Arc::clone(&self.stop);
             let checkpoint = saved.repos.get(&repo).cloned();
+            let enable_allowed = Arc::clone(&self.enable_allowed);
+            let roster_allows = Arc::clone(&self.roster_allows);
             handles.push(thread::spawn(move || {
-                follow_repo(source.as_ref(), &repo, checkpoint, &tx, &stop);
+                let may_enable = || {
+                    enable_allowed
+                        .lock()
+                        .expect("watch enable set poisoned")
+                        .contains(&repo)
+                        && roster_allows(&repo)
+                };
+                follow_repo(source.as_ref(), &repo, checkpoint, &may_enable, &tx, &stop);
             }));
         }
     }
@@ -850,6 +985,7 @@ mod tests {
         probes: Mutex<VecDeque<ProbeOutput>>,
         streams: Mutex<VecDeque<Vec<String>>>,
         calls: Mutex<Vec<String>>,
+        enable_error: Option<String>,
     }
 
     impl FakeJournal {
@@ -866,6 +1002,10 @@ mod tests {
         }
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+        fn failing_enable(mut self, error: &str) -> Self {
+            self.enable_error = Some(error.to_string());
+            self
         }
     }
 
@@ -894,12 +1034,33 @@ mod tests {
         }
 
         fn interrupt(&self) {}
+
+        fn set_journal(&self, _repo: &Path, on: bool) -> Result<(), String> {
+            let call = if on { "enable" } else { "disable" };
+            self.calls.lock().unwrap().push(call.to_string());
+            match &self.enable_error {
+                Some(error) if on => Err(error.clone()),
+                _ => Ok(()),
+            }
+        }
     }
 
     fn run(source: &FakeJournal, saved: Option<Checkpoint>) -> Vec<Report> {
+        run_with(source, saved, true)
+    }
+
+    fn run_with(source: &FakeJournal, saved: Option<Checkpoint>, may_enable: bool) -> Vec<Report> {
         let (tx, rx) = mpsc::channel();
         let stop = AtomicBool::new(false);
-        follow_repo_with_backoff(source, Path::new("/r"), saved, &tx, &stop, Duration::ZERO);
+        follow_repo_with_backoff(
+            source,
+            Path::new("/r"),
+            saved,
+            &|| may_enable,
+            &tx,
+            &stop,
+            Duration::ZERO,
+        );
         drop(tx);
         rx.into_iter().collect()
     }
@@ -968,20 +1129,118 @@ mod tests {
         assert_eq!(source.calls()[..2], ["probe 1", "follow 6"]);
     }
 
-    #[test]
-    fn disabled_journal_warns_once_and_stops_following() {
-        let source = FakeJournal::default().probe(ProbeOutput {
+    fn disabled() -> ProbeOutput {
+        ProbeOutput {
             success: true,
             stdout: String::new(),
             stderr: "note: the events journal is disabled for this workspace".to_string(),
-        });
+        }
+    }
+
+    #[test]
+    fn disabled_journal_is_turned_on_announced_and_then_followed() {
+        let source = FakeJournal::default()
+            .probe(disabled())
+            .probe(ok(""))
+            .stream(&[&record(1, "t1")]);
         let reports = run(&source, None);
-        assert_eq!(reports.len(), 1);
+        assert_eq!(reports.len(), 2, "{reports:?}");
         assert!(
-            matches!(&reports[0], Report::Warning(w) if w.contains("events-journal true")),
+            matches!(&reports[0], Report::Warning(w)
+                if w.contains("turned on the events journal") && w.contains(".beads/config.yaml")),
             "{reports:?}"
         );
-        assert_eq!(source.calls(), vec!["probe 0"]);
+        assert_eq!(reports[1], changed(1));
+        assert_eq!(
+            source.calls()[..4],
+            ["probe 0", "enable", "probe 0", "follow 0"]
+        );
+    }
+
+    #[test]
+    fn opted_out_journal_is_left_off_quietly_and_rechecked() {
+        // Off twice, then on: someone ran `hank repos watch` mid-session.
+        let source = FakeJournal::default()
+            .probe(disabled())
+            .probe(disabled())
+            .probe(ok(""))
+            .stream(&[&record(1, "t1")]);
+        let reports = run_with(&source, None, false);
+        assert_eq!(reports, vec![changed(1)], "no enable, no nagging");
+        assert_eq!(
+            source.calls()[..4],
+            ["probe 0", "probe 0", "probe 0", "follow 0"]
+        );
+    }
+
+    #[test]
+    fn enable_racing_an_unwatch_is_undone_quietly() {
+        // Off, then on: the follower's enable landed after `hank repos
+        // unwatch` turned the journal off, so the undo is all that keeps it off.
+        let source = FakeJournal::default()
+            .probe(disabled())
+            .probe(ok(""))
+            .stream(&[&record(1, "t1")]);
+        let allowed = std::cell::Cell::new(true);
+        let may_enable = || allowed.replace(false);
+        let (tx, rx) = mpsc::channel();
+        follow_repo_with_backoff(
+            &source,
+            Path::new("/r"),
+            None,
+            &may_enable,
+            &tx,
+            &AtomicBool::new(false),
+            Duration::ZERO,
+        );
+        drop(tx);
+        let reports: Vec<Report> = rx.into_iter().collect();
+        assert_eq!(
+            reports,
+            vec![changed(1)],
+            "no announcement for an undone write"
+        );
+        assert_eq!(
+            source.calls()[..5],
+            ["probe 0", "enable", "disable", "probe 0", "follow 0"]
+        );
+    }
+
+    #[test]
+    fn failed_enable_warns_once_and_keeps_rechecking() {
+        let source = FakeJournal::default()
+            .failing_enable("config.yaml is read-only")
+            .probe(disabled())
+            .probe(disabled())
+            .probe(disabled())
+            .probe(ok(""));
+        let reports = run(&source, None);
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(
+            matches!(&reports[0], Report::Warning(w) if w.contains("read-only")),
+            "{reports:?}"
+        );
+        let calls = source.calls();
+        assert_eq!(
+            calls.iter().filter(|call| *call == "enable").count(),
+            1,
+            "one enable attempt per follower: {calls:?}"
+        );
+        assert_eq!(calls.last().map(String::as_str), Some("follow 0"));
+    }
+
+    #[test]
+    fn journal_still_off_after_enable_warns_once() {
+        let source = FakeJournal::default()
+            .probe(disabled())
+            .probe(disabled())
+            .probe(disabled());
+        let reports = run(&source, None);
+        assert_eq!(reports.len(), 2, "{reports:?}");
+        assert!(
+            matches!(&reports[1], Report::Warning(w) if w.contains("still reports")),
+            "{reports:?}"
+        );
     }
 
     #[test]
@@ -1058,6 +1317,10 @@ mod tests {
         }
 
         fn interrupt(&self) {}
+
+        fn set_journal(&self, _repo: &Path, _on: bool) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -1072,9 +1335,9 @@ mod tests {
         let source = Arc::new(ParkedJournal {
             follows: Mutex::new(tx),
         });
-        let watcher = Watcher::start(source, vec![PathBuf::from("/a")], file, |_| {});
+        let watcher = Watcher::start(source, vec![PathBuf::from("/a")], file, |_| true, |_| {});
 
-        watcher.follow([PathBuf::from("/a"), PathBuf::from("/b")]);
+        watcher.follow(vec![PathBuf::from("/a"), PathBuf::from("/b")]);
         let mut seen: Vec<String> = (0..2)
             .map(|_| follows.recv_timeout(Duration::from_secs(5)).unwrap())
             .collect();
@@ -1082,10 +1345,110 @@ mod tests {
         assert_eq!(seen, ["/a 0", "/b 7"]);
 
         watcher.stop();
-        watcher.follow([PathBuf::from("/c")]);
+        watcher.follow(vec![PathBuf::from("/c")]);
         assert!(
             follows.try_recv().is_err(),
             "no second /a follower, and nothing new after stop"
         );
+    }
+
+    /// A journal that is always off, whose first probe waits for the test's
+    /// go-ahead, recording every enable.
+    struct GatedOffJournal {
+        gate: Mutex<Option<Receiver<()>>>,
+        enables: Mutex<Vec<PathBuf>>,
+    }
+
+    impl JournalSource for GatedOffJournal {
+        fn probe(&self, _repo: &Path, _since: u64) -> ProbeOutput {
+            if let Some(gate) = self.gate.lock().unwrap().take() {
+                let _ = gate.recv_timeout(Duration::from_secs(5));
+            }
+            disabled()
+        }
+
+        fn follow(
+            &self,
+            _repo: &Path,
+            _since: u64,
+            _stop: &AtomicBool,
+            _on_line: &mut dyn FnMut(&str),
+        ) {
+        }
+
+        fn interrupt(&self) {}
+
+        fn set_journal(&self, repo: &Path, on: bool) -> Result<(), String> {
+            if on {
+                self.enables.lock().unwrap().push(repo.to_path_buf());
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn watcher_never_enables_a_repo_dropped_from_the_roster() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (go, gate) = mpsc::channel();
+        let source = Arc::new(GatedOffJournal {
+            gate: Mutex::new(Some(gate)),
+            enables: Mutex::new(Vec::new()),
+        });
+        let watcher = Watcher::start(
+            Arc::clone(&source) as Arc<dyn JournalSource>,
+            vec![PathBuf::from("/a")],
+            tmp.path().join("events_checkpoints.json"),
+            |_| true,
+            |_| {},
+        );
+
+        // `hank repos remove /a` ran; its follower lives on until exit.
+        watcher.follow(WatchList::default());
+        go.send(()).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        watcher.stop();
+
+        assert!(
+            source.enables.lock().unwrap().is_empty(),
+            "a repo no longer on the roster is never written to"
+        );
+    }
+
+    #[test]
+    fn watcher_rechecks_the_roster_before_enabling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (go, gate) = mpsc::channel();
+        let source = Arc::new(GatedOffJournal {
+            gate: Mutex::new(Some(gate)),
+            enables: Mutex::new(Vec::new()),
+        });
+        let watcher = Watcher::start(
+            Arc::clone(&source) as Arc<dyn JournalSource>,
+            vec![PathBuf::from("/a")],
+            tmp.path().join("events_checkpoints.json"),
+            // `hank repos unwatch /a` saved the roster; no refresh has run.
+            |_| false,
+            |_| {},
+        );
+
+        go.send(()).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        watcher.stop();
+
+        assert!(
+            source.enables.lock().unwrap().is_empty(),
+            "an opt-out on disk wins over the follower's stale roster"
+        );
+    }
+
+    #[test]
+    fn watch_list_allows_only_unopted_roster_repos() {
+        let list = WatchList {
+            repos: vec![PathBuf::from("/a"), PathBuf::from("/b")],
+            opted_out: BTreeSet::from([PathBuf::from("/b")]),
+        };
+        assert!(list.allows(Path::new("/a")));
+        assert!(!list.allows(Path::new("/b")), "opted out");
+        assert!(!list.allows(Path::new("/c")), "not on the roster");
     }
 }

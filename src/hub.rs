@@ -407,9 +407,7 @@ mod tests {
             watch: false,
             repos: paths
                 .iter()
-                .map(|p| RepoEntry {
-                    path: p.to_path_buf(),
-                })
+                .map(|p| RepoEntry::new(p.to_path_buf()))
                 .collect(),
         }
     }
@@ -744,9 +742,7 @@ mod tests {
         let paths = Paths::with_base(tmp.path());
         let roster = Config {
             watch: false,
-            repos: vec![RepoEntry {
-                path: PathBuf::from("later"),
-            }],
+            repos: vec![RepoEntry::new(PathBuf::from("later"))],
         };
 
         let witness = reconcile_witness(&paths, &roster).unwrap();
@@ -809,9 +805,7 @@ mod tests {
         let repo = make_repo(config_dir, "repo");
         let roster = Config {
             watch: false,
-            repos: vec![RepoEntry {
-                path: PathBuf::from("repo"),
-            }],
+            repos: vec![RepoEntry::new(PathBuf::from("repo"))],
         };
         let fake = FakeBdClient::new();
 
@@ -833,7 +827,7 @@ mod tests {
         let repo = tmp.path().join("later");
         let roster = Config {
             watch: false,
-            repos: vec![RepoEntry { path: repo.clone() }],
+            repos: vec![RepoEntry::new(repo.clone())],
         };
 
         let missing = reconcile_witness(&paths, &roster).unwrap();

@@ -185,6 +185,17 @@ fn argv_events_journal(repo: &Path) -> Vec<OsString> {
     ]
 }
 
+fn argv_set_events_journal(repo: &Path, on: bool) -> Vec<OsString> {
+    vec![
+        "-C".into(),
+        arg(repo),
+        "config".into(),
+        "set".into(),
+        "events-journal".into(),
+        if on { "true" } else { "false" }.into(),
+    ]
+}
+
 fn argv_ready(hub: &Path) -> Vec<OsString> {
     // `--limit 0` = unlimited; bd's `ready` otherwise caps output at 100, which
     // would silently truncate a large cross-repo hub.
@@ -271,6 +282,10 @@ impl BdClient for BdCli {
     fn events_journal_enabled(&self, repo: &Path) -> Result<bool, BdError> {
         let config: ConfigValue = self.run_json(argv_events_journal(repo))?;
         Ok(journal_flag(&config.value))
+    }
+
+    fn set_events_journal(&self, repo: &Path, on: bool) -> Result<(), BdError> {
+        self.run_ok(argv_set_events_journal(repo, on))
     }
 
     fn repo_sync(&self, hub: &Path) -> Result<RepoSyncReport, BdError> {
@@ -375,6 +390,15 @@ mod tests {
         assert_eq!(
             argv_events_journal(Path::new("/tmp/ra")),
             os(&["-C", "/tmp/ra", "config", "get", "events-journal", "--json"])
+        );
+
+        assert_eq!(
+            argv_set_events_journal(Path::new("/tmp/ra"), true),
+            os(&["-C", "/tmp/ra", "config", "set", "events-journal", "true"])
+        );
+        assert_eq!(
+            argv_set_events_journal(Path::new("/tmp/ra"), false),
+            os(&["-C", "/tmp/ra", "config", "set", "events-journal", "false"])
         );
 
         // `--limit 0` (unlimited) defeats bd's default 100-result cap.

@@ -56,3 +56,47 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+
+  bd-integration:
+    name: bd integration (ubuntu-latest)
+    runs-on: ubuntu-latest
+    env:
+      # The bd the gated integration suite runs against; bump here to upgrade.
+      BD_VERSION: v1.3.1
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: Restore bd
+        id: bd-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/go/bin/bd
+          key: bd-${{ runner.os }}-${{ env.BD_VERSION }}
+      - name: Install ICU (bd links it)
+        run: sudo apt-get update && sudo apt-get install -y libicu-dev
+      - name: Build bd
+        if: steps.bd-cache.outputs.cache-hit != 'true'
+        run: go install github.com/steveyegge/beads/cmd/bd@"$BD_VERSION"
+      - name: Put bd on PATH
+        run: |
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          "$HOME/go/bin/bd" version
+      - name: Run the bd integration suite
+        shell: bash
+        run: |
+          # A test that cannot find bd prints `SKIP:` and passes, so a broken
+          # install would look green; treat any skip as a failure.
+          cargo test --test bd_integration -- --nocapture 2>&1 | tee bd-integration.log
+          if grep -q "SKIP:" bd-integration.log; then
+            echo "::error::bd integration tests skipped; bd is not usable in CI"
+            exit 1
+          fi

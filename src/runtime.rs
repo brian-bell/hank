@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -32,7 +32,7 @@ use crate::hub::{ReconcileWitness, ensure_hub, hub_dir, reconcile_witness};
 use crate::refresh::{self, AttributionGeneration, HubGenerationToken, RefreshError};
 use crate::snapshot::{self, Row, Snapshot};
 use crate::ui_state;
-use crate::watch::{BdJournal, Watcher};
+use crate::watch::{BdJournal, WatchList, Watcher};
 
 /// How long the event thread blocks on `event::poll` before re-checking the stop
 /// flag, so a quit is observed promptly without a busy loop.
@@ -113,7 +113,7 @@ impl RuntimeRefreshState {
     /// Follow any `roster` repo the watcher (if running) doesn't follow yet.
     fn watch_roster(&self, paths: &Paths, roster: &Config) {
         if let Some(watcher) = self.watcher.get() {
-            watcher.follow(watched_repos(paths, roster));
+            watcher.follow(watch_list(paths, roster));
         }
     }
 
@@ -221,8 +221,9 @@ fn event_loop(
         let tx = tx.clone();
         let watcher = Watcher::start(
             Arc::new(BdJournal::new()),
-            watched_repos(paths, roster),
+            watch_list(paths, roster),
             paths.events_checkpoints_file().to_path_buf(),
+            roster_allows(paths.clone()),
             move |msg| {
                 let _ = tx.send(msg.into());
             },
@@ -442,6 +443,29 @@ fn reloading_refresh_worker(
                 .into(),
             );
         }
+    }
+}
+
+/// The watcher's view of `roster`: [`watched_repos`] plus the repos marked
+/// `unwatched`, normalized the same way, whose journal it must not turn on.
+fn watch_list(paths: &Paths, roster: &Config) -> WatchList {
+    WatchList {
+        repos: watched_repos(paths, roster),
+        opted_out: roster
+            .repos
+            .iter()
+            .filter(|entry| entry.unwatched)
+            .map(|entry| refresh::normalize_path(&paths.resolve_roster_path(&entry.path)))
+            .collect(),
+    }
+}
+
+/// The watcher's last word before turning a journal on: reload the roster
+/// from disk, so a `hank repos unwatch` saved since the last refresh is
+/// honored. An unreadable roster allows nothing.
+fn roster_allows(paths: Paths) -> impl Fn(&Path) -> bool + Send + Sync + 'static {
+    move |repo: &Path| {
+        load_roster(&paths).is_ok_and(|roster| watch_list(&paths, &roster).allows(repo))
     }
 }
 
@@ -1219,9 +1243,7 @@ mod tests {
             watch: false,
             repos: paths
                 .iter()
-                .map(|p| RepoEntry {
-                    path: p.to_path_buf(),
-                })
+                .map(|p| RepoEntry::new(p.to_path_buf()))
                 .collect(),
         }
     }
@@ -1507,6 +1529,48 @@ mod tests {
         }
 
         fn interrupt(&self) {}
+
+        fn set_journal(&self, _repo: &Path, _on: bool) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn watch_list_carries_the_roster_opt_outs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let rb = seed_repo(tmp.path(), "rb", "rb");
+        let mut config = roster(&[&ra, &rb]);
+        config.repos[1].unwatched = true;
+
+        let list = watch_list(&paths, &config);
+
+        assert_eq!(list.repos, watched_repos(&paths, &config), "both followed");
+        assert_eq!(list.opted_out.len(), 1, "{list:?}");
+        assert!(list.opted_out.iter().all(|p| p.ends_with("rb")), "{list:?}");
+    }
+
+    #[test]
+    fn roster_allows_reads_the_opt_out_saved_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let rb = seed_repo(tmp.path(), "rb", "rb");
+        let mut config = roster(&[&ra, &rb]);
+        let followed = watched_repos(&paths, &config);
+        config.save(paths.config_file()).unwrap();
+        let allows = roster_allows(paths.clone());
+        assert!(followed.iter().all(|repo| allows(repo)), "{followed:?}");
+
+        // `hank repos unwatch rb` saved the roster; no refresh has run since.
+        config.repos[1].unwatched = true;
+        config.save(paths.config_file()).unwrap();
+
+        assert!(allows(&followed[0]), "ra is still allowed");
+        assert!(!allows(&followed[1]), "rb's opt-out is read from disk");
+        fs::write(paths.config_file(), "not = [valid").unwrap();
+        assert!(!allows(&followed[0]), "an unreadable roster allows nothing");
     }
 
     #[test]
@@ -1523,6 +1587,7 @@ mod tests {
             Arc::new(ParkedJournal(Mutex::new(tx))),
             watched_repos(&paths, &launch),
             paths.events_checkpoints_file().to_path_buf(),
+            |_| true,
             |_| {},
         );
         assert!(state.watcher.set(watcher).is_ok());

@@ -110,3 +110,19 @@ fn reset_ignores_legacy_state_and_only_clears_canonical_derived_state() {
     assert!(!config_root.join("hank/config.toml").exists());
     assert!(!data_root.join("hank/ui_state.json").exists());
 }
+
+#[test]
+fn repos_watch_needs_a_path_or_all() {
+    for action in ["watch", "unwatch"] {
+        let output = hank().args(["repos", action]).output().unwrap();
+        assert!(!output.status.success(), "bare `repos {action}` is refused");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("<PATH>"), "{stderr}");
+
+        let output = hank()
+            .args(["repos", action, "/some/repo", "--all"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "a path and --all conflict");
+    }
+}

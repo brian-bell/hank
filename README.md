@@ -6,17 +6,18 @@ repositories into a persistent hub database that `bd` itself maintains
 (multi-repo hydration) and presents a cross-repo ready-work list with a detail
 pane, cross-repo search, and a copy-context action.
 
-Hank never writes to your issue data. The only writes it makes are `bd export`
-refreshing each source repo's own `.beads/issues.jsonl` — which `bd` owns — so
-your repos are safe. Acting on an issue happens in your terminal: the
+Hank never writes to your issue data. Its writes to your repos go through `bd`:
+`bd export` refreshing each source repo's own `.beads/issues.jsonl`, and, only
+when you turn on live refresh, the `events-journal` setting in
+`.beads/config.yaml` (see [Live refresh](#live-refresh)). Acting on an issue happens in your terminal: the
 copy-context key hands you a ready-to-run command.
 
 ## Requirements
 
 - `bd` (beads) **>= 1.1.0** with `schema_version == 1` on `PATH` at runtime.
   Hank checks this at startup and refuses a version it cannot vouch for.
-- Optional live refresh (`hank --watch`) needs `bd` **>= 1.3.0** and the events
-  journal turned on in each repo you want followed (see [Live refresh](#live-refresh)).
+- Optional live refresh (`hank --watch`) needs `bd` **>= 1.3.0** (see
+  [Live refresh](#live-refresh)).
 
 Prebuilt binaries are available for Apple Silicon and Intel macOS, plus ARM64
 and x86_64 GNU/Linux. Building from source requires Rust 1.88 or newer.
@@ -61,15 +62,27 @@ re-exports just that repo and re-syncs the hub, so the list updates without
 pressing `r`. The status bar shows `live` while the watcher runs. A repo added
 with `hank repos add` while the TUI is open is followed from its next refresh.
 
-The journal is per workspace and off by default. Turn it on in each repo you
-want followed (Hank is read-only and never does this for you):
+The journal is per workspace and off by default. With live refresh on, Hank
+turns it on for you in every roster repo where it is off, by running
+`bd -C <repo> config set events-journal true`, and says so in the status bar.
+`hank repos add` and `hank repos discover --add` do the same for new repos when
+`watch = true`. bd keeps this setting in the repo's `.beads/config.yaml`, which
+is git-tracked, so you will see a one-line change there to commit (Hank never
+commits). bd reads only that file for this setting, so there is no
+per-machine alternative.
+
+To stop Hank from managing a repo's journal, opt it out:
 
 ```bash
-bd -C ~/dev/megaclock config set events-journal true
+hank repos unwatch ~/dev/megaclock   # journal off; live refresh leaves it alone
+hank repos watch ~/dev/megaclock     # journal on; clears the opt-out
+hank repos watch --all               # every roster repo
 ```
 
-A repo with the journal off shows a status-bar note and is simply not
-followed; `hank doctor` prints `journal: on|off` for every roster repo. Hank
+`unwatch` records `unwatched = true` on the repo's roster entry. A repo whose
+journal is off is re-checked while the TUI runs, so turning it on later needs no
+restart. `hank doctor` prints `journal: on|off` for every roster repo, marking
+opted-out ones `(unwatched)`. Hank
 saves the last journal position per repo in
 `hank/events_checkpoints.json` under the data dir and resumes from it; if the
 journal has pruned past that position, Hank falls back to a full refresh.
@@ -118,6 +131,8 @@ hank repos add <path>    # add a beads repo to the roster
 hank repos remove <path> # drop a repo from the roster and the hub
 hank repos list          # print the roster
 hank repos discover <dir> [--add]   # scan <dir>/*/.beads one level deep
+hank repos watch <path>|--all       # turn a repo's events journal on (live refresh)
+hank repos unwatch <path>|--all     # turn it off and opt the repo out
 ```
 
 The roster's source of truth is `hank/config.toml` under your

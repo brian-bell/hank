@@ -303,14 +303,7 @@ mod tests {
         PrefixMap::from_pairs(
             pairs
                 .iter()
-                .map(|(prefix, path)| {
-                    (
-                        (*prefix).to_string(),
-                        RepoEntry {
-                            path: PathBuf::from(path),
-                        },
-                    )
-                })
+                .map(|(prefix, path)| ((*prefix).to_string(), RepoEntry::new(PathBuf::from(path))))
                 .collect(),
         )
     }

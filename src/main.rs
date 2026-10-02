@@ -27,12 +27,14 @@ use hank::config::Paths;
                   Esc back, q quit. The last confirmed repository view is \
                   restored on the next launch; All repos is the first-run \
                   default. `hank --watch` refreshes live from each repo's \
-                  `bd events` journal (bd >= 1.3.0).\n\n\
+                  `bd events` journal (bd >= 1.3.0), turning the journal on \
+                  where it is off; `hank repos unwatch <path>` opts a repo out.\n\n\
                   First run: `hank repos discover ~/dev --add` then `hank`."
 )]
 struct Cli {
-    /// Refresh live from each repo's `bd events` journal (bd >= 1.3.0 with
-    /// `events-journal: true`). Same as `watch = true` in config.toml.
+    /// Refresh live from each repo's `bd events` journal (bd >= 1.3.0),
+    /// turning the journal on in roster repos not opted out with `hank repos
+    /// unwatch`. Same as `watch = true` in config.toml.
     #[arg(long)]
     watch: bool,
 
@@ -73,6 +75,26 @@ enum ReposAction {
     },
     /// Print the current roster.
     List,
+    /// Turn on a repo's events journal so live refresh follows it. Edits the
+    /// repo's git-tracked `.beads/config.yaml` through `bd config set`.
+    Watch {
+        /// Roster path of the repo (a leading `~` is expanded).
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        path: Option<PathBuf>,
+        /// Every repo in the roster.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Turn off a repo's events journal and stop live refresh from turning it
+    /// back on.
+    Unwatch {
+        /// Roster path of the repo (a leading `~` is expanded).
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        path: Option<PathBuf>,
+        /// Every repo in the roster.
+        #[arg(long)]
+        all: bool,
+    },
     /// Scan `<root>/*/.beads` one level deep for beads repos.
     Discover {
         /// Directory whose immediate children are scanned for `.beads`.
@@ -117,14 +139,24 @@ fn run() -> Result<(), CliError> {
         }
         Some(Command::Reset) => cli::run_reset(&paths, &mut stdout),
         Some(Command::Doctor) => cli::run_doctor(&bd, &paths, &mut stdout),
-        // Roster editing is config I/O; only `remove` touches bd, to prune the hub.
-        // Each runner loads and saves the roster itself.
+        // Roster editing is config I/O. bd is touched to prune the hub
+        // (`remove`), to toggle the events journal (`watch`/`unwatch`), and, with
+        // live refresh on, to turn the journal on in newly added repos. Each
+        // runner loads and saves the roster itself.
         Some(Command::Repos { action }) => match action {
-            ReposAction::Add { path } => cli::run_repos_add(&paths, &path, &mut stdout),
+            ReposAction::Add { path } => cli::run_repos_add(&bd, &paths, &path, &mut stdout),
             ReposAction::Remove { path } => cli::run_repos_remove(&bd, &paths, &path, &mut stdout),
             ReposAction::List => cli::run_repos_list(&paths, &mut stdout),
+            ReposAction::Watch { path, all } => {
+                let path = if all { None } else { path.as_deref() };
+                cli::run_repos_watch(&bd, &paths, path, true, &mut stdout)
+            }
+            ReposAction::Unwatch { path, all } => {
+                let path = if all { None } else { path.as_deref() };
+                cli::run_repos_watch(&bd, &paths, path, false, &mut stdout)
+            }
             ReposAction::Discover { root, add } => {
-                cli::run_repos_discover(&paths, &root, add, &mut stdout)
+                cli::run_repos_discover(&bd, &paths, &root, add, &mut stdout)
             }
         },
         // Bare `hank` launches the interactive TUI: ensure_hub warnings flow to

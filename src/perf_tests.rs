@@ -282,7 +282,7 @@ impl Fixture {
                 &repo,
                 &["export", "-o", output.to_str().expect("utf8 temp path")],
             );
-            repos.push(RepoEntry { path: repo });
+            repos.push(RepoEntry::new(repo));
         }
         let paths = Paths::with_base(temp.path());
         let roster = Config {

@@ -14,7 +14,9 @@ that federates N beads repositories into one persistent `bd` hub workspace and
 answers "what's ready to work on across all my repos?" It shows a cross-repo
 ready list with a detail pane, cross-repo search (`/`), repo/priority filters,
 and a copy-context action (`y`/`Y` via OSC 52). Hank never writes issue data;
-its only source-repo write is `bd export` refreshing `.beads/issues.jsonl`.
+its source-repo writes are `bd export` refreshing `.beads/issues.jsonl` and,
+with live refresh on (or `hank repos watch`/`unwatch`), `bd config set
+events-journal` in the repo's git-tracked `.beads/config.yaml`.
 
 Requires `bd` >= 1.1.0 with `schema_version == 1` on `PATH` at runtime (gated
 at startup; constants in `src/cli.rs`). Rust edition 2024.
@@ -63,7 +65,13 @@ when `bd` is missing.
   verified prefixes. A pruned checkpoint (`events_journal_truncated`) widens to
   a full refresh. A failed watcher refresh is retried with backoff
   (`Effect::RetryWatch`). Sync is not journaled, so launch and `r` stay full
-  refreshes.
+  refreshes. A follower that finds a repo's journal off turns it on
+  (`JournalSource::set_journal`) unless the roster entry is `unwatched` (set by
+  `hank repos unwatch`), then keeps re-checking on its backoff. It re-reads the
+  roster on disk right before the write and again after it, undoing a write
+  that raced an `unwatch` (which saves the roster before turning bd off). bd decides
+  journal activation only from `BD_EVENTS_JOURNAL` or the repo's own
+  `.beads/config.yaml`, so there is no untracked per-machine switch.
 - **Pure state core**: the TUI is `reduce(&mut App, Msg) -> Vec<Effect>` with
   no I/O, clock, or threads inside; the runtime performs effects. `view::draw`
   is pure over `(App, now)` and tested with ratatui's `TestBackend`.
