@@ -53,6 +53,12 @@ when `bd` is missing.
 - **Refresh**: async and TUI-owned — export each repo + one hub sync on a
   worker thread; an advisory lock on `<hub>/.hank.lock` serializes concurrent
   Hank instances.
+- **Live refresh (opt-in)**: `hank --watch` or `watch = true` in
+  `config.toml`. `watch` follows each repo's events journal (bd >= 1.3.0) and
+  sends `Msg::WatchChanged(RefreshScope)`; the runtime runs a scoped refresh
+  (`refresh::run_scoped`) that exports only those repos and carries the others'
+  verified prefixes. A pruned checkpoint (`events_journal_truncated`) widens to
+  a full refresh. Sync is not journaled, so launch and `r` stay full refreshes.
 - **Pure state core**: the TUI is `reduce(&mut App, Msg) -> Vec<Effect>` with
   no I/O, clock, or threads inside; the runtime performs effects. `view::draw`
   is pure over `(App, now)` and tested with ratatui's `TestBackend`.
@@ -69,6 +75,7 @@ Module map (`src/`):
 | `app/` | `mod` (pure `reduce` core), `view` (renderer), `keys` (crossterm→`Msg`, only file importing crossterm), `context` (copy builders + OSC 52) |
 | `runtime` | Event loop: event + refresh worker threads feed one mpsc channel |
 | `cli` | Headless runners (`snapshot`, `doctor`, `reset`, `repos`), version gate |
+| `watch` | Opt-in live refresh: per-repo `bd events tail --follow` followers, debounced batcher, saved checkpoints |
 
 ## Conventions & Gotchas
 

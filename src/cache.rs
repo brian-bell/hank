@@ -215,6 +215,7 @@ mod tests {
 
     fn roster(paths: &[&str]) -> Config {
         Config {
+            watch: false,
             repos: paths.iter().map(|p| RepoEntry { path: p.into() }).collect(),
         }
     }

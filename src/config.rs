@@ -18,6 +18,10 @@ pub struct RepoEntry {
 pub struct Config {
     #[serde(default)]
     pub repos: Vec<RepoEntry>,
+    /// Opt in to live refresh from each repo's events journal (`hank --watch`
+    /// for one session). Omitted from `config.toml` while off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub watch: bool,
 }
 
 #[derive(Deserialize)]
@@ -87,6 +91,7 @@ const LEGACY_APP_DIR: &str = "federated-beads";
 const CONFIG_FILE_NAME: &str = "config.toml";
 const CACHE_FILE_NAME: &str = "snapshot_cache.json";
 const UI_STATE_FILE_NAME: &str = "ui_state.json";
+const EVENTS_CHECKPOINTS_FILE_NAME: &str = "events_checkpoints.json";
 const MIGRATION_LOCK_FILE_NAME: &str = ".hank-migration.lock";
 
 static MIGRATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -101,6 +106,7 @@ pub struct Paths {
     data_dir: PathBuf,
     cache_file: PathBuf,
     ui_state_file: PathBuf,
+    events_checkpoints_file: PathBuf,
     legacy_config_file: PathBuf,
     legacy_ui_state_file: PathBuf,
     migration_lock_file: PathBuf,
@@ -131,6 +137,12 @@ impl Paths {
         &self.ui_state_file
     }
 
+    /// Path to the live-refresh journal checkpoints
+    /// (`<data_root>/hank/events_checkpoints.json`), see [`crate::watch`].
+    pub fn events_checkpoints_file(&self) -> &Path {
+        &self.events_checkpoints_file
+    }
+
     /// Resolve a possibly-relative roster entry against the injected config
     /// directory. This keeps direct lower-level callers deterministic even when
     /// they construct a [`Config`] without going through the CLI load boundary.
@@ -153,6 +165,7 @@ impl Paths {
             data_dir: data_root.join(APP_DIR),
             cache_file: data_root.join(APP_DIR).join(CACHE_FILE_NAME),
             ui_state_file: data_root.join(APP_DIR).join(UI_STATE_FILE_NAME),
+            events_checkpoints_file: data_root.join(APP_DIR).join(EVENTS_CHECKPOINTS_FILE_NAME),
             legacy_config_file: config_root.join(LEGACY_APP_DIR).join(CONFIG_FILE_NAME),
             legacy_ui_state_file: data_root.join(LEGACY_APP_DIR).join(UI_STATE_FILE_NAME),
             migration_lock_file: data_root.join(APP_DIR).join(MIGRATION_LOCK_FILE_NAME),
@@ -517,6 +530,7 @@ mod tests {
         let path = dir.path().join("config.toml");
 
         let original = Config {
+            watch: false,
             repos: vec![
                 RepoEntry {
                     path: PathBuf::from("/a"),
@@ -547,6 +561,7 @@ mod tests {
         let path = dir.path().join("nested/does/not/exist/config.toml");
 
         let original = Config {
+            watch: false,
             repos: vec![RepoEntry {
                 path: PathBuf::from("/x"),
             }],
@@ -582,6 +597,7 @@ mod tests {
         let paths = Paths::with_base(dir.path());
         let legacy = dir.path().join("federated-beads/config.toml");
         let expected = Config {
+            watch: false,
             repos: vec![RepoEntry {
                 path: PathBuf::from("/legacy/repo"),
             }],
@@ -640,6 +656,7 @@ mod tests {
         let paths = Paths::with_base(dir.path());
         let legacy = dir.path().join("federated-beads/config.toml");
         Config {
+            watch: false,
             repos: vec![
                 RepoEntry { path: "~".into() },
                 RepoEntry {
@@ -707,6 +724,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(dir.path());
         let canonical = Config {
+            watch: false,
             repos: vec![RepoEntry {
                 path: PathBuf::from("/canonical"),
             }],
@@ -853,6 +871,7 @@ mod tests {
         let paths = Paths::with_base(dir.path());
         let legacy = dir.path().join("federated-beads/config.toml");
         let expected = Config {
+            watch: false,
             repos: vec![RepoEntry {
                 path: PathBuf::from("/concurrent"),
             }],
@@ -910,6 +929,7 @@ mod tests {
         let path = dir.path().join("config.toml");
 
         Config {
+            watch: false,
             repos: vec![RepoEntry {
                 path: PathBuf::from("/first"),
             }],
@@ -918,6 +938,7 @@ mod tests {
         .unwrap();
 
         let second = Config {
+            watch: false,
             repos: vec![RepoEntry {
                 path: PathBuf::from("/second"),
             }],
@@ -925,6 +946,23 @@ mod tests {
         second.save(&path).unwrap();
 
         assert_eq!(Config::load(&path).unwrap(), second);
+    }
+
+    #[test]
+    fn watch_opt_in_roundtrips_and_stays_out_of_the_file_when_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let on = Config {
+            repos: Vec::new(),
+            watch: true,
+        };
+        on.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), on);
+
+        Config::default().save(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("watch"));
+        fs::write(&path, "repos = []\n").unwrap();
+        assert!(!Config::load(&path).unwrap().watch, "absent means off");
     }
 
     #[test]

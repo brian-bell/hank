@@ -14,6 +14,7 @@ pub mod refresh;
 pub mod runtime;
 pub mod snapshot;
 pub mod ui_state;
+pub mod watch;
 
 #[cfg(test)]
 mod perf_tests;

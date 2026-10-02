@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -22,7 +23,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::{App, Effect, Msg, context, keys, view};
+use crate::app::{App, Effect, Msg, RefreshScope, context, keys, view};
 use crate::bd::{BdCli, BdClient, RepoSyncReport};
 use crate::cache;
 use crate::cli::{CliError, sanitize, version_gate};
@@ -31,6 +32,7 @@ use crate::hub::{ReconcileWitness, ensure_hub, hub_dir, reconcile_witness};
 use crate::refresh::{self, AttributionGeneration, HubGenerationToken, RefreshError};
 use crate::snapshot::{self, Row, Snapshot};
 use crate::ui_state;
+use crate::watch::{BdJournal, Watcher};
 
 /// How long the event thread blocks on `event::poll` before re-checking the stop
 /// flag, so a quit is observed promptly without a busy loop.
@@ -149,10 +151,12 @@ impl From<Msg> for Incoming {
 
 /// Launch the interactive TUI (bare `hank`). Sets up the terminal, runs the event
 /// loop against `roster`, and always restores the terminal before returning —
-/// even on error, so a failure never leaves the user's terminal wedged.
-pub fn run(paths: &Paths, roster: Config) -> Result<(), CliError> {
+/// even on error, so a failure never leaves the user's terminal wedged. With
+/// `watch`, a [`Watcher`] follows each repo's events journal and refreshes just
+/// the repos that change.
+pub fn run(paths: &Paths, roster: Config, watch: bool) -> Result<(), CliError> {
     let mut terminal = setup_terminal().map_err(CliError::Io)?;
-    let loop_result = event_loop(&mut terminal, paths, &roster);
+    let loop_result = event_loop(&mut terminal, paths, &roster, watch);
     let restore_result = restore_terminal(&mut terminal);
     // Surface a loop failure first; a restore failure only if the loop was fine.
     loop_result?;
@@ -162,7 +166,12 @@ pub fn run(paths: &Paths, roster: Config) -> Result<(), CliError> {
 
 /// The UI thread: spawn the input + initial-refresh producers, then consume
 /// messages, reduce, execute effects, and redraw until the app is done.
-fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), CliError> {
+fn event_loop(
+    terminal: &mut Tui,
+    paths: &Paths,
+    roster: &Config,
+    watch: bool,
+) -> Result<(), CliError> {
     let (tx, rx) = mpsc::channel::<Incoming>();
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -195,7 +204,22 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
         paths,
         roster,
         Arc::clone(&refresh_state),
+        RefreshScope::Full,
     ));
+    // Started after the launch refresh is spawned: anything the watcher reports
+    // from here on queues behind that full refresh (the app is born stale).
+    let watcher = watch.then(|| {
+        app.set_watching(true);
+        let tx = tx.clone();
+        Watcher::start(
+            Arc::new(BdJournal::new()),
+            watched_repos(paths, roster),
+            paths.events_checkpoints_file().to_path_buf(),
+            move |msg| {
+                let _ = tx.send(msg.into());
+            },
+        )
+    });
 
     // Run the render/reduce loop, then join threads *unconditionally* — for a
     // clean quit and for every error return alike — so a terminal write failure
@@ -212,6 +236,9 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
         &refresh_state,
     );
     stop.store(true, Ordering::SeqCst);
+    if let Some(watcher) = watcher {
+        watcher.stop();
+    }
     let _ = input_handle.join();
     for handle in worker_handles {
         let _ = handle.join();
@@ -295,7 +322,9 @@ fn execute_effect(
 ) {
     worker_handles.retain(|h| !h.is_finished());
     let handle = match effect {
-        Effect::Refresh => spawn_refresh(tx, paths, roster, Arc::clone(refresh_state)),
+        Effect::Refresh(scope) => {
+            spawn_refresh(tx, paths, roster, Arc::clone(refresh_state), scope)
+        }
         Effect::FetchDetail { id, token } => spawn_detail(tx, paths, id, token),
         Effect::Search { query, token } => {
             spawn_search(tx, paths, query, token, Arc::clone(refresh_state))
@@ -350,11 +379,24 @@ fn spawn_refresh(
     paths: &Paths,
     roster: &Config,
     state: Arc<RuntimeRefreshState>,
+    scope: RefreshScope,
 ) -> thread::JoinHandle<()> {
     let tx = tx.clone();
     let paths = paths.clone();
     let roster = roster.clone();
-    thread::spawn(move || refresh_worker_with_state(BdCli::new(), roster, paths, tx, state))
+    thread::spawn(move || refresh_worker_with_state(BdCli::new(), roster, paths, tx, state, scope))
+}
+
+/// The resolved, deduplicated roster paths the watcher follows, normalized the
+/// same way a scoped refresh matches them.
+fn watched_repos(paths: &Paths, roster: &Config) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    roster
+        .repos
+        .iter()
+        .map(|entry| refresh::normalize_path(&paths.resolve_roster_path(&entry.path)))
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
 }
 
 /// The refresh worker body: announce the start, run the pipeline, cache a
@@ -375,6 +417,7 @@ pub(crate) fn refresh_worker(
         paths,
         tx,
         Arc::new(RuntimeRefreshState::default()),
+        RefreshScope::Full,
     );
 }
 
@@ -384,9 +427,16 @@ fn refresh_worker_with_state(
     paths: Paths,
     tx: Sender<Incoming>,
     state: Arc<RuntimeRefreshState>,
+    scope: RefreshScope,
 ) {
     let _ = tx.send(Msg::RefreshStarted.into());
-    let (snapshot, warnings) = gather_snapshot_with_state(&bd, &roster, &paths, &state);
+    let only = match scope {
+        RefreshScope::Full => None,
+        RefreshScope::Repos(repos) => Some(repos.into_iter().collect::<HashSet<_>>()),
+    };
+    let mut metrics = PipelineMetrics::default();
+    let (snapshot, warnings) =
+        gather_snapshot_with_metrics(&bd, &roster, &paths, &state, only.as_ref(), &mut metrics);
     if let Some(snapshot) = &snapshot {
         let _ = cache::save(paths.cache_file(), snapshot, &roster);
     }
@@ -769,7 +819,7 @@ pub(crate) fn gather_snapshot_measured(
     state: &RuntimeRefreshState,
 ) -> ((Option<Snapshot>, Vec<String>), PipelineMetrics) {
     let mut metrics = PipelineMetrics::default();
-    let result = gather_snapshot_with_metrics(bd, roster, paths, state, &mut metrics);
+    let result = gather_snapshot_with_metrics(bd, roster, paths, state, None, &mut metrics);
     (result, metrics)
 }
 
@@ -778,6 +828,7 @@ fn gather_snapshot_with_metrics(
     roster: &Config,
     paths: &Paths,
     state: &RuntimeRefreshState,
+    only: Option<&HashSet<PathBuf>>,
     metrics: &mut PipelineMetrics,
 ) -> (Option<Snapshot>, Vec<String>) {
     let total_started = std::time::Instant::now();
@@ -823,7 +874,7 @@ fn gather_snapshot_with_metrics(
         .current_hub
         .as_ref()
         .map(|verified| verified.candidate.clone());
-    let synced = match refresh::run_with_state(bd, roster, paths, previous.as_ref(), 4) {
+    let synced = match refresh::run_scoped(bd, roster, paths, previous.as_ref(), only, 4) {
         Ok(synced) => {
             for repo_error in &synced.outcome().errors {
                 warnings.push(sanitize(&repo_error.to_string()));
@@ -1082,6 +1133,7 @@ mod tests {
 
     fn roster(paths: &[&Path]) -> Config {
         Config {
+            watch: false,
             repos: paths
                 .iter()
                 .map(|p| RepoEntry {
@@ -1492,6 +1544,49 @@ mod tests {
                 .count(),
             1,
             "the warm refresh revalidates the cached prefix from its fresh export"
+        );
+    }
+
+    #[test]
+    fn watcher_scoped_refresh_exports_only_the_changed_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let rb = seed_repo(tmp.path(), "rb", "rb");
+        let bd = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "a"), issue("rb-1", 1, "b")])
+            .with_export_content(&ra, b"{\"id\":\"ra-1\"}\n".to_vec())
+            .with_export_content(&rb, b"{\"id\":\"rb-1\"}\n".to_vec());
+        let config = roster(&[&ra, &rb]);
+        let state = RuntimeRefreshState::default();
+        assert!(
+            gather_snapshot_with_state(&bd, &config, &paths, &state)
+                .0
+                .is_some()
+        );
+        let before = bd.calls().len();
+
+        let only: HashSet<PathBuf> = watched_repos(&paths, &config)
+            .into_iter()
+            .filter(|path| path.ends_with("rb"))
+            .collect();
+        let mut metrics = PipelineMetrics::default();
+        let (snapshot, warnings) =
+            gather_snapshot_with_metrics(&bd, &config, &paths, &state, Some(&only), &mut metrics);
+
+        let snapshot = snapshot.expect("scoped refresh succeeds");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let exports: Vec<_> = bd.calls()[before..]
+            .iter()
+            .filter_map(|call| match call {
+                crate::bd::Call::Export(repo, _) => Some(repo.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(exports, vec![rb.clone()]);
+        assert!(
+            snapshot.rows.iter().all(|row| row.repo_id.is_some()),
+            "the quiet repo's rows keep their attribution"
         );
     }
 

@@ -113,3 +113,17 @@ pub fn build_ready_fixture_repo_with_prefix(dir: &Path, prefix: &str) {
     assert_ne!(ready, blocker);
     assert_ne!(ready, blocked);
 }
+
+/// True if the installed `bd` has the events journal (bd >= 1.3.0).
+pub fn bd_has_events() -> bool {
+    Command::new("bd")
+        .args(["events", "tail", "--help"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Run `bd -C <dir> <args>`, panicking on failure; returns stdout.
+pub fn bd_in(dir: &Path, args: &[&str]) -> String {
+    bd(Some(dir), args)
+}

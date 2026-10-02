@@ -15,6 +15,8 @@ copy-context key hands you a ready-to-run command.
 
 - `bd` (beads) **>= 1.1.0** with `schema_version == 1` on `PATH` at runtime.
   Hank checks this at startup and refuses a version it cannot vouch for.
+- Optional live refresh (`hank --watch`) needs `bd` **>= 1.3.0** and the events
+  journal turned on in each repo you want followed (see [Live refresh](#live-refresh)).
 
 Prebuilt binaries are available for Apple Silicon and Intel macOS, plus ARM64
 and x86_64 GNU/Linux. Building from source requires Rust 1.88 or newer.
@@ -49,6 +51,28 @@ hank                              # launch the TUI
 `discover` without `--add` previews what it found without changing anything.
 The hub database is created automatically on first run under your XDG data dir
 and is disposable derived data (see `hank reset`).
+
+## Live refresh
+
+Off by default. Launch with `hank --watch`, or set `watch = true` at the top of
+`config.toml`, and Hank follows each repo's `bd` events journal
+(`bd events tail --follow`) in the background. When a repo changes, Hank
+re-exports just that repo and re-syncs the hub, so the list updates without
+pressing `r`. The status bar shows `live` while the watcher runs.
+
+The journal is per workspace and off by default. Turn it on in each repo you
+want followed (Hank is read-only and never does this for you):
+
+```bash
+bd -C ~/dev/megaclock config set events-journal true
+```
+
+A repo with the journal off shows a status-bar note and is simply not
+followed. Hank saves the last journal position per repo in
+`hank/events_checkpoints.json` under the data dir and resumes from it; if the
+journal has pruned past that position, Hank falls back to a full refresh.
+Syncs such as `bd dolt pull` are not journaled, so press `r` after pulling;
+every launch is also a full refresh.
 
 ## Keybindings (TUI)
 
@@ -142,6 +166,9 @@ Source repos            Hank                              Hub (bd workspace)
   object. Ownership, ACLs, xattrs, labels, file flags, and inode identity are
   not part of the changed-export metadata contract. The stale list stays
   browsable, and `<hub>/.hank.lock` serializes concurrent Hank instances.
+- **Live refresh** (opt-in): one `bd events tail --follow` per repo feeds a
+  debounced batcher; a batch refreshes only the repos that changed, queued
+  behind any refresh already running. See [Live refresh](#live-refresh).
 - **State core**: the whole TUI is a pure `reduce(&mut App, Msg) -> Vec<Effect>`
   state machine (no I/O, no clock, no threads inside), so it is exhaustively
   unit-tested; the runtime performs the effects. The last confirmed repository
@@ -152,8 +179,8 @@ Module map: `config` (roster + XDG paths) · `ui_state` (persisted TUI
 preferences) · `bd` (the `BdClient` trait, real subprocess + fake impls, serde
 types) · `hub` (lifecycle) · `refresh` (export + sync + prefix map) · `snapshot`
 (the read model) · `app` (`reduce` core, `view` renderer, `keys` mapping,
-`context` copy builders) · `runtime` (the event loop and workers) · `cli`
-(headless subcommands).
+`context` copy builders) · `runtime` (the event loop and workers) · `watch`
+(the opt-in events-journal follower) · `cli` (headless subcommands).
 
 ## Verification commands
 
@@ -184,7 +211,7 @@ Recorded phase timings for the refresh-performance epic live in
 - A blocked-issues view (v1 shows only ready work).
 - Any write path from the TUI (create/update/close/comment) — the copy-context
   key is the bridge to acting in a terminal.
-- A background daemon / file watcher; refresh is user-triggered.
+- A background daemon. Live refresh (`--watch`) runs only while the TUI is open.
 
 ## License
 
