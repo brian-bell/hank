@@ -15,7 +15,7 @@ rg -n -i --hidden \
 Every remaining semantic match belongs to one of these required categories:
 
 - **Legacy migration literals:** `src/config.rs`, its unit tests,
-  `tests/hank_binary.rs`, the README upgrade section, and old `.fbd.lock` /
+  `tests/hank_binary.rs`, `docs/upgrading-from-fbd.md`, and old `.fbd.lock` /
   `.issues.jsonl.fbd.*.tmp` fixtures. Hank must recognize or prove it does not
   copy these exact legacy names.
 - **Historical tracker/storage evidence:** historical `federated-beads-*`
@@ -24,7 +24,7 @@ Every remaining semantic match belongs to one of these required categories:
   migrated to the `hank-*` prefix; these old textual references remain as
   provenance rather than active issue ids. The Dolt database and project UUID
   remain durable identities.
-- **Immutable rc.1 history:** the README identifies the old `fbd` RC only to
+- **Immutable rc.1 history:** the upgrade doc identifies the old `fbd` RC only to
   explain migration. The binary test's negative assertion proves that this
   historical executable name is absent from current help/install surfaces.
 - **Stale active references:** none remain. Active package, library, binary,
