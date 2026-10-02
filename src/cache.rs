@@ -8,7 +8,7 @@
 //! roster mismatch) is never an error to the caller — it just means the
 //! ordinary `Loading` boot runs, exactly as if no cache module existed.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -87,17 +87,29 @@ pub fn load(path: &Path, now: SystemTime, roster: &Config) -> Option<Snapshot> {
 /// `snapshot`'s, so the cache stays monotonic in `fetched_at` even under a
 /// racing writer.
 pub fn save(path: &Path, snapshot: &Snapshot, roster: &Config) -> io::Result<()> {
+    save_if(path, snapshot, roster, || true)
+}
+
+/// [`save`], but only when `still_current` returns `true`. The check runs under
+/// the same cache lock [`clear`] takes, so a writer whose source state was
+/// discarded (e.g. by `hank reset`, which deletes the hub before clearing the
+/// cache) either lands before the clear — and is removed by it — or sees the
+/// discard and skips, never recreating a cache the reset just cleared.
+pub fn save_if(
+    path: &Path,
+    snapshot: &Snapshot,
+    roster: &Config,
+    still_current: impl FnOnce() -> bool,
+) -> io::Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(parent) = parent {
         fs::create_dir_all(parent)?;
     }
 
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(lock_path(path))?;
-    lock_file.lock_exclusive()?;
+    let _lock = lock(path)?;
+    if !still_current() {
+        return Ok(());
+    }
 
     if let Some(existing) = read(path)
         && existing.version == CACHE_VERSION
@@ -129,7 +141,19 @@ pub fn save(path: &Path, snapshot: &Snapshot, roster: &Config) -> io::Result<()>
 
     fs::write(&tmp_path, bytes)?;
     fs::rename(&tmp_path, path)
-    // `lock_file` drops here, releasing the flock.
+    // `_lock` drops here, releasing the flock.
+}
+
+/// Take the exclusive (blocking) lock on `path`'s sibling lock file, released
+/// when the returned handle drops.
+fn lock(path: &Path) -> io::Result<File> {
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path(path))?;
+    lock_file.lock_exclusive()?;
+    Ok(lock_file)
 }
 
 /// Parse whatever is currently at `path` into a [`CacheFile`], ignoring
@@ -167,7 +191,16 @@ fn lock_path(path: &Path) -> PathBuf {
 /// error — `reset` calls this unconditionally alongside deleting the hub, so
 /// a launch just after `hank reset` never paints rows from the discarded hub
 /// (see [`crate::hub::reset`]).
+///
+/// Takes the same lock as [`save_if`], so a concurrent writer's check-and-write
+/// finishes entirely before or after the removal.
 pub fn clear(path: &Path) -> io::Result<()> {
+    let _lock = match lock(path) {
+        Ok(lock) => lock,
+        // No data dir yet: there is no cache to clear.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -406,6 +439,22 @@ mod tests {
             on_disk, newer,
             "the older write did not overwrite the newer cache"
         );
+    }
+
+    #[test]
+    fn save_if_skips_the_write_when_the_source_is_no_longer_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("snapshot_cache.json");
+
+        save_if(
+            &path,
+            &snapshot_at(at(0)),
+            &roster(&["/dev/repo-a"]),
+            || false,
+        )
+        .expect("skip is ok");
+
+        assert!(!path.exists());
     }
 
     #[test]
