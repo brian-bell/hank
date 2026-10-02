@@ -113,3 +113,12 @@ pub fn build_ready_fixture_repo_with_prefix(dir: &Path, prefix: &str) {
     assert_ne!(ready, blocker);
     assert_ne!(ready, blocked);
 }
+
+/// Create an issue titled `title` in the fixture repo at `dir` and close it,
+/// returning its id. The caller re-exports (e.g. via a hank refresh) before the
+/// hub can see it.
+pub fn create_closed_issue(dir: &Path, title: &str) -> String {
+    let id = parse_created_id(&bd(Some(dir), &["create", title, "-p", "1", "--json"]));
+    bd(Some(dir), &["close", &id]);
+    id
+}

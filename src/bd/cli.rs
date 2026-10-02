@@ -272,8 +272,19 @@ impl BdClient for BdCli {
     }
 
     fn search(&self, hub: &Path, query: &str) -> Result<Vec<Issue>, BdError> {
-        self.run_json(argv_search(hub, query))
+        self.run_json(argv_search(hub, query)).map(drop_closed)
     }
+}
+
+/// Drop closed issues from `bd search` results. bd 1.3.0 began including
+/// closed issues by default (bd-t5yex); hank's search finds live work, so this
+/// restores the pre-1.3.0 results. Filtering here rather than passing
+/// `--status` keeps the argv identical across every bd the version gate accepts.
+fn drop_closed(issues: Vec<Issue>) -> Vec<Issue> {
+    issues
+        .into_iter()
+        .filter(|i| i.status != "closed")
+        .collect()
 }
 
 #[cfg(test)]
@@ -427,5 +438,20 @@ esac
             shown.contains("(truncated)"),
             "expected truncation marker in: {shown}"
         );
+    }
+
+    #[test]
+    fn drop_closed_keeps_every_non_closed_status() {
+        let issues: Vec<Issue> = serde_json::from_str(
+            r#"[
+                {"id":"ra-1","title":"a","status":"open","priority":1},
+                {"id":"ra-2","title":"b","status":"closed","priority":1},
+                {"id":"ra-3","title":"c","status":"in_progress","priority":1},
+                {"id":"ra-4","title":"d","status":"blocked","priority":1}
+            ]"#,
+        )
+        .expect("issues parse");
+        let ids: Vec<String> = drop_closed(issues).into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, ["ra-1", "ra-3", "ra-4"]);
     }
 }
