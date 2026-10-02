@@ -25,7 +25,7 @@ use ratatui::backend::CrosstermBackend;
 use crate::app::{App, Effect, Msg, context, keys, view};
 use crate::bd::{BdCli, BdClient, RepoSyncReport};
 use crate::cache;
-use crate::cli::{CliError, sanitize, version_gate};
+use crate::cli::{CliError, load_roster, sanitize, version_gate};
 use crate::config::{Config, Paths};
 use crate::hub::{ReconcileWitness, ensure_hub, hub_dir, reconcile_witness};
 use crate::refresh::{self, AttributionGeneration, HubGenerationToken, RefreshError};
@@ -148,8 +148,10 @@ impl From<Msg> for Incoming {
 }
 
 /// Launch the interactive TUI (bare `hank`). Sets up the terminal, runs the event
-/// loop against `roster`, and always restores the terminal before returning —
-/// even on error, so a failure never leaves the user's terminal wedged.
+/// loop, and always restores the terminal before returning — even on error, so a
+/// failure never leaves the user's terminal wedged. `roster` is the launch roster,
+/// used only to validate the on-disk cache that paints the first frame; every
+/// refresh re-reads `config.toml` (see [`reloading_refresh_worker`]).
 pub fn run(paths: &Paths, roster: Config) -> Result<(), CliError> {
     let mut terminal = setup_terminal().map_err(CliError::Io)?;
     let loop_result = event_loop(&mut terminal, paths, &roster);
@@ -190,12 +192,7 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
     let mut worker_handles: Vec<thread::JoinHandle<()>> = Vec::new();
     let refresh_state = Arc::new(RuntimeRefreshState::default());
     // The App is born stale; launch immediately kicks off the first refresh.
-    worker_handles.push(spawn_refresh(
-        &tx,
-        paths,
-        roster,
-        Arc::clone(&refresh_state),
-    ));
+    worker_handles.push(spawn_refresh(&tx, paths, Arc::clone(&refresh_state)));
 
     // Run the render/reduce loop, then join threads *unconditionally* — for a
     // clean quit and for every error return alike — so a terminal write failure
@@ -208,7 +205,6 @@ fn event_loop(terminal: &mut Tui, paths: &Paths, roster: &Config) -> Result<(), 
         &mut app,
         &mut worker_handles,
         paths,
-        roster,
         &refresh_state,
     );
     stop.store(true, Ordering::SeqCst);
@@ -239,7 +235,6 @@ fn ui_loop(
     app: &mut App,
     worker_handles: &mut Vec<thread::JoinHandle<()>>,
     paths: &Paths,
-    roster: &Config,
     refresh_state: &Arc<RuntimeRefreshState>,
 ) -> Result<(), CliError> {
     draw(terminal, app)?;
@@ -266,7 +261,7 @@ fn ui_loop(
                 };
                 if let Some(msg) = msg {
                     for effect in app.reduce(msg) {
-                        execute_effect(effect, tx, worker_handles, paths, roster, refresh_state);
+                        execute_effect(effect, tx, worker_handles, paths, refresh_state);
                     }
                     refresh_state.prune(&app.attribution_generations());
                     if app.is_done() {
@@ -290,12 +285,11 @@ fn execute_effect(
     tx: &Sender<Incoming>,
     worker_handles: &mut Vec<thread::JoinHandle<()>>,
     paths: &Paths,
-    roster: &Config,
     refresh_state: &Arc<RuntimeRefreshState>,
 ) {
     worker_handles.retain(|h| !h.is_finished());
     let handle = match effect {
-        Effect::Refresh => spawn_refresh(tx, paths, roster, Arc::clone(refresh_state)),
+        Effect::Refresh => spawn_refresh(tx, paths, Arc::clone(refresh_state)),
         Effect::FetchDetail { id, token } => spawn_detail(tx, paths, id, token),
         Effect::Search { query, token } => {
             spawn_search(tx, paths, query, token, Arc::clone(refresh_state))
@@ -343,18 +337,48 @@ fn draw(terminal: &mut Tui, app: &mut App) -> Result<(), CliError> {
 }
 
 /// Spawn a background refresh worker that reports over `tx`, returning its join
-/// handle so the event loop can wait for it on shutdown. Clones the roster and
-/// paths into the thread and builds a fresh [`BdCli`] (stateless).
+/// handle so the event loop can wait for it on shutdown. Clones the paths into
+/// the thread and builds a fresh [`BdCli`] (stateless); the worker reads the
+/// roster itself.
 fn spawn_refresh(
     tx: &Sender<Incoming>,
     paths: &Paths,
-    roster: &Config,
     state: Arc<RuntimeRefreshState>,
 ) -> thread::JoinHandle<()> {
     let tx = tx.clone();
     let paths = paths.clone();
-    let roster = roster.clone();
-    thread::spawn(move || refresh_worker_with_state(BdCli::new(), roster, paths, tx, state))
+    thread::spawn(move || reloading_refresh_worker(&BdCli::new(), paths, tx, state))
+}
+
+/// The TUI's refresh body: re-read the roster from `config.toml`, then run
+/// [`refresh_worker_with_state`] against it. Reloading per refresh means a
+/// `hank repos add`/`remove` (or a `hank reset`) run in another terminal is
+/// honored by an already-open TUI, instead of its launch roster re-adding a
+/// removed repo to the hub. The reloaded roster also drives export, prefix
+/// attribution (so search, copy, and the repo picker follow it), and the cache
+/// key. An unreadable roster keeps the current view: one warning, no bd call.
+fn reloading_refresh_worker(
+    bd: &impl BdClient,
+    paths: Paths,
+    tx: Sender<Incoming>,
+    state: Arc<RuntimeRefreshState>,
+) {
+    match load_roster(&paths) {
+        Ok(roster) => refresh_worker_with_state(bd, roster, paths, tx, state),
+        Err(error) => {
+            let _ = tx.send(Msg::RefreshStarted.into());
+            let warning = sanitize(&format!(
+                "couldn't read the roster: {error}; keeping the current view"
+            ));
+            let _ = tx.send(
+                Msg::RefreshCompleted {
+                    snapshot: None,
+                    warnings: vec![warning],
+                }
+                .into(),
+            );
+        }
+    }
 }
 
 /// The refresh worker body: announce the start, run the pipeline, cache a
@@ -370,7 +394,7 @@ pub(crate) fn refresh_worker(
     tx: Sender<Incoming>,
 ) {
     refresh_worker_with_state(
-        bd,
+        &bd,
         roster,
         paths,
         tx,
@@ -379,14 +403,14 @@ pub(crate) fn refresh_worker(
 }
 
 fn refresh_worker_with_state(
-    bd: impl BdClient,
+    bd: &impl BdClient,
     roster: Config,
     paths: Paths,
     tx: Sender<Incoming>,
     state: Arc<RuntimeRefreshState>,
 ) {
     let _ = tx.send(Msg::RefreshStarted.into());
-    let (snapshot, warnings) = gather_snapshot_with_state(&bd, &roster, &paths, &state);
+    let (snapshot, warnings) = gather_snapshot_with_state(bd, &roster, &paths, &state);
     if let Some(snapshot) = &snapshot {
         let _ = cache::save(paths.cache_file(), snapshot, &roster);
     }
@@ -1161,7 +1185,6 @@ mod tests {
             &tx,
             &mut handles,
             &paths,
-            &Config::default(),
             &Arc::new(RuntimeRefreshState::default()),
         );
 
@@ -1198,7 +1221,6 @@ mod tests {
             &tx,
             &mut handles,
             &paths,
-            &Config::default(),
             &Arc::new(RuntimeRefreshState::default()),
         );
 
@@ -1245,6 +1267,132 @@ mod tests {
             "exactly one completion, then the channel closes"
         );
         handle.join().unwrap();
+    }
+
+    /// Run one production refresh (roster reloaded from `config.toml`) and
+    /// return its completion plus every bd call it made.
+    fn reloading_refresh(
+        bd: FakeBdClient,
+        paths: &Paths,
+        state: &Arc<RuntimeRefreshState>,
+    ) -> (Option<Snapshot>, Vec<String>, Vec<crate::bd::Call>) {
+        let (tx, rx) = mpsc::channel();
+        reloading_refresh_worker(&bd, paths.clone(), tx, Arc::clone(state));
+        assert_eq!(recv_msg(&rx), Msg::RefreshStarted);
+        match recv_msg(&rx) {
+            Msg::RefreshCompleted { snapshot, warnings } => (snapshot, warnings, bd.calls()),
+            other => panic!("expected RefreshCompleted, got {other:?}"),
+        }
+    }
+
+    fn repo_adds(calls: &[crate::bd::Call]) -> Vec<PathBuf> {
+        calls
+            .iter()
+            .filter_map(|call| match call {
+                crate::bd::Call::RepoAdd(_, repo) => Some(repo.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn refresh_rereads_the_roster_so_a_removed_repo_stays_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        // rb is still on disk; only the roster and hub dropped it.
+        seed_repo(tmp.path(), "rb", "rb");
+        let state = Arc::new(RuntimeRefreshState::default());
+        // The TUI launched with both repos; `hank repos remove rb` then ran in
+        // another terminal, rewriting the roster and pruning rb from the hub.
+        roster(&[&ra]).save(paths.config_file()).unwrap();
+        seed_initialized_hub(&paths, &[&ra]);
+
+        let bd = FakeBdClient::new().with_ready(vec![issue("ra-1", 1, "Ready one")]);
+        let (snapshot, _warnings, calls) = reloading_refresh(bd, &paths, &state);
+
+        assert!(snapshot.is_some(), "the refresh still succeeds");
+        assert_eq!(
+            repo_adds(&calls),
+            Vec::<PathBuf>::new(),
+            "the removed repo is not re-added to the hub: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(
+                |call| matches!(call, crate::bd::Call::Export(repo, _) if repo.ends_with("rb"))
+            ),
+            "the removed repo is no longer exported: {calls:?}"
+        );
+        let current = crate::cli::load_roster(&paths).unwrap();
+        assert!(
+            cache::load(paths.cache_file(), SystemTime::now(), &current).is_some(),
+            "the cache is keyed by the reloaded roster, so the next launch hits it"
+        );
+    }
+
+    #[test]
+    fn refresh_rereads_the_roster_so_an_added_repo_is_picked_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let rb = seed_repo(tmp.path(), "rb", "rb");
+        let state = Arc::new(RuntimeRefreshState::default());
+        seed_initialized_hub(&paths, &[&ra]);
+        // `hank repos add rb` ran in another terminal after launch.
+        roster(&[&ra, &rb]).save(paths.config_file()).unwrap();
+
+        let bd = FakeBdClient::new().with_ready(vec![
+            issue("ra-1", 1, "Ready one"),
+            issue("rb-1", 2, "Ready two"),
+        ]);
+        let (snapshot, _warnings, calls) = reloading_refresh(bd, &paths, &state);
+
+        let adds = repo_adds(&calls);
+        assert!(
+            adds.len() == 1 && adds[0].ends_with("rb"),
+            "the newly added repo joins the hub: {calls:?}"
+        );
+        let snapshot = snapshot.expect("a snapshot on success");
+        let rb_row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.issue.id == "rb-1")
+            .expect("rb's ready row is listed");
+        assert_eq!(
+            rb_row.repo_name, "rb",
+            "rb's rows are attributed through the reloaded roster's prefix map"
+        );
+    }
+
+    #[test]
+    fn refresh_with_an_unreadable_roster_keeps_the_view_and_skips_bd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let config_file = paths.config_file();
+        fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+        fs::write(config_file, "not = [valid").unwrap();
+        let state = Arc::new(RuntimeRefreshState::default());
+
+        let (snapshot, warnings, calls) = reloading_refresh(FakeBdClient::new(), &paths, &state);
+
+        assert!(
+            snapshot.is_none(),
+            "no snapshot, so the last-good rows stay"
+        );
+        assert!(
+            warnings.iter().any(|warning| warning.contains("roster")),
+            "the bad roster is reported: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.chars().any(char::is_control)),
+            "warnings are sanitized: {warnings:?}"
+        );
+        assert!(
+            calls.is_empty(),
+            "no bd call runs against a bad roster: {calls:?}"
+        );
     }
 
     #[test]
