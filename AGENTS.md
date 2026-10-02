@@ -66,8 +66,10 @@ when `bd` is missing.
   a full refresh. A failed watcher refresh is retried with backoff
   (`Effect::RetryWatch`). Sync is not journaled, so launch and `r` stay full
   refreshes. A follower that finds a repo's journal off turns it on
-  (`JournalSource::enable`) unless the roster entry is `unwatched` (set by
-  `hank repos unwatch`), then keeps re-checking on its backoff. bd decides
+  (`JournalSource::set_journal`) unless the roster entry is `unwatched` (set by
+  `hank repos unwatch`), then keeps re-checking on its backoff. It re-reads the
+  roster on disk right before the write and again after it, undoing a write
+  that raced an `unwatch` (which saves the roster before turning bd off). bd decides
   journal activation only from `BD_EVENTS_JOURNAL` or the repo's own
   `.beads/config.yaml`, so there is no untracked per-machine switch.
 - **Pure state core**: the TUI is `reduce(&mut App, Msg) -> Vec<Effect>` with

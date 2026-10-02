@@ -506,9 +506,16 @@ fn start_watcher(
     file: std::path::PathBuf,
 ) -> (Watcher, mpsc::Receiver<Msg>) {
     let (tx, rx) = mpsc::channel();
-    let watcher = Watcher::start(Arc::new(BdJournal::new()), repos, file, move |msg| {
-        let _ = tx.send(msg);
-    });
+    // The roster each test hands in is the whole truth; there is no file.
+    let watcher = Watcher::start(
+        Arc::new(BdJournal::new()),
+        repos,
+        file,
+        |_| true,
+        move |msg| {
+            let _ = tx.send(msg);
+        },
+    );
     (watcher, rx)
 }
 
