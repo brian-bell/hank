@@ -285,7 +285,10 @@ impl Fixture {
             repos.push(RepoEntry { path: repo });
         }
         let paths = Paths::with_base(temp.path());
-        let roster = Config { repos };
+        let roster = Config {
+            watch: false,
+            repos,
+        };
         ensure_hub(&BdCli::new(), &paths, &roster).expect("fixture hub");
         Self {
             _temp: temp,

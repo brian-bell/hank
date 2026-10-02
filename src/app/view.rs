@@ -454,6 +454,9 @@ fn status_line(app: &App, now: SystemTime) -> String {
     if app.is_stale() && app.fetched_at().is_some() {
         status.push_str(" · refreshing…");
     }
+    if app.is_watching() {
+        status.push_str(" · live");
+    }
     // A recent copy confirmation, ahead of any warnings so it is not clipped.
     if let Some(flash) = app.copy_flash() {
         status.push_str(&format!(" · copied: {}", sanitize(flash)));
@@ -461,7 +464,11 @@ fn status_line(app: &App, now: SystemTime) -> String {
     if let Some(warning) = app.persistence_warning() {
         status.push_str(&format!(" · {}", sanitize(warning)));
     }
-    let warnings = app.status_warnings();
+    let warnings: Vec<&String> = app
+        .status_warnings()
+        .iter()
+        .chain(app.watch_warnings())
+        .collect();
     if let Some(first) = warnings.first() {
         // Sanitize at the render boundary: warnings embed bd stderr / paths and
         // are written straight to the terminal (the runtime pre-sanitizes, but
@@ -716,6 +723,19 @@ mod tests {
 
         assert!(status.contains("save warning"));
         assert!(status.contains("refresh warning"));
+    }
+
+    #[test]
+    fn status_marks_live_refresh_and_shows_watch_warnings() {
+        let mut app = app_with(vec![row("repo-a", "a-1", 1, "A")], Vec::new());
+        assert!(!status_line(&app, at(1000)).contains("live"));
+        app.set_watching(true);
+        app.reduce(Msg::WatchWarning("live refresh is off for /a".into()));
+
+        let status = status_line(&app, at(1000));
+
+        assert!(status.contains(" · live"), "{status:?}");
+        assert!(status.contains("live refresh is off for /a"), "{status:?}");
     }
 
     #[test]

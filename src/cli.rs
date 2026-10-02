@@ -683,6 +683,7 @@ mod tests {
 
     fn roster(paths: &[&Path]) -> Config {
         Config {
+            watch: false,
             repos: paths
                 .iter()
                 .map(|p| RepoEntry {
@@ -1060,6 +1061,7 @@ mod tests {
         let launch_dir = tmp.path().join("elsewhere");
         fs::create_dir_all(&launch_dir).unwrap();
         Config {
+            watch: false,
             repos: vec![RepoEntry {
                 path: PathBuf::from("repo"),
             }],
@@ -1591,6 +1593,7 @@ mod tests {
         fs::create_dir_all(&launch_dir).unwrap();
         // Persist a roster whose entry is relative to the config directory.
         Config {
+            watch: false,
             repos: vec![RepoEntry {
                 path: PathBuf::from("r"),
             }],
@@ -1631,6 +1634,7 @@ mod tests {
         // is one level below the injected base.
         let rel_x = PathBuf::from("..").join(x.strip_prefix(tmp.path()).expect("x is under base"));
         Config {
+            watch: false,
             repos: vec![RepoEntry { path: rel_x }],
         }
         .save(paths.config_file())

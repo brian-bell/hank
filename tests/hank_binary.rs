@@ -21,7 +21,11 @@ fn help_uses_hank_commands() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Usage: hank [COMMAND]"), "{stdout}");
+    assert!(
+        stdout.contains("Usage: hank [OPTIONS] [COMMAND]"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("--watch"), "{stdout}");
     assert!(
         stdout.contains("First run: `hank repos discover ~/dev --add` then `hank`."),
         "{stdout}"

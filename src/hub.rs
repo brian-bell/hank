@@ -404,6 +404,7 @@ mod tests {
 
     fn roster(paths: &[&Path]) -> Config {
         Config {
+            watch: false,
             repos: paths
                 .iter()
                 .map(|p| RepoEntry {
@@ -742,6 +743,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let roster = Config {
+            watch: false,
             repos: vec![RepoEntry {
                 path: PathBuf::from("later"),
             }],
@@ -806,6 +808,7 @@ mod tests {
             .expect("config file has a parent");
         let repo = make_repo(config_dir, "repo");
         let roster = Config {
+            watch: false,
             repos: vec![RepoEntry {
                 path: PathBuf::from("repo"),
             }],
@@ -829,6 +832,7 @@ mod tests {
         let paths = Paths::with_base(tmp.path());
         let repo = tmp.path().join("later");
         let roster = Config {
+            watch: false,
             repos: vec![RepoEntry { path: repo.clone() }],
         };
 

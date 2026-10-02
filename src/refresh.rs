@@ -404,6 +404,23 @@ pub(crate) fn run_with_state(
     previous: Option<&AttributionCandidate>,
     worker_limit: usize,
 ) -> Result<SyncedRefresh, RefreshError> {
+    run_scoped(bd, roster, paths, previous, None, worker_limit)
+}
+
+/// [`run_with_state`] limited to the repos in `only` (normalized paths), as
+/// asked for by the live-refresh watcher. A repo outside `only` is neither
+/// exported nor re-read: its previous export stays on disk for the hub sync and
+/// its prefix from `previous` is carried over. A repo with no prefix in
+/// `previous` is refreshed in full regardless, so a scoped refresh never
+/// attributes less than a full one would. `None` refreshes every repo.
+pub(crate) fn run_scoped(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    previous: Option<&AttributionCandidate>,
+    only: Option<&HashSet<PathBuf>>,
+    worker_limit: usize,
+) -> Result<SyncedRefresh, RefreshError> {
     let hub = hub_dir(paths);
     fs::create_dir_all(&hub).map_err(|source| RefreshError::Io {
         path: hub.clone(),
@@ -423,8 +440,38 @@ pub(crate) fn run_with_state(
         .iter()
         .map(|job| normalize_path(&job.entry.path))
         .collect();
+    let (jobs, mut carried): (Vec<SourceJob>, Vec<SourceOutcome>) = match only {
+        None => (jobs, Vec::new()),
+        Some(only) => {
+            let mut run = Vec::new();
+            let mut carried = Vec::new();
+            for job in jobs {
+                let normalized_path = normalize_path(&job.entry.path);
+                match previous_prefixes.get(&normalized_path) {
+                    Some(prefix) if !only.contains(&normalized_path) => {
+                        carried.push(SourceOutcome {
+                            roster_index: job.roster_index,
+                            entry: job.entry,
+                            prefix: Some(prefix.clone()),
+                            verified_prefix: Some(VerifiedRepoPrefix {
+                                normalized_path,
+                                prefix: prefix.clone(),
+                            }),
+                            export_called: false,
+                            issue_prefix_called: false,
+                            errors: Vec::new(),
+                        })
+                    }
+                    _ => run.push(job),
+                }
+            }
+            (run, carried)
+        }
+    };
     let source_started = Instant::now();
-    let outcomes = run_source_jobs(bd, jobs, &previous_prefixes, worker_limit)?;
+    let mut outcomes = run_source_jobs(bd, jobs, &previous_prefixes, worker_limit)?;
+    outcomes.append(&mut carried);
+    outcomes.sort_by_key(|outcome| outcome.roster_index);
     let source_wall = source_started.elapsed();
     let export_calls = outcomes
         .iter()
@@ -954,6 +1001,7 @@ mod tests {
 
     fn roster(paths: &[&Path]) -> Config {
         Config {
+            watch: false,
             repos: paths
                 .iter()
                 .map(|p| RepoEntry {
@@ -1004,6 +1052,7 @@ mod tests {
             .expect("config file has a parent");
         let repo = seed_repo(config_dir, "repo", "repo");
         let config = Config {
+            watch: false,
             repos: vec![RepoEntry {
                 path: PathBuf::from("repo"),
             }],
@@ -1648,6 +1697,85 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![&renamed],
             "the changed export invalidates only its own cached prefix"
+        );
+    }
+
+    fn exported(bd: &FakeBdClient) -> Vec<PathBuf> {
+        bd.calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Export(repo, _) => Some(repo),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scoped_refresh_exports_only_changed_repos_and_carries_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let changed = seed_repo(tmp.path(), "changed", "ch");
+        let quiet = seed_repo(tmp.path(), "quiet", "qu");
+        let bd = || {
+            FakeBdClient::new()
+                .with_issue_prefix(changed.clone(), "ch")
+                .with_issue_prefix(quiet.clone(), "qu")
+                .with_export_content(&changed, b"{\"id\":\"ch-1\"}\n".to_vec())
+                .with_export_content(&quiet, b"{\"id\":\"qu-1\"}\n".to_vec())
+        };
+        let config = roster(&[&changed, &quiet]);
+        let first = run_with_state(&bd(), &config, &paths, None, 1).unwrap();
+        let verified = first.candidate().clone();
+        drop(first);
+
+        let second_bd = bd();
+        let only: HashSet<PathBuf> = [normalize_path(&changed)].into();
+        let second =
+            run_scoped(&second_bd, &config, &paths, Some(&verified), Some(&only), 1).unwrap();
+
+        assert_eq!(exported(&second_bd), vec![changed.clone()]);
+        assert!(second_bd.calls().contains(&Call::RepoSync(hub_dir(&paths))));
+        let map = &second.outcome().prefix_map;
+        assert_eq!(map.repo_for("qu-1").map(|e| &e.path), Some(&quiet));
+        assert_eq!(map.repo_for("ch-1").map(|e| &e.path), Some(&changed));
+        assert_eq!(
+            second.candidate().repos.len(),
+            2,
+            "the carried prefix stays verified for the next scoped refresh"
+        );
+    }
+
+    #[test]
+    fn scoped_refresh_still_runs_repos_with_no_verified_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let changed = seed_repo(tmp.path(), "changed", "ch");
+        let unknown = seed_repo(tmp.path(), "unknown", "un");
+        let bd = FakeBdClient::new()
+            .with_issue_prefix(changed.clone(), "ch")
+            .with_issue_prefix(unknown.clone(), "un")
+            .with_export_content(&changed, b"{\"id\":\"ch-1\"}\n".to_vec())
+            .with_export_content(&unknown, b"{\"id\":\"un-1\"}\n".to_vec());
+        let only: HashSet<PathBuf> = [normalize_path(&changed)].into();
+
+        let outcome = run_scoped(
+            &bd,
+            &roster(&[&changed, &unknown]),
+            &paths,
+            None,
+            Some(&only),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(exported(&bd), vec![changed.clone(), unknown.clone()]);
+        assert_eq!(
+            outcome
+                .outcome()
+                .prefix_map
+                .repo_for("un-1")
+                .map(|e| &e.path),
+            Some(&unknown)
         );
     }
 

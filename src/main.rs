@@ -26,10 +26,16 @@ use hank::config::Paths;
                   `cd … && bd show <id>`, Y copy a markdown block, r refresh, \
                   Esc back, q quit. The last confirmed repository view is \
                   restored on the next launch; All repos is the first-run \
-                  default.\n\n\
+                  default. `hank --watch` refreshes live from each repo's \
+                  `bd events` journal (bd >= 1.3.0).\n\n\
                   First run: `hank repos discover ~/dev --add` then `hank`."
 )]
 struct Cli {
+    /// Refresh live from each repo's `bd events` journal (bd >= 1.3.0 with
+    /// `events-journal: true`). Same as `watch = true` in config.toml.
+    #[arg(long)]
+    watch: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -125,7 +131,8 @@ fn run() -> Result<(), CliError> {
         // the status bar and the initial refresh is spawned at launch.
         None => {
             let roster = cli::load_roster(&paths)?;
-            hank::runtime::run(&paths, roster)
+            let watch = cli.watch || roster.watch;
+            hank::runtime::run(&paths, roster, watch)
         }
     }
 }
