@@ -106,7 +106,7 @@ const STDERR_LIMIT: usize = 2000;
 
 /// A failed `bd` invocation, carrying the command line and captured stderr for
 /// display, plus a machine-inspectable [`BdErrorKind`].
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub struct BdError {
     /// Human-readable command line, e.g. `bd -C <hub> ready --json`.
     pub command: String,
