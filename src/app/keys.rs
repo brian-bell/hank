@@ -6,6 +6,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use super::{InputContext, Msg};
 
+/// Rows PageDown/PageUp scroll the health panel.
+const HEALTH_PAGE_ROWS: i16 = 10;
+
 /// Decode a crossterm key event into a [`Msg`], or `None` for an unmapped key or
 /// a key-release event (so a press+release fires a single message).
 ///
@@ -39,9 +42,23 @@ pub fn map_key(event: KeyEvent, context: InputContext) -> Option<Msg> {
             _ => None,
         };
     }
+    if context == InputContext::Health {
+        return match event.code {
+            KeyCode::Char('q') => Some(Msg::Quit),
+            KeyCode::Char('r') => Some(Msg::Refresh),
+            KeyCode::Char('h') => Some(Msg::ToggleHealth),
+            KeyCode::Char('j' | 'J') | KeyCode::Down => Some(Msg::HealthScroll(1)),
+            KeyCode::Char('k' | 'K') | KeyCode::Up => Some(Msg::HealthScroll(-1)),
+            KeyCode::PageDown => Some(Msg::HealthScroll(HEALTH_PAGE_ROWS)),
+            KeyCode::PageUp => Some(Msg::HealthScroll(-HEALTH_PAGE_ROWS)),
+            KeyCode::Esc => Some(Msg::Back),
+            _ => None,
+        };
+    }
     match event.code {
         KeyCode::Char('q') => Some(Msg::Quit),
         KeyCode::Char('/') => Some(Msg::OpenSearch),
+        KeyCode::Char('h') => Some(Msg::ToggleHealth),
         KeyCode::Char('r') => Some(Msg::Refresh),
         KeyCode::Char('y') => Some(Msg::CopyContext),
         KeyCode::Char('Y') => Some(Msg::CopyMarkdown),
@@ -141,6 +158,35 @@ mod tests {
         assert_eq!(
             map_key(press(KeyCode::Char('J')), InputContext::SearchEditing),
             Some(Msg::SearchInput('J'))
+        );
+    }
+
+    #[test]
+    fn h_opens_the_health_panel_and_its_keys_scroll_and_close_it() {
+        assert_eq!(
+            map_key(press(KeyCode::Char('h')), InputContext::Normal),
+            Some(Msg::ToggleHealth)
+        );
+        let health = |code| map_key(press(code), InputContext::Health);
+        assert_eq!(health(KeyCode::Char('h')), Some(Msg::ToggleHealth));
+        assert_eq!(health(KeyCode::Esc), Some(Msg::Back));
+        assert_eq!(health(KeyCode::Char('j')), Some(Msg::HealthScroll(1)));
+        assert_eq!(health(KeyCode::Up), Some(Msg::HealthScroll(-1)));
+        assert_eq!(
+            health(KeyCode::PageDown),
+            Some(Msg::HealthScroll(HEALTH_PAGE_ROWS))
+        );
+        assert_eq!(health(KeyCode::Char('r')), Some(Msg::Refresh));
+        assert_eq!(health(KeyCode::Char('q')), Some(Msg::Quit));
+        assert_eq!(
+            health(KeyCode::Enter),
+            None,
+            "list commands are inert under the panel"
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('h')), InputContext::SearchEditing),
+            Some(Msg::SearchInput('h')),
+            "h types into a search query"
         );
     }
 

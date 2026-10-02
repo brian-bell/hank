@@ -41,6 +41,21 @@ pub struct RefreshOutcome {
     pub sync_report: RepoSyncReport,
     /// Production-neutral phase observations for benchmarks and diagnostics.
     pub metrics: RefreshMetrics,
+    /// How each roster repo fared, in roster order (deduplicated).
+    pub repos: Vec<RepoRefresh>,
+}
+
+/// One roster repo's part in a refresh, for per-repo freshness reporting.
+#[derive(Debug, Clone)]
+pub struct RepoRefresh {
+    /// The resolved roster path.
+    pub path: PathBuf,
+    /// The repo's id prefix, when it could be read (or was carried over).
+    pub prefix: Option<String>,
+    /// A scoped refresh carried this repo over without exporting it.
+    pub carried: bool,
+    /// The repo's failures this cycle (empty when it exported cleanly).
+    pub errors: Vec<RepoError>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -459,6 +474,7 @@ pub(crate) fn run_scoped(
                             }),
                             export_called: false,
                             issue_prefix_called: false,
+                            carried: true,
                             errors: Vec::new(),
                         })
                     }
@@ -484,7 +500,14 @@ pub(crate) fn run_scoped(
     let mut errors = Vec::new();
     let mut pairs: Vec<(String, RepoEntry)> = Vec::new();
     let mut verified_repos = Vec::new();
+    let mut repos = Vec::with_capacity(outcomes.len());
     for outcome in outcomes {
+        repos.push(RepoRefresh {
+            path: outcome.entry.path.clone(),
+            prefix: outcome.prefix.clone(),
+            carried: outcome.carried,
+            errors: outcome.errors.clone(),
+        });
         errors.extend(outcome.errors);
         if let Some(prefix) = outcome.prefix {
             pairs.push((prefix, outcome.entry));
@@ -512,6 +535,7 @@ pub(crate) fn run_scoped(
             export_calls,
             issue_prefix_calls,
         },
+        repos,
     };
     Ok(SyncedRefresh {
         outcome,
@@ -537,6 +561,7 @@ struct SourceOutcome {
     verified_prefix: Option<VerifiedRepoPrefix>,
     export_called: bool,
     issue_prefix_called: bool,
+    carried: bool,
     errors: Vec<RepoError>,
 }
 
@@ -635,6 +660,7 @@ fn run_source_job(
                     }),
                     export_called,
                     issue_prefix_called: false,
+                    carried: false,
                     errors,
                 };
             }
@@ -707,6 +733,7 @@ fn run_source_job(
         verified_prefix,
         export_called,
         issue_prefix_called: true,
+        carried: false,
         errors,
     }
 }
