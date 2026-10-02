@@ -592,6 +592,10 @@ pub struct App {
     health: Option<HealthPanel>,
     /// A monotonic generation stamped on each health-panel doctor run.
     health_seq: u64,
+    /// The token of the doctor run still in flight, if any. Reopening the
+    /// panel while one runs shares it instead of starting another, so a held
+    /// `h` cannot pile up concurrent doctor runs.
+    health_in_flight: Option<u64>,
     /// A watcher refresh requested while another refresh was in flight. Runs
     /// when that cycle completes, merged with any later requests.
     pending_refresh: Option<RefreshScope>,
@@ -674,6 +678,7 @@ impl App {
             repo_health: Vec::new(),
             health: None,
             health_seq: 0,
+            health_in_flight: None,
             pending_refresh: None,
             watch_in_flight: None,
             watch_failures: 0,
@@ -887,8 +892,17 @@ impl App {
                 if self.health.take().is_some() {
                     return Vec::new();
                 }
+                if let Some(token) = self.health_in_flight {
+                    self.health = Some(HealthPanel {
+                        token,
+                        doctor: DoctorState::Running,
+                        scroll: 0,
+                    });
+                    return Vec::new();
+                }
                 self.health_seq += 1;
                 let token = self.health_seq;
+                self.health_in_flight = Some(token);
                 self.health = Some(HealthPanel {
                     token,
                     doctor: DoctorState::Running,
@@ -902,6 +916,9 @@ impl App {
                 }
             }
             Msg::HealthReport { token, report } => {
+                if self.health_in_flight == Some(token) {
+                    self.health_in_flight = None;
+                }
                 if let Some(health) = &mut self.health
                     && health.token == token
                 {
@@ -1107,8 +1124,8 @@ impl App {
     /// Fold one successful sync's per-repo results into [`App::repo_health`].
     /// The new list follows the reported roster, so a removed repo drops out.
     /// A clean export is fresh as of `synced_at`; a failure keeps the last
-    /// clean time; a carried-over repo is as fresh as before, and current as of
-    /// `synced_at` unless its last attempt failed.
+    /// clean time; a carried-over repo (not exported) keeps its last clean
+    /// time and any standing problem.
     fn apply_repo_syncs(&mut self, synced_at: SystemTime, repos: Vec<RepoSync>) {
         let mut previous: HashMap<PathBuf, RepoHealth> = self
             .repo_health
@@ -1122,12 +1139,11 @@ impl App {
                 let last_clean = before.as_ref().and_then(|health| health.synced_at);
                 let (synced_at, problem) = match repo.outcome {
                     RepoSyncOutcome::Exported => (Some(synced_at), None),
+                    // Not exported this cycle: its last clean export and any
+                    // standing problem carry over unchanged.
                     RepoSyncOutcome::Carried => match before {
-                        Some(RepoHealth {
-                            problem: Some(problem),
-                            ..
-                        }) => (last_clean, Some(problem)),
-                        _ => (Some(synced_at), None),
+                        Some(before) => (before.synced_at, before.problem),
+                        None => (Some(synced_at), None),
                     },
                     RepoSyncOutcome::Failed(message) => (last_clean, Some(message)),
                 };
@@ -3629,8 +3645,8 @@ mod tests {
         assert_eq!(b.problem.as_deref(), Some("export failed"));
         assert_eq!(app.stale_repos().count(), 1);
 
-        // A live refresh that carries /b over leaves it stale; one that
-        // carries a healthy /a keeps it current.
+        // A live refresh that carries both over exports neither: each keeps
+        // its last clean export time, and /b stays stale.
         app.reduce(Msg::RepoSyncs {
             synced_at: at(300),
             repos: vec![
@@ -3638,7 +3654,8 @@ mod tests {
                 sync("/b", RepoSyncOutcome::Carried),
             ],
         });
-        assert_eq!(health(&app, "/a").synced_at, Some(at(300)));
+        assert_eq!(health(&app, "/a").synced_at, Some(at(200)));
+        assert!(!health(&app, "/a").is_stale());
         assert!(health(&app, "/b").is_stale(), "carrying over never clears");
         assert_eq!(health(&app, "/b").synced_at, Some(at(100)));
 
@@ -3701,15 +3718,53 @@ mod tests {
         assert_eq!(app.view_mode(), ViewMode::List, "and nothing beneath it");
         assert_eq!(app.input_context(), InputContext::Normal);
 
-        // A late report from the closed opening is dropped by the reopened one.
-        app.reduce(Msg::ToggleHealth);
-        app.reduce(Msg::HealthReport {
-            token: 1,
-            report: Err("late".into()),
-        });
-        assert_eq!(app.health_doctor(), Some(&DoctorState::Running));
+        // Reopening after the run finished starts a fresh one.
+        assert_eq!(
+            app.reduce(Msg::ToggleHealth),
+            vec![Effect::CheckHealth { token: 2 }]
+        );
         assert!(app.reduce(Msg::ToggleHealth).is_empty(), "h closes it too");
         assert!(!app.health_open());
+    }
+
+    #[test]
+    fn reopening_the_health_panel_shares_the_doctor_run_in_flight() {
+        let mut app = app_with(Vec::new());
+        assert_eq!(
+            app.reduce(Msg::ToggleHealth),
+            vec![Effect::CheckHealth { token: 1 }]
+        );
+        // A held `h` toggles close/open repeatedly: no new runs start.
+        for _ in 0..5 {
+            assert!(app.reduce(Msg::ToggleHealth).is_empty());
+            assert!(app.reduce(Msg::ToggleHealth).is_empty());
+        }
+        assert!(app.health_open());
+        app.reduce(Msg::HealthReport {
+            token: 1,
+            report: Ok("gate: OK".into()),
+        });
+        assert_eq!(
+            app.health_doctor(),
+            Some(&DoctorState::Done("gate: OK".into())),
+            "the shared run fills the reopened panel"
+        );
+
+        // A run whose panel was closed still clears the in-flight slot.
+        app.reduce(Msg::Back);
+        assert_eq!(
+            app.reduce(Msg::ToggleHealth),
+            vec![Effect::CheckHealth { token: 2 }]
+        );
+        app.reduce(Msg::Back);
+        app.reduce(Msg::HealthReport {
+            token: 2,
+            report: Err("late".into()),
+        });
+        assert_eq!(
+            app.reduce(Msg::ToggleHealth),
+            vec![Effect::CheckHealth { token: 3 }]
+        );
     }
 
     #[test]

@@ -123,7 +123,7 @@ both ready and search results and is restored on the next launch. `All repos`
 is used on first run and whenever saved UI state is missing or invalid.
 
 The sync-health panel (`h`) lists each roster repo with how fresh the hub's
-copy is ("synced 3m ago") and, when a repo's latest refresh failed, flags it
+copy is (when it last exported cleanly: "synced 3m ago") and, when a repo's latest refresh failed, flags it
 **STALE** with the reason; the hub keeps that repo's last good export until a
 refresh succeeds. Below that it shows `hank doctor`'s findings (bd version gate,
 paths, per-repo prefix and journal state), run fresh each time the panel opens.
