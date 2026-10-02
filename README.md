@@ -9,8 +9,9 @@ pane, cross-repo search, and a copy-context action.
 Hank never writes to your issue data. Its writes to your repos go through `bd`:
 `bd export` refreshing each source repo's own `.beads/issues.jsonl`, and, only
 when you turn on live refresh, the `events-journal` setting in
-`.beads/config.yaml` (see [Live refresh](#live-refresh)). Acting on an issue happens in your terminal: the
-copy-context key hands you a ready-to-run command.
+`.beads/config.yaml` (see [Live refresh](#live-refresh)). Acting on an issue
+happens in your terminal: the copy-context key hands you a ready-to-run
+command.
 
 ## Requirements
 
@@ -82,8 +83,7 @@ hank repos watch --all               # every roster repo
 `unwatch` records `unwatched = true` on the repo's roster entry. A repo whose
 journal is off is re-checked while the TUI runs, so turning it on later needs no
 restart. `hank doctor` prints `journal: on|off` for every roster repo, marking
-opted-out ones `(unwatched)`. Hank
-saves the last journal position per repo in
+opted-out ones `(unwatched)`. Hank saves the last journal position per repo in
 `hank/events_checkpoints.json` under the data dir and resumes from it; if the
 journal has pruned past that position, Hank falls back to a full refresh.
 Syncs such as `bd dolt pull` are not journaled, so press `r` after pulling;
@@ -93,8 +93,10 @@ every launch is also a full refresh.
 
 | Key            | Action                                                    |
 | -------------- | --------------------------------------------------------- |
-| `j` / `↓`      | Move selection down (scrolls the detail pane in detail)   |
-| `k` / `↑`      | Move selection up                                         |
+| `j` / `↓`      | Move selection down (next issue while in detail)          |
+| `k` / `↑`      | Move selection up (previous issue while in detail)        |
+| `J` / `K`      | Scroll the detail pane one row down / up                  |
+| `PgDn` / `PgUp`| Scroll the detail pane one page down / up                 |
 | `f`            | Open the repository picker (`All repos` is first)          |
 | `p`            | Toggle the priority filter: All ↔ P0/P1 only              |
 | `/`            | Open cross-repo search                                    |
@@ -144,65 +146,18 @@ The last confirmed repository view is stored independently at
 `hank/ui_state.json` under the platform data directory. `hank reset`
 does not remove this user preference; it only discards derived hub/cache data.
 
-### Upgrade from the `fbd` RC
+## How it works
 
-On the first Hank command that uses user state, Hank checks the legacy
-`federated-beads/config.toml` and `federated-beads/ui_state.json` locations. A
-valid legacy file is copied to its canonical Hank path with no-clobber,
-atomic publication; the legacy file is retained for rollback. A canonical Hank
-file always wins. Relative roster paths keep their legacy meaning.
-
-Legacy hub, snapshot-cache, lock, and temporary files are derived state and are
-not copied; Hank rebuilds them under `hank/`. A malformed legacy config stops
-normal commands with an actionable path instead of silently loading an empty
-roster; `hank doctor` reports the problem. Invalid legacy UI state is skipped
-and the repository view safely defaults to `All repos`. `hank reset` does not
-perform migration and touches only canonical Hank hub/cache state.
-
-## Architecture
-
-```
-Source repos            Hank                              Hub (bd workspace)
-──────────────   ──────────────────────────────   ─────────────────────────
-~/dev/megaclock  refresh:  bd export per repo  →   <XDG data dir>/
-~/dev/reading-…            bd repo sync (once)  →     hank/hub/
-     …           read:     bd ready/show/search --json (all through the hub)
-```
-
-- **Central DB**: a `bd` "hub" workspace using built-in multi-repo hydration
-  (`bd repo add` + `bd repo sync`), not a custom aggregation store.
-- **Read path**: every query goes through the hub via `bd … --json` subprocess
-  calls. `bd` owns ready/blocked semantics; Hank never reimplements them.
-- **Repo attribution**: `bd`'s JSON does not expose a source repo, so Hank maps
-  each issue id to its repo by **longest id prefix** (read from each repo's
-  effective `bd` prefix), detecting and flagging prefix collisions.
-- **Refresh**: TUI-owned and async. Launch and the `r` key run content-stable
-  exports with at most four source repositories in parallel, then one hub sync.
-  Unchanged exports retain their canonical inode and mtime; changed exports are
-  atomically replaced while preserving the platform's standard permission
-  object. Ownership, ACLs, xattrs, labels, file flags, and inode identity are
-  not part of the changed-export metadata contract. The stale list stays
-  browsable, and `<hub>/.hank.lock` serializes concurrent Hank instances.
-- **Live refresh** (opt-in): one `bd events tail --follow` per repo feeds a
-  debounced batcher; a batch refreshes only the repos that changed, queued
-  behind any refresh already running. See [Live refresh](#live-refresh).
-- **State core**: the whole TUI is a pure `reduce(&mut App, Msg) -> Vec<Effect>`
-  state machine (no I/O, no clock, no threads inside), so it is exhaustively
-  unit-tested; the runtime performs the effects. The last confirmed repository
-  view is stored separately in versioned `ui_state.json`; snapshot-cache
-  freshness and roster configuration remain independent.
-
-Module map: `config` (roster + XDG paths) · `ui_state` (persisted TUI
-preferences) · `bd` (the `BdClient` trait, real subprocess + fake impls, serde
-types) · `hub` (lifecycle) · `refresh` (export + sync + prefix map) · `snapshot`
-(the read model) · `app` (`reduce` core, `view` renderer, `keys` mapping,
-`context` copy builders) · `runtime` (the event loop and workers) · `watch`
-(the opt-in events-journal follower) · `cli` (headless subcommands).
+Hank reads everything through a `bd` hub workspace that `bd` itself hydrates
+from your repos (`bd repo add` + `bd repo sync`). Refresh exports each source
+repo and syncs the hub once; every query then goes through the hub via
+`bd … --json`, so `bd` owns ready/blocked semantics. Issues are attributed to
+repos by longest id prefix. See [docs/architecture.md](docs/architecture.md)
+for the refresh pipeline, state core, and module map.
 
 ## Verification commands
 
-These four commands are the project's quality gate and stay constant across
-slices:
+The project's quality gate:
 
 ```bash
 cargo fmt --check                              # formatting
@@ -212,7 +167,8 @@ cargo test --test bd_integration               # gated e2e (skips cleanly withou
 ```
 
 The integration suite builds real fixture repos with `bd` in tempdirs; each test
-skips with an explicit `SKIP` line when `bd` is not installed.
+skips with an explicit `SKIP` line when `bd` is not installed. CI runs it in a
+dedicated job with a pinned `bd` and fails if any test skips.
 
 The ignored, machine-dependent refresh matrix is available separately:
 
@@ -220,8 +176,7 @@ The ignored, machine-dependent refresh matrix is available separately:
 cargo test refresh_performance_matrix -- --ignored --nocapture
 ```
 
-Recorded phase timings for the refresh-performance epic live in
-`docs/performance/federated-beads-9dt.md`.
+Recorded phase timings live in `docs/performance/refresh.md`.
 
 ## Not in v1 (planned)
 

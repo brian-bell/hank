@@ -13,7 +13,7 @@ use std::time::SystemTime;
 
 use crate::bd::{BdClient, BdError, BdVersion};
 use crate::cache;
-use crate::config::{self, Config, Paths, RepoEntry};
+use crate::config::{Config, Paths, RepoEntry};
 use crate::hub::{self, HubError, hub_dir};
 use crate::refresh::{self, PrefixMap, RefreshError};
 use crate::snapshot::{self, Row};
@@ -45,9 +45,6 @@ pub enum CliError {
     /// (e.g. `repos add` on a directory that is not a beads repo).
     #[error("{0}")]
     Roster(String),
-    /// Legacy user state could not be validated or published safely.
-    #[error("{0}")]
-    Migration(String),
     /// Writing to an output sink failed.
     #[error("writing output: {0}")]
     Io(#[from] std::io::Error),
@@ -210,22 +207,6 @@ pub fn run_snapshot(
 /// aborts the command before it can diagnose anything — the config being broken
 /// is one of the things you run doctor to discover.
 pub fn run_doctor(bd: &impl BdClient, paths: &Paths, out: &mut impl Write) -> Result<(), CliError> {
-    let migration = config::migrate_legacy_state(paths);
-    if migration.problems().next().is_none() {
-        writeln!(
-            out,
-            "legacy migration: OK ({} file(s) migrated)",
-            migration.migrated().len()
-        )?;
-    } else {
-        if let Some(problem) = migration.fatal_problem() {
-            writeln!(out, "legacy migration: ERROR {problem}")?;
-        }
-        for warning in migration.warnings() {
-            writeln!(out, "legacy migration: WARNING {warning}")?;
-        }
-    }
-
     // Doctor is the diagnostic you run *because* something is wrong, so it never
     // gates: it reports the version and whether the gate would pass, and tolerates
     // bd being absent entirely.
@@ -297,20 +278,6 @@ pub fn run_doctor(bd: &impl BdClient, paths: &Paths, out: &mut impl Write) -> Re
             }
         }
         Err(e) => writeln!(out, "roster: ERROR reading {}: {e}", config_file.display())?,
-    }
-    Ok(())
-}
-
-/// Run the launch-time legacy migration for commands other than `doctor`.
-/// Invalid config or migration infrastructure is fatal; invalid legacy UI state
-/// is reported and the TUI safely falls back to All repositories.
-pub fn prepare_legacy_state(paths: &Paths, err: &mut impl Write) -> Result<(), CliError> {
-    let migration = config::migrate_legacy_state(paths);
-    if let Some(problem) = migration.fatal_problem() {
-        return Err(CliError::Migration(problem.to_string()));
-    }
-    for warning in migration.warnings() {
-        writeln!(err, "warning: {warning}")?;
     }
     Ok(())
 }
@@ -1252,28 +1219,6 @@ mod tests {
     }
 
     #[test]
-    fn doctor_reports_legacy_migration_problems_without_silently_emptying_roster() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths::with_base(tmp.path());
-        let legacy = tmp.path().join("federated-beads/config.toml");
-        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::write(&legacy, "repos = [not valid TOML").unwrap();
-        let bd = FakeBdClient::new();
-        let mut out = Vec::new();
-
-        run_doctor(&bd, &paths, &mut out).expect("doctor still succeeds");
-
-        let stdout = String::from_utf8(out).unwrap();
-        assert!(stdout.contains("legacy migration: ERROR"), "{stdout}");
-        assert!(stdout.contains(&legacy.display().to_string()), "{stdout}");
-        assert!(
-            stdout.contains("roster (0 repos)") || stdout.contains("roster: ERROR"),
-            "doctor continues through the complete report: {stdout}"
-        );
-        assert!(!paths.config_file().exists());
-    }
-
-    #[test]
     fn load_roster_absent_is_empty_but_invalid_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
@@ -1357,8 +1302,7 @@ mod tests {
     #[test]
     fn reset_clears_the_snapshot_cache() {
         // A launch right after `hank reset` must not paint rows from the
-        // just-discarded hub, so reset clears the cache alongside it
-        // (federated-beads review finding: cache survived reset otherwise).
+        // just-discarded hub, so reset clears the cache alongside it.
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let hub = hub_dir(&paths);
@@ -1390,29 +1334,6 @@ mod tests {
             crate::app::RepoFilter::Only("repo-a".into()),
             "reset preserves the user's repository preference"
         );
-    }
-
-    #[test]
-    fn reset_never_touches_legacy_user_or_derived_state() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths::with_base(tmp.path());
-        let legacy = tmp.path().join("federated-beads");
-        fs::create_dir_all(legacy.join("hub")).unwrap();
-        fs::write(legacy.join("config.toml"), "repos = []\n").unwrap();
-        fs::write(legacy.join("ui_state.json"), r#"{"version":2}"#).unwrap();
-        fs::write(legacy.join("snapshot_cache.json"), "legacy cache").unwrap();
-        fs::create_dir_all(hub_dir(&paths)).unwrap();
-        fs::write(paths.cache_file(), "canonical cache").unwrap();
-        let mut out = Vec::new();
-
-        run_reset(&paths, &mut out).expect("ok");
-
-        assert!(legacy.join("hub").exists());
-        assert!(legacy.join("config.toml").exists());
-        assert!(legacy.join("ui_state.json").exists());
-        assert!(legacy.join("snapshot_cache.json").exists());
-        assert!(!hub_dir(&paths).exists());
-        assert!(!paths.cache_file().exists());
     }
 
     #[cfg(unix)]

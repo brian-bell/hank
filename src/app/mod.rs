@@ -3004,8 +3004,8 @@ mod tests {
         // the runtime spawns the real launch refresh right after hydrating, and
         // if `stale` were cleared in between, a quick `r` would slip past the
         // `Msg::Refresh` dedup check and spawn a second, overlapping worker
-        // (federated-beads review finding: hydrating via
-        // `reduce(Msg::RefreshCompleted { .. })` had exactly this bug).
+        // (hydrating via `reduce(Msg::RefreshCompleted { .. })` had exactly
+        // this bug).
         let mut app = App::new();
         assert!(
             app.is_stale(),

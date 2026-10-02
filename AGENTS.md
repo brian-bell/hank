@@ -1,12 +1,5 @@
 # Agent Instructions
 
-> **Note:** This repository intentionally maintains **separate `CLAUDE.md` and
-> `AGENTS.md` files** (not symlinked) to support the beads (`bd`) integration:
-> bd's setup recipes write and verify their own managed blocks in each file
-> (`bd setup claude` targets `CLAUDE.md`, `bd setup codex` targets `AGENTS.md`),
-> and they must remain independently editable by bd. `CLAUDE.md` is a thin
-> pointer back to this file for everything project-specific.
-
 ## Project Overview
 
 **Hank (`hank`)** is a read-only Rust terminal UI (ratatui + crossterm)
@@ -40,9 +33,12 @@ The four quality-gate commands are the project's constant verification suite.
 Unit tests never touch real XDG paths or a real `bd` — they use
 `Paths::with_base` and `FakeBdClient`. The integration suite builds real
 fixture repos with `bd` in tempdirs and prints an explicit `SKIP` line per test
-when `bd` is missing.
+when `bd` is missing. CI runs the integration suite in its own job against a
+pinned `bd` and fails on any `SKIP`.
 
 ## Architecture
+
+Fuller narrative in [docs/architecture.md](docs/architecture.md).
 
 - **Hub, not custom store**: aggregation is a `bd` hub workspace under
   `<data_dir>/hank/hub` using bd's multi-repo hydration
@@ -69,8 +65,8 @@ when `bd` is missing.
   (`JournalSource::set_journal`) unless the roster entry is `unwatched` (set by
   `hank repos unwatch`), then keeps re-checking on its backoff. It re-reads the
   roster on disk right before the write and again after it, undoing a write
-  that raced an `unwatch` (which saves the roster before turning bd off). bd decides
-  journal activation only from `BD_EVENTS_JOURNAL` or the repo's own
+  that raced an `unwatch` (which saves the roster before turning bd off). bd
+  decides journal activation only from `BD_EVENTS_JOURNAL` or the repo's own
   `.beads/config.yaml`, so there is no untracked per-machine switch.
 - **Pure state core**: the TUI is `reduce(&mut App, Msg) -> Vec<Effect>` with
   no I/O, clock, or threads inside; the runtime performs effects. `view::draw`
@@ -101,9 +97,8 @@ Module map (`src/`):
 - `bd search` includes closed issues by default since bd 1.3.0; `BdCli::search`
   drops them client-side so results match older bd and stay live work only.
 - Canonical user state lives at `<config_root>/hank/config.toml` and
-  `<data_root>/hank/ui_state.json`. Startup safely migrates only those two
-  user-owned legacy files from `federated-beads/`; it never copies the legacy
-  hub, cache, locks, or temp state. `hank reset` skips migration.
+  `<data_root>/hank/ui_state.json`. `hank reset` discards only derived hub and
+  cache state, never these files.
 - ratatui is pinned with the `unstable-rendered-line-info` feature for
   `Paragraph::line_count` (detail-pane scroll clamping); stay within 0.30.x.
 - Only `main.rs` resolves real paths, spawns the real `bd`, and wires
@@ -113,27 +108,9 @@ Module map (`src/`):
 
 ## Non-Interactive Shell Commands
 
-**ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
-
-Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
-
-**Use these forms instead:**
-```bash
-# Force overwrite without prompting
-cp -f source dest           # NOT: cp source dest
-mv -f source dest           # NOT: mv source dest
-rm -f file                  # NOT: rm file
-
-# For recursive operations
-rm -rf directory            # NOT: rm -r directory
-cp -rf source dest          # NOT: cp -r source dest
-```
-
-**Other commands that may prompt:**
-- `scp` - use `-o BatchMode=yes` for non-interactive
-- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
-- `apt-get` - use `-y` flag
-- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
+Shell `cp`, `mv`, and `rm` may be aliased to interactive mode and hang the
+agent: use `cp -f`, `mv -f`, `rm -f` (`-rf` for directories), and `-y` /
+`BatchMode=yes` / `HOMEBREW_NO_AUTO_UPDATE=1` for `apt-get` / `ssh`+`scp` / `brew`.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->
 ## Beads Issue Tracker

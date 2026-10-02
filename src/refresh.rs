@@ -908,39 +908,6 @@ fn file_error(
     }
 }
 
-/// Build only the id-prefix → repo attribution map from the roster, without
-/// exporting, syncing, or taking the hub lock. Reads each repo's authoritative,
-/// hyphen-preserving prefix with [`BdClient::issue_prefix`] — the *same* source
-/// [`run`] uses — so attribution is identical to a full refresh's.
-///
-/// This backs cross-repo search (Slice 11), whose worker needs a `PrefixMap` to
-/// attribute `bd search` results the same way ready rows are attributed, without
-/// re-running the whole export+sync pipeline. Deliberately standalone rather than
-/// factored out of [`run`], so `run`'s interleaved export/prefix call order (an
-/// asserted Slice 4 contract) is not disturbed. A per-repo prefix-read failure is
-/// a non-fatal [`RepoError`]; that repo's ids simply fall to the `unknown` bucket.
-#[cfg(test)]
-pub(crate) fn attribution_map(bd: &impl BdClient, roster: &Config) -> (PrefixMap, Vec<RepoError>) {
-    let mut pairs: Vec<(String, RepoEntry)> = Vec::new();
-    let mut errors = Vec::new();
-    // Dedupe aliased/duplicate roster entries, mirroring `run`, so one repo
-    // listed twice is not mistaken for a self-collision.
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    for entry in &roster.repos {
-        if !seen.insert(normalize_path(&entry.path)) {
-            continue;
-        }
-        match bd.issue_prefix(&entry.path) {
-            Ok(prefix) => pairs.push((prefix, entry.clone())),
-            Err(source) => errors.push(RepoError::Metadata {
-                repo: entry.path.clone(),
-                detail: source.to_string(),
-            }),
-        }
-    }
-    (PrefixMap::from_pairs(pairs), errors)
-}
-
 /// The subset of `<repo>/.beads/metadata.json` hank reads: the id prefix, stored
 /// under `dolt_database`. Tolerant (no `deny_unknown_fields`) — bd writes other
 /// keys hank ignores.
@@ -2030,32 +1997,6 @@ mod tests {
         let repo = seed_repo(tmp.path(), "a", "reading_lite");
 
         assert_eq!(read_prefix(&repo).unwrap(), "reading_lite");
-    }
-
-    #[test]
-    fn attribution_map_reads_prefixes() {
-        // The search path's map builder: attributes each repo's ids, and a
-        // metadata-read failure is a non-fatal RepoError (the other repo stands).
-        let tmp = tempfile::tempdir().unwrap();
-        let a = seed_repo(tmp.path(), "a", "ra");
-        // `bad` has no metadata.json, so its prefix read fails.
-        let bad = tmp.path().join("bad");
-        fs::create_dir_all(&bad).unwrap();
-        let fake = FakeBdClient::new();
-
-        let (map, errors) = attribution_map(&fake, &roster(&[&a, &bad]));
-
-        assert_eq!(
-            map.repo_for("ra-2hc").map(|r| &r.path),
-            Some(&a),
-            "the readable repo is attributed"
-        );
-        assert!(
-            errors
-                .iter()
-                .any(|e| matches!(e, RepoError::Metadata { repo, .. } if repo == &bad)),
-            "an unreadable prefix is a non-fatal RepoError: {errors:?}"
-        );
     }
 
     #[test]
