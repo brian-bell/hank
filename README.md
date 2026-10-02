@@ -89,7 +89,7 @@ hank snapshot [--json]   # print the merged, attributed ready list (no TUI)
 hank doctor              # bd version + gate, config/hub paths, per-repo health
 hank reset               # delete the hub DB; rebuilt on the next snapshot/launch
 hank repos add <path>    # add a beads repo to the roster
-hank repos remove <path> # drop a repo from the roster
+hank repos remove <path> # drop a repo from the roster and the hub
 hank repos list          # print the roster
 hank repos discover <dir> [--add]   # scan <dir>/*/.beads one level deep
 ```
