@@ -29,6 +29,32 @@ const WATCH_RETRY_MAX: Duration = Duration::from_secs(300);
 /// final content-height clamp because the pure app core does not know dimensions.
 const DETAIL_PAGE_ROWS: u16 = 10;
 
+/// A triage mutation the user has chosen and not yet confirmed.
+///
+/// This is the whole pending-action state: stored as `Option<TriageAction>`,
+/// so "armed" and "which action" cannot disagree. Confirm names this value
+/// in one effect; cancel and dismiss drop it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriageAction {
+    /// `bd update <id> --claim` for this issue.
+    Claim { id: String },
+    /// `bd close <id>` for this issue.
+    Close { id: String },
+    /// `bd update <id> --priority <priority>` for this issue.
+    SetPriority { id: String, priority: i64 },
+}
+
+impl TriageAction {
+    /// Short name of the chosen action, used to show it before confirm.
+    fn label(&self) -> String {
+        match self {
+            TriageAction::Claim { id } => format!("claim {id}"),
+            TriageAction::Close { id } => format!("close {id}"),
+            TriageAction::SetPriority { id, priority } => format!("set {id} to P{priority}"),
+        }
+    }
+}
+
 /// A message driving a state transition: either a decoded keypress (see
 /// [`keys::map_key`]) or a refresh-lifecycle event fed by the Slice 9 runtime's
 /// worker thread.
@@ -130,6 +156,13 @@ pub enum Msg {
     /// Copy a markdown block (title/id/repo/description) for the selected row
     /// (`Y`); `reduce` emits [`Effect::Copy`] with `markdown: true`.
     CopyMarkdown,
+    /// Arm `action` for confirmation. It is shown; nothing is emitted until
+    /// [`Msg::ConfirmTriage`].
+    ChooseTriage(TriageAction),
+    /// Confirm the armed triage action. Emits one effect naming that action.
+    ConfirmTriage,
+    /// Drop the armed triage action. Emits nothing.
+    CancelTriage,
     /// A copy worker finished building the clipboard string (runtime copy worker →
     /// app). `token` echoes the request's generation (see [`Effect::Copy`]) so a
     /// superseded copy's late reply — the user copied row A, moved, copied row B,
@@ -234,6 +267,9 @@ pub enum Effect {
         scope: RefreshScope,
         after: Duration,
     },
+    /// A confirmed triage mutation. The value is the action the user confirmed;
+    /// running it belongs to the `BdClient` slice, not to `reduce`.
+    Triage(TriageAction),
 }
 
 /// What a refresh re-exports before the hub sync.
@@ -340,14 +376,16 @@ pub enum ViewMode {
     Search,
 }
 
-/// Live key-routing context. Picker input takes precedence over the underlying
-/// screen, then search editing, then normal commands.
+/// Live key-routing context. A triage confirmation sits above the repository
+/// picker, then the health panel, then search editing, then normal commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputContext {
     Normal,
     SearchEditing,
     RepoPicker,
     Health,
+    /// A triage confirmation is showing. Only confirm, cancel, and quit act.
+    TriageConfirm,
 }
 
 /// The detail pane's state for one issue id.
@@ -565,6 +603,8 @@ pub struct App {
     repo_view: RepoFilter,
     /// Open picker overlay. Choices are frozen until it closes.
     repo_picker: Option<RepoPickerState>,
+    /// The triage action waiting for confirm. `None` is the only idle state.
+    pending_triage: Option<TriageAction>,
     /// Non-fatal warning from the latest relevant UI-state save failure.
     persistence_warning: Option<String>,
     /// The cross-repo ready list (rows, filter, selection), always maintained by
@@ -666,6 +706,7 @@ impl App {
         App {
             repo_view,
             repo_picker: None,
+            pending_triage: None,
             persistence_warning: None,
             ready: RowList::default(),
             search: None,
@@ -717,6 +758,13 @@ impl App {
     /// that can change the row set or filter re-establishes the selection
     /// invariant via [`RowList::recompute`].
     pub fn reduce(&mut self, msg: Msg) -> Vec<Effect> {
+        // The confirmation sits above every other mode, including the repo
+        // picker: Esc dismisses the mutation and must not also leave detail
+        // or search, and must not emit it.
+        if self.pending_triage.is_some() && matches!(&msg, Msg::Back) {
+            self.pending_triage = None;
+            return Vec::new();
+        }
         // Esc always cancels the topmost overlay before it can affect the
         // underlying detail/search mode.
         if self.repo_picker.is_some() && matches!(&msg, Msg::Back) {
@@ -1089,6 +1137,17 @@ impl App {
             // runtime resolves the path + builds the string off the UI thread.
             Msg::CopyContext => return self.copy_effect(false),
             Msg::CopyMarkdown => return self.copy_effect(true),
+            Msg::ChooseTriage(action) => {
+                self.pending_triage = Some(action);
+            }
+            Msg::ConfirmTriage => {
+                if let Some(action) = self.pending_triage.take() {
+                    return vec![Effect::Triage(action)];
+                }
+            }
+            Msg::CancelTriage => {
+                self.pending_triage = None;
+            }
             Msg::Copied {
                 token,
                 payload,
@@ -1578,7 +1637,9 @@ impl App {
 
     /// The current key-routing context.
     pub fn input_context(&self) -> InputContext {
-        if self.repo_picker.is_some() {
+        if self.pending_triage.is_some() {
+            InputContext::TriageConfirm
+        } else if self.repo_picker.is_some() {
             InputContext::RepoPicker
         } else if self.health.is_some() {
             InputContext::Health
@@ -1587,6 +1648,11 @@ impl App {
         } else {
             InputContext::Normal
         }
+    }
+
+    /// The triage action waiting for confirmation, if the user has chosen one.
+    pub fn pending_triage(&self) -> Option<&TriageAction> {
+        self.pending_triage.as_ref()
     }
 
     /// The number of rows the current search returned (0 when not in results).
@@ -3778,5 +3844,90 @@ mod tests {
         assert_eq!(app.health_scroll(), 4);
         app.reduce(Msg::HealthScroll(-1));
         assert_eq!(app.health_scroll(), 3);
+    }
+
+    #[test]
+    fn choosing_a_triage_action_shows_it_and_emits_nothing() {
+        let mut app = App::new();
+        let action = TriageAction::Claim { id: "ra-1".into() };
+
+        assert_eq!(app.reduce(Msg::ChooseTriage(action.clone())), vec![]);
+        assert_eq!(app.pending_triage(), Some(&action));
+        assert_eq!(app.input_context(), InputContext::TriageConfirm);
+    }
+
+    #[test]
+    fn confirm_emits_exactly_the_pending_claim() {
+        let mut app = App::new();
+        let action = TriageAction::Claim { id: "ra-1".into() };
+        assert_eq!(app.reduce(Msg::ChooseTriage(action.clone())), vec![]);
+
+        assert_eq!(app.reduce(Msg::ConfirmTriage), vec![Effect::Triage(action)]);
+        assert_eq!(app.pending_triage(), None);
+        assert_eq!(app.reduce(Msg::ConfirmTriage), vec![]);
+    }
+
+    #[test]
+    fn confirm_emits_exactly_the_pending_close() {
+        let mut app = App::new();
+        let action = TriageAction::Close { id: "mc-2".into() };
+        assert_eq!(app.reduce(Msg::ChooseTriage(action.clone())), vec![]);
+
+        assert_eq!(app.reduce(Msg::ConfirmTriage), vec![Effect::Triage(action)]);
+        assert_eq!(app.pending_triage(), None);
+    }
+
+    #[test]
+    fn confirm_emits_exactly_the_pending_priority_change() {
+        let mut app = App::new();
+        let action = TriageAction::SetPriority {
+            id: "st-3".into(),
+            priority: 0,
+        };
+        assert_eq!(app.reduce(Msg::ChooseTriage(action.clone())), vec![]);
+
+        assert_eq!(app.reduce(Msg::ConfirmTriage), vec![Effect::Triage(action)]);
+        assert_eq!(app.pending_triage(), None);
+    }
+
+    #[test]
+    fn a_later_choice_replaces_the_pending_action_without_emitting() {
+        let mut app = App::new();
+        let first = TriageAction::Claim { id: "ra-1".into() };
+        let second = TriageAction::Close { id: "ra-1".into() };
+
+        assert_eq!(app.reduce(Msg::ChooseTriage(first)), vec![]);
+        assert_eq!(app.reduce(Msg::ChooseTriage(second.clone())), vec![]);
+        assert_eq!(app.pending_triage(), Some(&second));
+        assert_eq!(app.reduce(Msg::ConfirmTriage), vec![Effect::Triage(second)]);
+    }
+
+    #[test]
+    fn cancel_clears_the_pending_triage_action_with_no_effect() {
+        let mut app = App::new();
+        app.reduce(Msg::ChooseTriage(TriageAction::Claim { id: "ra-1".into() }));
+
+        assert_eq!(app.reduce(Msg::CancelTriage), vec![]);
+        assert_eq!(app.pending_triage(), None);
+        assert_eq!(app.input_context(), InputContext::Normal);
+        assert_eq!(app.reduce(Msg::ConfirmTriage), vec![]);
+        assert_eq!(app.reduce(Msg::CancelTriage), vec![]);
+    }
+
+    #[test]
+    fn back_dismisses_pending_triage_without_an_effect_or_leaving_detail() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        app.reduce(Msg::OpenDetail);
+        app.reduce(Msg::ChooseTriage(TriageAction::SetPriority {
+            id: "ra-1".into(),
+            priority: 2,
+        }));
+        assert_eq!(app.view_mode(), ViewMode::Detail);
+        assert_eq!(app.input_context(), InputContext::TriageConfirm);
+
+        assert_eq!(app.reduce(Msg::Back), vec![]);
+        assert_eq!(app.pending_triage(), None);
+        assert_eq!(app.view_mode(), ViewMode::Detail);
+        assert_eq!(app.reduce(Msg::ConfirmTriage), vec![]);
     }
 }

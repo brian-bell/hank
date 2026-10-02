@@ -68,18 +68,23 @@ pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) -> Option<u16> {
         ])
         .split(frame.area());
 
-    let hints = match app.view_mode() {
-        _ if app.health_open() => HEALTH_HINTS,
-        ViewMode::Detail => DETAIL_HINTS,
-        // Match the hint to the phase's real key routing: editing keys type the
-        // query and Enter runs it; results enable j/k + Enter (open) + Esc (edit);
-        // while loading or after an error only Esc (edit) and q act.
-        ViewMode::Search => match app.search_phase() {
-            Some(SearchPhase::Editing) => SEARCH_EDIT_HINTS,
-            Some(SearchPhase::Results) => SEARCH_RESULTS_HINTS,
-            _ => SEARCH_WAIT_HINTS,
-        },
-        ViewMode::List | ViewMode::Loading => LIST_HINTS,
+    let hints = if let Some(action) = app.pending_triage() {
+        format!("confirm {}? · enter confirm · esc cancel", action.label())
+    } else {
+        match app.view_mode() {
+            _ if app.health_open() => HEALTH_HINTS,
+            ViewMode::Detail => DETAIL_HINTS,
+            // Match the hint to the phase's real key routing: editing keys type the
+            // query and Enter runs it; results enable j/k + Enter (open) + Esc (edit);
+            // while loading or after an error only Esc (edit) and q act.
+            ViewMode::Search => match app.search_phase() {
+                Some(SearchPhase::Editing) => SEARCH_EDIT_HINTS,
+                Some(SearchPhase::Results) => SEARCH_RESULTS_HINTS,
+                _ => SEARCH_WAIT_HINTS,
+            },
+            ViewMode::List | ViewMode::Loading => LIST_HINTS,
+        }
+        .to_string()
     };
     frame.render_widget(Paragraph::new(hints), chunks[0]);
     let detail_max_scroll = match app.view_mode() {
@@ -620,7 +625,7 @@ fn format_age(now: SystemTime, fetched: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Msg, RepoFilter};
+    use crate::app::{Msg, RepoFilter, TriageAction};
     use crate::bd::Issue;
     use crate::snapshot::{Row, Snapshot};
     use ratatui::Terminal;
@@ -1352,6 +1357,24 @@ DESIGN
         assert!(
             rows_with_word >= 2,
             "long description wraps: {rows_with_word} rows"
+        );
+    }
+
+    #[test]
+    fn pending_triage_action_is_shown_in_place_of_the_mode_hints() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1, "t")], vec![]);
+        assert_eq!(
+            app.reduce(Msg::ChooseTriage(TriageAction::Claim { id: "ra-1".into() })),
+            vec![]
+        );
+        let title = line_text(&render_sized(&app, at(1000), W, H), 0);
+        assert!(
+            title.contains("confirm claim ra-1?"),
+            "the chosen action is shown: {title:?}"
+        );
+        assert!(
+            title.contains("esc cancel"),
+            "cancel stays visible with the action: {title:?}"
         );
     }
 

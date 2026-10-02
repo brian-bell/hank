@@ -377,6 +377,10 @@ fn execute_effect(
             let _ = tx.send(Msg::RepoViewPersisted { repo, result }.into());
             return;
         }
+        // The reducer has already committed to this action. Executing claim,
+        // close, or priority belongs to the BdClient slice; doing it here
+        // would write issue data before that slice exists.
+        Effect::Triage(_) => return,
     };
     worker_handles.push(handle);
 }
