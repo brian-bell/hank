@@ -465,7 +465,7 @@ fn follow_repo_with_backoff(
                     StartPoint::Disabled => {
                         // An `unwatched` repo is left alone, quietly: the user
                         // opted it out, and `hank doctor` still lists it.
-                        if may_enable() && !enable_tried {
+                        if !enable_tried && may_enable() {
                             enable_tried = true;
                             match source.enable(repo) {
                                 Ok(()) => {
@@ -484,7 +484,7 @@ fn follow_repo_with_backoff(
                                     )));
                                 }
                             }
-                        } else if may_enable() && !warned_disabled {
+                        } else if !warned_disabled && may_enable() {
                             // Turned on, yet bd still reports it off (for one,
                             // `BD_EVENTS_JOURNAL=false` overrides the file).
                             warned_disabled = true;
@@ -608,6 +608,13 @@ pub struct WatchList {
     pub opted_out: BTreeSet<PathBuf>,
 }
 
+impl WatchList {
+    /// Whether Hank may turn on `repo`'s journal: on the roster, not opted out.
+    pub fn allows(&self, repo: &Path) -> bool {
+        self.repos.iter().any(|r| r == repo) && !self.opted_out.contains(repo)
+    }
+}
+
 impl From<Vec<PathBuf>> for WatchList {
     /// Every repo followed, none opted out.
     fn from(repos: Vec<PathBuf>) -> Self {
@@ -631,7 +638,14 @@ pub struct Watcher {
     /// so an `unwatch` or `repos remove` run mid-session is honored even though
     /// the follower itself lives on until exit.
     enable_allowed: Arc<Mutex<BTreeSet<PathBuf>>>,
+    /// Asked last, right before an enable: whether the roster on disk still
+    /// allows it. `enable_allowed` only changes when a refresh reloads the
+    /// roster, and `hank repos unwatch` doesn't trigger one.
+    roster_allows: Arc<RosterCheck>,
 }
+
+/// Re-reads the roster and answers [`WatchList::allows`] for one repo.
+pub type RosterCheck = dyn Fn(&Path) -> bool + Send + Sync;
 
 /// The mutable half of a [`Watcher`], behind one lock so a late
 /// [`Watcher::follow`] can never race [`Watcher::stop`].
@@ -646,10 +660,12 @@ struct Followers {
 impl Watcher {
     /// Start following `repos` (resolved, deduplicated roster paths), saving
     /// checkpoints to `checkpoints_file` and delivering messages via `deliver`.
+    /// `roster_allows` is consulted before every enable (see [`RosterCheck`]).
     pub fn start(
         source: Arc<dyn JournalSource>,
         repos: impl Into<WatchList>,
         checkpoints_file: PathBuf,
+        roster_allows: impl Fn(&Path) -> bool + Send + Sync + 'static,
         deliver: impl FnMut(Msg) + Send + 'static,
     ) -> Watcher {
         let saved = Checkpoints::load(&checkpoints_file);
@@ -671,6 +687,7 @@ impl Watcher {
                 handles: vec![batcher],
             }),
             enable_allowed: Arc::default(),
+            roster_allows: Arc::new(roster_allows),
         };
         watcher.follow(repos);
         watcher
@@ -683,15 +700,17 @@ impl Watcher {
     /// roster keeps its follower until shutdown, and its reports only ask for a
     /// refresh the reloaded roster no longer runs.
     pub fn follow(&self, repos: impl Into<WatchList>) {
-        let WatchList { repos, opted_out } = repos.into();
+        let list = repos.into();
         *self
             .enable_allowed
             .lock()
-            .expect("watch enable set poisoned") = repos
+            .expect("watch enable set poisoned") = list
+            .repos
             .iter()
-            .filter(|repo| !opted_out.contains(*repo))
+            .filter(|repo| list.allows(repo))
             .cloned()
             .collect();
+        let repos = list.repos;
         let mut followers = self.followers.lock().expect("watch followers poisoned");
         let Followers {
             reports,
@@ -718,12 +737,14 @@ impl Watcher {
             let stop = Arc::clone(&self.stop);
             let checkpoint = saved.repos.get(&repo).cloned();
             let enable_allowed = Arc::clone(&self.enable_allowed);
+            let roster_allows = Arc::clone(&self.roster_allows);
             handles.push(thread::spawn(move || {
                 let may_enable = || {
                     enable_allowed
                         .lock()
                         .expect("watch enable set poisoned")
                         .contains(&repo)
+                        && roster_allows(&repo)
                 };
                 follow_repo(source.as_ref(), &repo, checkpoint, &may_enable, &tx, &stop);
             }));
@@ -1265,7 +1286,7 @@ mod tests {
         let source = Arc::new(ParkedJournal {
             follows: Mutex::new(tx),
         });
-        let watcher = Watcher::start(source, vec![PathBuf::from("/a")], file, |_| {});
+        let watcher = Watcher::start(source, vec![PathBuf::from("/a")], file, |_| true, |_| {});
 
         watcher.follow(vec![PathBuf::from("/a"), PathBuf::from("/b")]);
         let mut seen: Vec<String> = (0..2)
@@ -1326,6 +1347,7 @@ mod tests {
             Arc::clone(&source) as Arc<dyn JournalSource>,
             vec![PathBuf::from("/a")],
             tmp.path().join("events_checkpoints.json"),
+            |_| true,
             |_| {},
         );
 
@@ -1339,5 +1361,43 @@ mod tests {
             source.enables.lock().unwrap().is_empty(),
             "a repo no longer on the roster is never written to"
         );
+    }
+
+    #[test]
+    fn watcher_rechecks_the_roster_before_enabling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (go, gate) = mpsc::channel();
+        let source = Arc::new(GatedOffJournal {
+            gate: Mutex::new(Some(gate)),
+            enables: Mutex::new(Vec::new()),
+        });
+        let watcher = Watcher::start(
+            Arc::clone(&source) as Arc<dyn JournalSource>,
+            vec![PathBuf::from("/a")],
+            tmp.path().join("events_checkpoints.json"),
+            // `hank repos unwatch /a` saved the roster; no refresh has run.
+            |_| false,
+            |_| {},
+        );
+
+        go.send(()).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        watcher.stop();
+
+        assert!(
+            source.enables.lock().unwrap().is_empty(),
+            "an opt-out on disk wins over the follower's stale roster"
+        );
+    }
+
+    #[test]
+    fn watch_list_allows_only_unopted_roster_repos() {
+        let list = WatchList {
+            repos: vec![PathBuf::from("/a"), PathBuf::from("/b")],
+            opted_out: BTreeSet::from([PathBuf::from("/b")]),
+        };
+        assert!(list.allows(Path::new("/a")));
+        assert!(!list.allows(Path::new("/b")), "opted out");
+        assert!(!list.allows(Path::new("/c")), "not on the roster");
     }
 }

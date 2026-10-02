@@ -725,8 +725,9 @@ fn enable_journal_for_added(
 ///
 /// `unwatch` also marks the roster entry `unwatched`, which stops live refresh
 /// from turning the journal back on; `watch` clears it. The roster is saved
-/// before bd runs, so a TUI that reloads it mid-command already sees the
-/// opt-out. A path that is not on the roster is refused.
+/// before bd runs, so a running TUI, which re-reads it before turning a
+/// journal on, already sees the opt-out. A path that is not on the roster is
+/// refused.
 pub fn run_repos_watch(
     bd: &impl BdClient,
     paths: &Paths,
