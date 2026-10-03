@@ -1,17 +1,15 @@
 # Hank
 
-A read-only terminal UI that answers **"what's ready to work on across all my
+A terminal UI that answers **"what's ready to work on across all my
 [beads](https://github.com/gastownhall/beads) repos?"** It federates N beads
 repositories into a persistent hub database that `bd` itself maintains
 (multi-repo hydration) and presents a cross-repo ready-work list with a detail
 pane, cross-repo search, and a copy-context action.
 
-Hank never writes to your issue data. Its writes to your repos go through `bd`:
-`bd export` refreshing each source repo's own `.beads/issues.jsonl`, and, only
-when you turn on live refresh, the `events-journal` setting in
-`.beads/config.yaml` (see [Live refresh](#live-refresh)). Acting on an issue
-happens in your terminal: the copy-context key hands you a ready-to-run
-command.
+Refresh runs `bd export` to refresh each source repo's `.beads/issues.jsonl`.
+Live refresh manages the `events-journal` setting in `.beads/config.yaml`
+(see [Live refresh](#live-refresh)). The copy-context key hands you a
+ready-to-run command for your terminal.
 
 ## Requirements
 
@@ -189,8 +187,6 @@ Recorded phase timings live in `docs/performance/refresh.md`.
 ## Not in v1 (planned)
 
 - A blocked-issues view (v1 shows only ready work).
-- Any write path from the TUI (create/update/close/comment) — the copy-context
-  key is the bridge to acting in a terminal.
 - A background daemon. Live refresh (`--watch`) runs only while the TUI is open.
 
 ## License
