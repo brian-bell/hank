@@ -29,6 +29,32 @@ const WATCH_RETRY_MAX: Duration = Duration::from_secs(300);
 /// final content-height clamp because the pure app core does not know dimensions.
 const DETAIL_PAGE_ROWS: u16 = 10;
 
+/// A triage mutation the user has chosen and not yet confirmed.
+///
+/// This is the whole pending-action state: stored as `Option<TriageAction>`,
+/// so "armed" and "which action" cannot disagree. Confirm names this value
+/// in one effect; cancel and dismiss drop it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriageAction {
+    /// `bd update <id> --claim` for this issue.
+    Claim { id: String },
+    /// `bd close <id>` for this issue.
+    Close { id: String },
+    /// `bd update <id> --priority <priority>` for this issue.
+    SetPriority { id: String, priority: i64 },
+}
+
+impl TriageAction {
+    /// Short name of the chosen action, used to show it before confirm.
+    fn label(&self) -> String {
+        match self {
+            TriageAction::Claim { id } => format!("claim {id}"),
+            TriageAction::Close { id } => format!("close {id}"),
+            TriageAction::SetPriority { id, priority } => format!("set {id} to P{priority}"),
+        }
+    }
+}
+
 /// A message driving a state transition: either a decoded keypress (see
 /// [`keys::map_key`]) or a refresh-lifecycle event fed by the Slice 9 runtime's
 /// worker thread.
@@ -130,6 +156,13 @@ pub enum Msg {
     /// Copy a markdown block (title/id/repo/description) for the selected row
     /// (`Y`); `reduce` emits [`Effect::Copy`] with `markdown: true`.
     CopyMarkdown,
+    /// Arm `action` for confirmation. It is shown; nothing is emitted until
+    /// [`Msg::ConfirmTriage`].
+    ChooseTriage(TriageAction),
+    /// Confirm the armed triage action. Emits one effect naming that action.
+    ConfirmTriage,
+    /// Drop the armed triage action. Emits nothing.
+    CancelTriage,
     /// A copy worker finished building the clipboard string (runtime copy worker →
     /// app). `token` echoes the request's generation (see [`Effect::Copy`]) so a
     /// superseded copy's late reply — the user copied row A, moved, copied row B,
@@ -158,6 +191,26 @@ pub enum Msg {
     /// A live-refresh problem worth surfacing (a repo's journal is off, `bd`
     /// can't follow it). Kept across refresh cycles; shown once per text.
     WatchWarning(String),
+    /// How each roster repo fared in a refresh whose hub sync succeeded (runtime
+    /// worker → app), sent just before that cycle's [`Msg::RefreshCompleted`].
+    /// `synced_at` is the sync's wall-clock time. Folded into
+    /// [`App::repo_health`]; never touches the in-flight flag.
+    RepoSyncs {
+        synced_at: SystemTime,
+        repos: Vec<RepoSync>,
+    },
+    /// Open or close the sync-health panel (`h`). Opening runs `hank doctor`
+    /// through [`Effect::CheckHealth`].
+    ToggleHealth,
+    /// Scroll the open health panel by this many rows (negative scrolls up).
+    HealthScroll(i16),
+    /// The health panel's `hank doctor` run concluded. `token` echoes
+    /// [`Effect::CheckHealth`] so a run from an earlier opening is dropped;
+    /// `report` is doctor's output, or a pre-formatted, sanitized failure.
+    HealthReport {
+        token: u64,
+        report: Result<String, String>,
+    },
     /// Leave the current sub-mode back to the list (`Esc`). No-op in `List`;
     /// Slices 10/11 return from `Detail`/`Search`.
     Back,
@@ -204,6 +257,9 @@ pub enum Effect {
     WriteClipboard(String),
     /// Persist one newly confirmed repository view.
     PersistRepoView(RepoFilter),
+    /// Run `hank doctor` off the UI thread for the health panel and send its
+    /// output back as [`Msg::HealthReport`] echoing `token`.
+    CheckHealth { token: u64 },
     /// A watcher refresh failed (another Hank held the hub lock, a sync
     /// failed, ...): send `Msg::WatchChanged(scope)` again after `after`, so
     /// the change the journal reported is not lost until the next write.
@@ -211,6 +267,9 @@ pub enum Effect {
         scope: RefreshScope,
         after: Duration,
     },
+    /// A confirmed triage mutation. The value is the action the user confirmed;
+    /// running it belongs to the `BdClient` slice, not to `reduce`.
+    Triage(TriageAction),
 }
 
 /// What a refresh re-exports before the hub sync.
@@ -236,6 +295,74 @@ impl RefreshScope {
     }
 }
 
+/// How one roster repo fared in a refresh cycle, as the runtime reports it.
+/// Failures are pre-formatted so this core stays free of `refresh` error types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoSync {
+    /// The resolved roster path.
+    pub path: PathBuf,
+    /// The repo's id prefix (what [`Row::repo_id`] carries), when known.
+    pub prefix: Option<String>,
+    pub outcome: RepoSyncOutcome,
+}
+
+/// The result of one repo's part in a refresh cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoSyncOutcome {
+    /// Exported cleanly; the hub now holds its latest issues.
+    Exported,
+    /// A scoped (live) refresh skipped it because its journal reported no
+    /// change, so its last export is still current.
+    Carried,
+    /// It failed this cycle; the hub keeps whatever it last exported. The
+    /// message is pre-formatted and sanitized.
+    Failed(String),
+}
+
+/// One roster repo's freshness, accumulated across refresh cycles, for the
+/// health panel and the stale-repo flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoHealth {
+    /// The resolved roster path.
+    pub path: PathBuf,
+    /// The repo's id prefix, when known.
+    pub prefix: Option<String>,
+    /// When the hub last took a clean export of this repo (that cycle's sync
+    /// time). `None` if it has not exported cleanly since launch.
+    pub synced_at: Option<SystemTime>,
+    /// Why the latest attempt failed; `None` after a clean one.
+    pub problem: Option<String>,
+}
+
+impl RepoHealth {
+    /// Whether the hub's copy of this repo is behind: its latest refresh failed,
+    /// so it shows an older export (or nothing).
+    pub fn is_stale(&self) -> bool {
+        self.problem.is_some()
+    }
+}
+
+/// The `hank doctor` part of the health panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DoctorState {
+    /// Doctor is running.
+    Running,
+    /// Doctor's output.
+    Done(String),
+    /// Doctor could not run; pre-formatted and sanitized.
+    Failed(String),
+}
+
+/// The open sync-health panel.
+#[derive(Debug, Clone)]
+struct HealthPanel {
+    /// The generation of this opening's doctor run.
+    token: u64,
+    doctor: DoctorState,
+    /// Vertical scroll offset (rows); the view clamps it to the content.
+    scroll: u16,
+}
+
 /// Which screen the app is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
@@ -249,13 +376,16 @@ pub enum ViewMode {
     Search,
 }
 
-/// Live key-routing context. Picker input takes precedence over the underlying
-/// screen, then search editing, then normal commands.
+/// Live key-routing context. A triage confirmation sits above the repository
+/// picker, then the health panel, then search editing, then normal commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputContext {
     Normal,
     SearchEditing,
     RepoPicker,
+    Health,
+    /// A triage confirmation is showing. Only confirm, cancel, and quit act.
+    TriageConfirm,
 }
 
 /// The detail pane's state for one issue id.
@@ -473,6 +603,8 @@ pub struct App {
     repo_view: RepoFilter,
     /// Open picker overlay. Choices are frozen until it closes.
     repo_picker: Option<RepoPickerState>,
+    /// The triage action waiting for confirm. `None` is the only idle state.
+    pending_triage: Option<TriageAction>,
     /// Non-fatal warning from the latest relevant UI-state save failure.
     persistence_warning: Option<String>,
     /// The cross-repo ready list (rows, filter, selection), always maintained by
@@ -494,6 +626,16 @@ pub struct App {
     watching: bool,
     /// Live-refresh warnings; unlike `status_warnings` these outlive a cycle.
     watch_warnings: Vec<String>,
+    /// Per-repo freshness from the latest successful sync, in roster order.
+    repo_health: Vec<RepoHealth>,
+    /// The sync-health panel overlay, `Some` while open.
+    health: Option<HealthPanel>,
+    /// A monotonic generation stamped on each health-panel doctor run.
+    health_seq: u64,
+    /// The token of the doctor run still in flight, if any. Reopening the
+    /// panel while one runs shares it instead of starting another, so a held
+    /// `h` cannot pile up concurrent doctor runs.
+    health_in_flight: Option<u64>,
     /// A watcher refresh requested while another refresh was in flight. Runs
     /// when that cycle completes, merged with any later requests.
     pending_refresh: Option<RefreshScope>,
@@ -564,6 +706,7 @@ impl App {
         App {
             repo_view,
             repo_picker: None,
+            pending_triage: None,
             persistence_warning: None,
             ready: RowList::default(),
             search: None,
@@ -573,6 +716,10 @@ impl App {
             status_warnings: Vec::new(),
             watching: false,
             watch_warnings: Vec::new(),
+            repo_health: Vec::new(),
+            health: None,
+            health_seq: 0,
+            health_in_flight: None,
             pending_refresh: None,
             watch_in_flight: None,
             watch_failures: 0,
@@ -611,10 +758,21 @@ impl App {
     /// that can change the row set or filter re-establishes the selection
     /// invariant via [`RowList::recompute`].
     pub fn reduce(&mut self, msg: Msg) -> Vec<Effect> {
+        // The confirmation sits above every other mode, including the repo
+        // picker: Esc dismisses the mutation and must not also leave detail
+        // or search, and must not emit it.
+        if self.pending_triage.is_some() && matches!(&msg, Msg::Back) {
+            self.pending_triage = None;
+            return Vec::new();
+        }
         // Esc always cancels the topmost overlay before it can affect the
         // underlying detail/search mode.
         if self.repo_picker.is_some() && matches!(&msg, Msg::Back) {
             self.repo_picker = None;
+            return Vec::new();
+        }
+        if self.health.is_some() && matches!(&msg, Msg::Back) {
+            self.health = None;
             return Vec::new();
         }
         match msg {
@@ -703,7 +861,11 @@ impl App {
                 }
             }
             Msg::DetailScrollBounds { max_scroll } => {
-                if self.view_mode == ViewMode::Detail {
+                // The view reports the bounds of whatever scrolls on top: the
+                // health panel when open, else the detail pane.
+                if let Some(health) = &mut self.health {
+                    health.scroll = health.scroll.min(max_scroll);
+                } else if self.view_mode == ViewMode::Detail {
                     self.detail_scroll = self.detail_scroll.min(max_scroll);
                 }
             }
@@ -771,6 +933,47 @@ impl App {
             Msg::WatchWarning(warning) => {
                 if !self.watch_warnings.contains(&warning) {
                     self.watch_warnings.push(warning);
+                }
+            }
+            Msg::RepoSyncs { synced_at, repos } => self.apply_repo_syncs(synced_at, repos),
+            Msg::ToggleHealth => {
+                if self.health.take().is_some() {
+                    return Vec::new();
+                }
+                if let Some(token) = self.health_in_flight {
+                    self.health = Some(HealthPanel {
+                        token,
+                        doctor: DoctorState::Running,
+                        scroll: 0,
+                    });
+                    return Vec::new();
+                }
+                self.health_seq += 1;
+                let token = self.health_seq;
+                self.health_in_flight = Some(token);
+                self.health = Some(HealthPanel {
+                    token,
+                    doctor: DoctorState::Running,
+                    scroll: 0,
+                });
+                return vec![Effect::CheckHealth { token }];
+            }
+            Msg::HealthScroll(delta) => {
+                if let Some(health) = &mut self.health {
+                    health.scroll = health.scroll.saturating_add_signed(delta);
+                }
+            }
+            Msg::HealthReport { token, report } => {
+                if self.health_in_flight == Some(token) {
+                    self.health_in_flight = None;
+                }
+                if let Some(health) = &mut self.health
+                    && health.token == token
+                {
+                    health.doctor = match report {
+                        Ok(output) => DoctorState::Done(output),
+                        Err(message) => DoctorState::Failed(message),
+                    };
                 }
             }
             Msg::OpenDetail => {
@@ -934,6 +1137,17 @@ impl App {
             // runtime resolves the path + builds the string off the UI thread.
             Msg::CopyContext => return self.copy_effect(false),
             Msg::CopyMarkdown => return self.copy_effect(true),
+            Msg::ChooseTriage(action) => {
+                self.pending_triage = Some(action);
+            }
+            Msg::ConfirmTriage => {
+                if let Some(action) = self.pending_triage.take() {
+                    return vec![Effect::Triage(action)];
+                }
+            }
+            Msg::CancelTriage => {
+                self.pending_triage = None;
+            }
             Msg::Copied {
                 token,
                 payload,
@@ -964,6 +1178,42 @@ impl App {
             Msg::Quit => self.done = true,
         }
         Vec::new()
+    }
+
+    /// Fold one successful sync's per-repo results into [`App::repo_health`].
+    /// The new list follows the reported roster, so a removed repo drops out.
+    /// A clean export is fresh as of `synced_at`; a failure keeps the last
+    /// clean time; a carried-over repo (not exported) keeps its last clean
+    /// time and any standing problem.
+    fn apply_repo_syncs(&mut self, synced_at: SystemTime, repos: Vec<RepoSync>) {
+        let mut previous: HashMap<PathBuf, RepoHealth> = self
+            .repo_health
+            .drain(..)
+            .map(|health| (health.path.clone(), health))
+            .collect();
+        self.repo_health = repos
+            .into_iter()
+            .map(|repo| {
+                let before = previous.remove(&repo.path);
+                let last_clean = before.as_ref().and_then(|health| health.synced_at);
+                let (synced_at, problem) = match repo.outcome {
+                    RepoSyncOutcome::Exported => (Some(synced_at), None),
+                    // Not exported this cycle: its last clean export and any
+                    // standing problem carry over unchanged.
+                    RepoSyncOutcome::Carried => match before {
+                        Some(before) => (before.synced_at, before.problem),
+                        None => (Some(synced_at), None),
+                    },
+                    RepoSyncOutcome::Failed(message) => (last_clean, Some(message)),
+                };
+                RepoHealth {
+                    path: repo.path,
+                    prefix: repo.prefix,
+                    synced_at,
+                    problem,
+                }
+            })
+            .collect();
     }
 
     /// Move the selection of the list behind the open detail pane (`j`/`k` in
@@ -1387,13 +1637,22 @@ impl App {
 
     /// The current key-routing context.
     pub fn input_context(&self) -> InputContext {
-        if self.repo_picker.is_some() {
+        if self.pending_triage.is_some() {
+            InputContext::TriageConfirm
+        } else if self.repo_picker.is_some() {
             InputContext::RepoPicker
+        } else if self.health.is_some() {
+            InputContext::Health
         } else if self.search_editing() {
             InputContext::SearchEditing
         } else {
             InputContext::Normal
         }
+    }
+
+    /// The triage action waiting for confirmation, if the user has chosen one.
+    pub fn pending_triage(&self) -> Option<&TriageAction> {
+        self.pending_triage.as_ref()
     }
 
     /// The number of rows the current search returned (0 when not in results).
@@ -1422,12 +1681,39 @@ impl App {
     pub fn copy_flash(&self) -> Option<&str> {
         self.copy_flash.as_deref()
     }
+
+    /// Per-repo freshness from the latest successful sync, in roster order.
+    /// Empty until the first sync completes.
+    pub fn repo_health(&self) -> &[RepoHealth] {
+        &self.repo_health
+    }
+
+    /// The repos whose latest refresh failed, so the hub shows an older export.
+    pub fn stale_repos(&self) -> impl Iterator<Item = &RepoHealth> {
+        self.repo_health.iter().filter(|health| health.is_stale())
+    }
+
+    /// Whether the sync-health panel is open.
+    pub fn health_open(&self) -> bool {
+        self.health.is_some()
+    }
+
+    /// The health panel's doctor state, when the panel is open.
+    pub fn health_doctor(&self) -> Option<&DoctorState> {
+        self.health.as_ref().map(|health| &health.doctor)
+    }
+
+    /// The health panel's requested scroll offset (0 when closed).
+    pub fn health_scroll(&self) -> u16 {
+        self.health.as_ref().map_or(0, |health| health.scroll)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bd::Issue;
+    use std::path::Path;
     use std::time::{Duration, UNIX_EPOCH};
 
     fn row(repo: &str, id: &str, priority: i64) -> Row {
@@ -3377,5 +3663,271 @@ mod tests {
         let mut app = app_with(Vec::new());
         app.reduce(Msg::Refresh);
         assert!(app.reduce(failed()).is_empty());
+    }
+
+    fn sync(path: &str, outcome: RepoSyncOutcome) -> RepoSync {
+        RepoSync {
+            path: PathBuf::from(path),
+            prefix: Some(path.trim_start_matches('/').to_string()),
+            outcome,
+        }
+    }
+
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn health<'a>(app: &'a App, path: &str) -> &'a RepoHealth {
+        app.repo_health()
+            .iter()
+            .find(|health| health.path == Path::new(path))
+            .expect("repo reported")
+    }
+
+    #[test]
+    fn repo_syncs_track_freshness_and_failures_across_cycles() {
+        let mut app = app_with(Vec::new());
+        app.reduce(Msg::RepoSyncs {
+            synced_at: at(100),
+            repos: vec![
+                sync("/a", RepoSyncOutcome::Exported),
+                sync("/b", RepoSyncOutcome::Exported),
+            ],
+        });
+        assert_eq!(app.stale_repos().count(), 0);
+        assert_eq!(health(&app, "/b").synced_at, Some(at(100)));
+
+        // /b fails: the hub keeps its older export, so it is stale since 100.
+        app.reduce(Msg::RepoSyncs {
+            synced_at: at(200),
+            repos: vec![
+                sync("/a", RepoSyncOutcome::Exported),
+                sync("/b", RepoSyncOutcome::Failed("export failed".into())),
+            ],
+        });
+        assert_eq!(health(&app, "/a").synced_at, Some(at(200)));
+        let b = health(&app, "/b");
+        assert_eq!(b.synced_at, Some(at(100)), "last clean sync kept");
+        assert_eq!(b.problem.as_deref(), Some("export failed"));
+        assert_eq!(app.stale_repos().count(), 1);
+
+        // A live refresh that carries both over exports neither: each keeps
+        // its last clean export time, and /b stays stale.
+        app.reduce(Msg::RepoSyncs {
+            synced_at: at(300),
+            repos: vec![
+                sync("/a", RepoSyncOutcome::Carried),
+                sync("/b", RepoSyncOutcome::Carried),
+            ],
+        });
+        assert_eq!(health(&app, "/a").synced_at, Some(at(200)));
+        assert!(!health(&app, "/a").is_stale());
+        assert!(health(&app, "/b").is_stale(), "carrying over never clears");
+        assert_eq!(health(&app, "/b").synced_at, Some(at(100)));
+
+        // /b recovers; a repo removed from the roster drops out.
+        app.reduce(Msg::RepoSyncs {
+            synced_at: at(400),
+            repos: vec![sync("/b", RepoSyncOutcome::Exported)],
+        });
+        assert_eq!(app.repo_health().len(), 1);
+        assert_eq!(health(&app, "/b").synced_at, Some(at(400)));
+        assert_eq!(app.stale_repos().count(), 0);
+    }
+
+    #[test]
+    fn a_repo_failing_its_first_sync_was_never_synced() {
+        let mut app = app_with(Vec::new());
+        app.reduce(Msg::RepoSyncs {
+            synced_at: at(100),
+            repos: vec![sync("/a", RepoSyncOutcome::Failed("gone".into()))],
+        });
+        let a = health(&app, "/a");
+        assert_eq!(a.synced_at, None);
+        assert!(a.is_stale());
+    }
+
+    #[test]
+    fn repo_syncs_leave_the_refresh_in_flight() {
+        let mut app = app_with(Vec::new());
+        app.reduce(Msg::Refresh);
+        app.reduce(Msg::RepoSyncs {
+            synced_at: at(100),
+            repos: vec![sync("/a", RepoSyncOutcome::Exported)],
+        });
+        assert!(app.is_stale(), "only RefreshCompleted ends the cycle");
+        assert!(app.reduce(Msg::Refresh).is_empty(), "still deduped");
+    }
+
+    #[test]
+    fn health_panel_opens_runs_doctor_and_closes() {
+        let mut app = app_with(Vec::new());
+        assert_eq!(
+            app.reduce(Msg::ToggleHealth),
+            vec![Effect::CheckHealth { token: 1 }]
+        );
+        assert!(app.health_open());
+        assert_eq!(app.input_context(), InputContext::Health);
+        assert_eq!(app.health_doctor(), Some(&DoctorState::Running));
+
+        app.reduce(Msg::HealthReport {
+            token: 1,
+            report: Ok("gate: OK".into()),
+        });
+        assert_eq!(
+            app.health_doctor(),
+            Some(&DoctorState::Done("gate: OK".into()))
+        );
+
+        assert!(app.reduce(Msg::Back).is_empty());
+        assert!(!app.health_open(), "esc closes the panel");
+        assert_eq!(app.view_mode(), ViewMode::List, "and nothing beneath it");
+        assert_eq!(app.input_context(), InputContext::Normal);
+
+        // Reopening after the run finished starts a fresh one.
+        assert_eq!(
+            app.reduce(Msg::ToggleHealth),
+            vec![Effect::CheckHealth { token: 2 }]
+        );
+        assert!(app.reduce(Msg::ToggleHealth).is_empty(), "h closes it too");
+        assert!(!app.health_open());
+    }
+
+    #[test]
+    fn reopening_the_health_panel_shares_the_doctor_run_in_flight() {
+        let mut app = app_with(Vec::new());
+        assert_eq!(
+            app.reduce(Msg::ToggleHealth),
+            vec![Effect::CheckHealth { token: 1 }]
+        );
+        // A held `h` toggles close/open repeatedly: no new runs start.
+        for _ in 0..5 {
+            assert!(app.reduce(Msg::ToggleHealth).is_empty());
+            assert!(app.reduce(Msg::ToggleHealth).is_empty());
+        }
+        assert!(app.health_open());
+        app.reduce(Msg::HealthReport {
+            token: 1,
+            report: Ok("gate: OK".into()),
+        });
+        assert_eq!(
+            app.health_doctor(),
+            Some(&DoctorState::Done("gate: OK".into())),
+            "the shared run fills the reopened panel"
+        );
+
+        // A run whose panel was closed still clears the in-flight slot.
+        app.reduce(Msg::Back);
+        assert_eq!(
+            app.reduce(Msg::ToggleHealth),
+            vec![Effect::CheckHealth { token: 2 }]
+        );
+        app.reduce(Msg::Back);
+        app.reduce(Msg::HealthReport {
+            token: 2,
+            report: Err("late".into()),
+        });
+        assert_eq!(
+            app.reduce(Msg::ToggleHealth),
+            vec![Effect::CheckHealth { token: 3 }]
+        );
+    }
+
+    #[test]
+    fn health_panel_scroll_saturates_and_is_clamped_by_the_view() {
+        let mut app = app_with(Vec::new());
+        app.reduce(Msg::ToggleHealth);
+        app.reduce(Msg::HealthScroll(-1));
+        assert_eq!(app.health_scroll(), 0);
+        app.reduce(Msg::HealthScroll(10));
+        app.reduce(Msg::DetailScrollBounds { max_scroll: 4 });
+        assert_eq!(app.health_scroll(), 4);
+        app.reduce(Msg::HealthScroll(-1));
+        assert_eq!(app.health_scroll(), 3);
+    }
+
+    #[test]
+    fn choosing_a_triage_action_shows_it_and_emits_nothing() {
+        let mut app = App::new();
+        let action = TriageAction::Claim { id: "ra-1".into() };
+
+        assert_eq!(app.reduce(Msg::ChooseTriage(action.clone())), vec![]);
+        assert_eq!(app.pending_triage(), Some(&action));
+        assert_eq!(app.input_context(), InputContext::TriageConfirm);
+    }
+
+    #[test]
+    fn confirm_emits_exactly_the_pending_claim() {
+        let mut app = App::new();
+        let action = TriageAction::Claim { id: "ra-1".into() };
+        assert_eq!(app.reduce(Msg::ChooseTriage(action.clone())), vec![]);
+
+        assert_eq!(app.reduce(Msg::ConfirmTriage), vec![Effect::Triage(action)]);
+        assert_eq!(app.pending_triage(), None);
+        assert_eq!(app.reduce(Msg::ConfirmTriage), vec![]);
+    }
+
+    #[test]
+    fn confirm_emits_exactly_the_pending_close() {
+        let mut app = App::new();
+        let action = TriageAction::Close { id: "mc-2".into() };
+        assert_eq!(app.reduce(Msg::ChooseTriage(action.clone())), vec![]);
+
+        assert_eq!(app.reduce(Msg::ConfirmTriage), vec![Effect::Triage(action)]);
+        assert_eq!(app.pending_triage(), None);
+    }
+
+    #[test]
+    fn confirm_emits_exactly_the_pending_priority_change() {
+        let mut app = App::new();
+        let action = TriageAction::SetPriority {
+            id: "st-3".into(),
+            priority: 0,
+        };
+        assert_eq!(app.reduce(Msg::ChooseTriage(action.clone())), vec![]);
+
+        assert_eq!(app.reduce(Msg::ConfirmTriage), vec![Effect::Triage(action)]);
+        assert_eq!(app.pending_triage(), None);
+    }
+
+    #[test]
+    fn a_later_choice_replaces_the_pending_action_without_emitting() {
+        let mut app = App::new();
+        let first = TriageAction::Claim { id: "ra-1".into() };
+        let second = TriageAction::Close { id: "ra-1".into() };
+
+        assert_eq!(app.reduce(Msg::ChooseTriage(first)), vec![]);
+        assert_eq!(app.reduce(Msg::ChooseTriage(second.clone())), vec![]);
+        assert_eq!(app.pending_triage(), Some(&second));
+        assert_eq!(app.reduce(Msg::ConfirmTriage), vec![Effect::Triage(second)]);
+    }
+
+    #[test]
+    fn cancel_clears_the_pending_triage_action_with_no_effect() {
+        let mut app = App::new();
+        app.reduce(Msg::ChooseTriage(TriageAction::Claim { id: "ra-1".into() }));
+
+        assert_eq!(app.reduce(Msg::CancelTriage), vec![]);
+        assert_eq!(app.pending_triage(), None);
+        assert_eq!(app.input_context(), InputContext::Normal);
+        assert_eq!(app.reduce(Msg::ConfirmTriage), vec![]);
+        assert_eq!(app.reduce(Msg::CancelTriage), vec![]);
+    }
+
+    #[test]
+    fn back_dismisses_pending_triage_without_an_effect_or_leaving_detail() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        app.reduce(Msg::OpenDetail);
+        app.reduce(Msg::ChooseTriage(TriageAction::SetPriority {
+            id: "ra-1".into(),
+            priority: 2,
+        }));
+        assert_eq!(app.view_mode(), ViewMode::Detail);
+        assert_eq!(app.input_context(), InputContext::TriageConfirm);
+
+        assert_eq!(app.reduce(Msg::Back), vec![]);
+        assert_eq!(app.pending_triage(), None);
+        assert_eq!(app.view_mode(), ViewMode::Detail);
+        assert_eq!(app.reduce(Msg::ConfirmTriage), vec![]);
     }
 }

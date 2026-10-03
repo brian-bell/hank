@@ -10,6 +10,7 @@
 //! displayed row at a time) with a `▸ <repo>` header emitted whenever the repo
 //! changes from the previous row.
 
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 use ratatui::Frame;
@@ -18,7 +19,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 
-use super::{App, DetailState, Row, SearchPhase, ViewMode};
+use super::{App, DetailState, DoctorState, RepoHealth, Row, SearchPhase, ViewMode};
 use crate::cli::{format_row_body, sanitize};
 
 /// Shown when the roster has no rows at all (no repos configured / nothing
@@ -33,11 +34,14 @@ const NO_MATCH_HINT: &str = "no issues match the current filters — press f/p t
 /// the UI never promises an inert command; `enter detail` is live as of Slice 10
 /// and `/ search` as of Slice 11.
 const LIST_HINTS: &str =
-    "hank · q quit · r refresh · / search · f repos · p prio · j/k move · enter detail";
+    "hank · q quit · r refresh · / search · f repos · p prio · j/k move · enter detail · h health";
 
 /// One-line key hints for the detail pane: `j`/`k` move through beads, while
 /// `J`/`K` and PageUp/PageDown scroll the pane.
 const DETAIL_HINTS: &str = "hank · esc back · j/k move · J/K scroll · PgUp/PgDn page · q quit";
+
+/// One-line key hints while the sync-health panel is open.
+const HEALTH_HINTS: &str = "hank health · j/k scroll · r refresh · esc/h close · q quit";
 
 /// One-line key hints while editing the search query: the keys that act there.
 const SEARCH_EDIT_HINTS: &str = "hank search · type query · enter run · esc cancel";
@@ -64,17 +68,23 @@ pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) -> Option<u16> {
         ])
         .split(frame.area());
 
-    let hints = match app.view_mode() {
-        ViewMode::Detail => DETAIL_HINTS,
-        // Match the hint to the phase's real key routing: editing keys type the
-        // query and Enter runs it; results enable j/k + Enter (open) + Esc (edit);
-        // while loading or after an error only Esc (edit) and q act.
-        ViewMode::Search => match app.search_phase() {
-            Some(SearchPhase::Editing) => SEARCH_EDIT_HINTS,
-            Some(SearchPhase::Results) => SEARCH_RESULTS_HINTS,
-            _ => SEARCH_WAIT_HINTS,
-        },
-        ViewMode::List | ViewMode::Loading => LIST_HINTS,
+    let hints = if let Some(action) = app.pending_triage() {
+        format!("confirm {}? · enter confirm · esc cancel", action.label())
+    } else {
+        match app.view_mode() {
+            _ if app.health_open() => HEALTH_HINTS,
+            ViewMode::Detail => DETAIL_HINTS,
+            // Match the hint to the phase's real key routing: editing keys type the
+            // query and Enter runs it; results enable j/k + Enter (open) + Esc (edit);
+            // while loading or after an error only Esc (edit) and q act.
+            ViewMode::Search => match app.search_phase() {
+                Some(SearchPhase::Editing) => SEARCH_EDIT_HINTS,
+                Some(SearchPhase::Results) => SEARCH_RESULTS_HINTS,
+                _ => SEARCH_WAIT_HINTS,
+            },
+            ViewMode::List | ViewMode::Loading => LIST_HINTS,
+        }
+        .to_string()
     };
     frame.render_widget(Paragraph::new(hints), chunks[0]);
     let detail_max_scroll = match app.view_mode() {
@@ -100,7 +110,92 @@ pub fn draw(frame: &mut Frame, app: &App, now: SystemTime) -> Option<u16> {
     if app.repo_picker_open() {
         draw_repo_picker(frame, app);
     }
+    if app.health_open() {
+        return Some(draw_health(frame, app, chunks[1], now));
+    }
     detail_max_scroll
+}
+
+/// Render the sync-health panel over the content area: each roster repo's
+/// freshness (stale repos flagged with why) and `hank doctor`'s findings.
+/// Returns the maximum scroll offset so the app can clamp the panel's scroll.
+fn draw_health(frame: &mut Frame, app: &App, area: Rect, now: SystemTime) -> u16 {
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Sync health")
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return 0;
+    }
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let mut lines = vec![Line::styled("Repos", bold)];
+    if app.repo_health().is_empty() {
+        lines.push(Line::from("  no refresh has synced the hub yet"));
+    }
+    for health in app.repo_health() {
+        lines.extend(health_lines(health, now));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled("Doctor", bold));
+    match app.health_doctor() {
+        Some(DoctorState::Done(output)) => lines.extend(
+            output
+                .lines()
+                .map(|line| Line::from(format!("  {}", sanitize(line)))),
+        ),
+        Some(DoctorState::Failed(message)) => {
+            lines.push(Line::from(format!("  {}", sanitize(message))));
+        }
+        Some(DoctorState::Running) | None => lines.push(Line::from("  running hank doctor…")),
+    }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let content = paragraph.line_count(inner.width) as u16;
+    let max_scroll = content.saturating_sub(inner.height);
+    let offset = app.health_scroll().min(max_scroll);
+    frame.render_widget(paragraph.scroll((offset, 0)), inner);
+    max_scroll
+}
+
+/// One repo's health-panel lines: a `✓`/`⚠` mark, its name, and how fresh the
+/// hub's copy is, then (for a stale repo) why its latest refresh failed.
+fn health_lines(health: &RepoHealth, now: SystemTime) -> Vec<Line<'static>> {
+    let name = health
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| health.path.display().to_string());
+    let name = match &health.prefix {
+        Some(prefix) if *prefix != name => format!("{name} [{prefix}]"),
+        _ => name,
+    };
+    let synced = match health.synced_at {
+        Some(at) => format!("synced {}", format_age(now, at)),
+        None => "never synced".to_string(),
+    };
+    let path = sanitize(&health.path.display().to_string());
+    match &health.problem {
+        None => vec![Line::from(format!(
+            "  ✓ {}  {synced}  {path}",
+            sanitize(&name)
+        ))],
+        Some(problem) => vec![
+            Line::styled(
+                format!("  ⚠ {}  STALE · last {synced}  {path}", sanitize(&name)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::from(format!("      {}", sanitize(problem))),
+        ],
+    }
+}
+
+/// The repo ids (prefixes) whose latest refresh failed, for the list's flags.
+fn stale_repo_ids(app: &App) -> HashSet<&str> {
+    app.stale_repos()
+        .filter_map(|health| health.prefix.as_deref())
+        .collect()
 }
 
 /// Render the repository picker last so it overlays, rather than replaces, the
@@ -293,7 +388,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    draw_rows(frame, &rows, app.selection(), area);
+    draw_rows(frame, &rows, app.selection(), &stale_repo_ids(app), area);
 }
 
 /// Render the cross-repo search screen: a query input line, a status/count line,
@@ -345,7 +440,13 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
     if matches!(app.search_phase(), Some(SearchPhase::Results)) {
         let rows = app.filtered_rows();
         if !rows.is_empty() {
-            draw_rows(frame, &rows, app.selection(), parts[2]);
+            draw_rows(
+                frame,
+                &rows,
+                app.selection(),
+                &stale_repo_ids(app),
+                parts[2],
+            );
         } else if app.search_result_count() > 0 {
             // Results exist but the active repo/priority filter hides them all —
             // explain the filter (and how to clear it) instead of a blank pane.
@@ -358,9 +459,16 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
 /// Render a grouped, selectable, scrolling row list into `area`: a `▸ <repo>`
 /// header whenever the repo changes, `P<pri> <id> <title>` rows in the list's flat
 /// (selection) order, the selected row highlighted, and a sticky repo header when
-/// the viewport scrolls. Shared by the ready list and the search results so the
-/// two render identically.
-fn draw_rows(frame: &mut Frame, rows: &[&Row], selection: Option<usize>, area: Rect) {
+/// the viewport scrolls. A repo in `stale` (by repo id) gets a `⚠ stale` mark on
+/// its header: its latest refresh failed, so its rows may be out of date. Shared
+/// by the ready list and the search results so the two render identically.
+fn draw_rows(
+    frame: &mut Frame,
+    rows: &[&Row],
+    selection: Option<usize>,
+    stale: &HashSet<&str>,
+    area: Rect,
+) {
     let header_style = Style::default().add_modifier(Modifier::BOLD);
     let selected_style = Style::default().add_modifier(Modifier::REVERSED);
 
@@ -381,6 +489,9 @@ fn draw_rows(frame: &mut Frame, rows: &[&Row], selection: Option<usize>, area: R
     for (i, row) in rows.iter().enumerate() {
         if current_repo != Some(row.repo_name.as_str()) {
             header_text = format!("▸ {}", sanitize(&row.repo_name));
+            if row.repo_id.as_deref().is_some_and(|id| stale.contains(id)) {
+                header_text.push_str("  ⚠ stale (h for details)");
+            }
             lines.push(Line::styled(header_text.clone(), header_style));
             line_header.push(header_text.clone());
             current_repo = Some(row.repo_name.as_str());
@@ -457,6 +568,15 @@ fn status_line(app: &App, now: SystemTime) -> String {
     if app.is_watching() {
         status.push_str(" · live");
     }
+    // Repos whose latest refresh failed show older data; flag them ahead of
+    // the warnings so the count is never clipped.
+    let stale = app.stale_repos().count();
+    if stale > 0 {
+        status.push_str(&format!(
+            " · ⚠ {stale} stale repo{} (h)",
+            if stale == 1 { "" } else { "s" }
+        ));
+    }
     // A recent copy confirmation, ahead of any warnings so it is not clipped.
     if let Some(flash) = app.copy_flash() {
         status.push_str(&format!(" · copied: {}", sanitize(flash)));
@@ -505,7 +625,7 @@ fn format_age(now: SystemTime, fetched: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Msg, RepoFilter};
+    use crate::app::{Msg, RepoFilter, TriageAction};
     use crate::bd::Issue;
     use crate::snapshot::{Row, Snapshot};
     use ratatui::Terminal;
@@ -1241,6 +1361,24 @@ DESIGN
     }
 
     #[test]
+    fn pending_triage_action_is_shown_in_place_of_the_mode_hints() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1, "t")], vec![]);
+        assert_eq!(
+            app.reduce(Msg::ChooseTriage(TriageAction::Claim { id: "ra-1".into() })),
+            vec![]
+        );
+        let title = line_text(&render_sized(&app, at(1000), W, H), 0);
+        assert!(
+            title.contains("confirm claim ra-1?"),
+            "the chosen action is shown: {title:?}"
+        );
+        assert!(
+            title.contains("esc cancel"),
+            "cancel stays visible with the action: {title:?}"
+        );
+    }
+
+    #[test]
     fn key_hints_are_mode_aware() {
         let list = app_with(vec![row("ra", "ra-1", 1, "t")], vec![]);
         let (w, h) = (80, 24);
@@ -1461,5 +1599,89 @@ DESIGN
         assert_eq!(format_age(at(1_432_000), base), "5d ago");
         // Clock skew: now precedes fetched -> saturates, never negative.
         assert_eq!(format_age(base, at(1_000_100)), "just now");
+    }
+
+    /// Report one synced cycle at `at(secs)` in which `failed` (a repo id) failed
+    /// and every other listed repo exported cleanly.
+    fn sync_cycle(app: &mut App, secs: u64, repos: &[&str], failed: Option<&str>) {
+        use crate::app::{RepoSync, RepoSyncOutcome};
+        app.reduce(Msg::RepoSyncs {
+            synced_at: at(secs),
+            repos: repos
+                .iter()
+                .map(|id| RepoSync {
+                    path: std::path::PathBuf::from(format!("/dev/{id}")),
+                    prefix: Some(id.to_string()),
+                    outcome: if failed == Some(*id) {
+                        RepoSyncOutcome::Failed(format!("export failed for /dev/{id}: boom"))
+                    } else {
+                        RepoSyncOutcome::Exported
+                    },
+                })
+                .collect(),
+        });
+    }
+
+    #[test]
+    fn stale_repo_is_flagged_in_the_status_bar_and_its_list_header() {
+        let mut app = app_with(
+            vec![row("repo-a", "ra-1", 1, "a"), row("repo-b", "rb-1", 2, "b")],
+            Vec::new(),
+        );
+        sync_cycle(&mut app, 1000, &["repo-a", "repo-b"], None);
+        let buf = render(&app, at(1000));
+        assert!(
+            find_line(&buf, "stale").is_none(),
+            "nothing is flagged while every repo is fresh"
+        );
+
+        sync_cycle(&mut app, 1600, &["repo-a", "repo-b"], Some("repo-b"));
+        let buf = render(&app, at(1600));
+        let header = find_line(&buf, "▸ repo-b").expect("repo-b header");
+        assert!(
+            line_text(&buf, header).contains("⚠ stale"),
+            "the failing repo's header is flagged: {}",
+            line_text(&buf, header)
+        );
+        let fresh = find_line(&buf, "▸ repo-a").expect("repo-a header");
+        assert!(!line_text(&buf, fresh).contains("stale"));
+        let status = line_text(&buf, H - 1);
+        assert!(
+            status.contains("⚠ 1 stale repo (h)"),
+            "status bar counts stale repos: {status}"
+        );
+    }
+
+    #[test]
+    fn health_panel_shows_freshness_problems_and_doctor_output() {
+        let mut app = app_with(vec![row("repo-a", "ra-1", 1, "a")], Vec::new());
+        sync_cycle(&mut app, 1000, &["repo-a", "repo-b"], None);
+        sync_cycle(&mut app, 1600, &["repo-a", "repo-b"], Some("repo-b"));
+        let effects = app.reduce(Msg::ToggleHealth);
+        assert_eq!(effects, vec![crate::app::Effect::CheckHealth { token: 1 }]);
+
+        let buf = render(&app, at(1600));
+        assert!(line_text(&buf, 0).contains("esc/h close"), "health hints");
+        let a = find_line(&buf, "✓ repo-a").expect("fresh repo line");
+        assert!(line_text(&buf, a).contains("synced just now"));
+        let b = find_line(&buf, "⚠ repo-b").expect("stale repo line");
+        assert!(
+            line_text(&buf, b).contains("STALE · last synced 10m ago"),
+            "stale repo shows its last clean sync: {}",
+            line_text(&buf, b)
+        );
+        assert!(
+            line_text(&buf, b + 1).contains("boom"),
+            "and why its refresh failed"
+        );
+        assert!(find_line(&buf, "running hank doctor").is_some());
+
+        app.reduce(Msg::HealthReport {
+            token: 1,
+            report: Ok("bd version: 1.3.1 (schema 1)  gate: OK\n".into()),
+        });
+        let buf = render(&app, at(1600));
+        assert!(find_line(&buf, "gate: OK").is_some(), "doctor output shown");
+        assert!(find_line(&buf, "running hank doctor").is_none());
     }
 }

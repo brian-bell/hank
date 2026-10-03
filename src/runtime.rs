@@ -23,10 +23,10 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::{App, Effect, Msg, RefreshScope, context, keys, view};
+use crate::app::{App, Effect, Msg, RefreshScope, RepoSync, RepoSyncOutcome, context, keys, view};
 use crate::bd::{BdCli, BdClient, RepoSyncReport};
 use crate::cache;
-use crate::cli::{CliError, load_roster, sanitize, version_gate};
+use crate::cli::{CliError, load_roster, run_doctor, sanitize, version_gate};
 use crate::config::{Config, Paths};
 use crate::hub::{ReconcileWitness, ensure_hub, hub_dir, reconcile_witness};
 use crate::refresh::{self, AttributionGeneration, HubGenerationToken, RefreshError};
@@ -370,12 +370,17 @@ fn execute_effect(
             });
             return;
         }
+        Effect::CheckHealth { token } => spawn_health(tx, paths, token),
         Effect::PersistRepoView(repo) => {
             let result = ui_state::save(paths.ui_state_file(), &repo)
                 .map_err(|error| sanitize(&format!("couldn't save repository view: {error}")));
             let _ = tx.send(Msg::RepoViewPersisted { repo, result }.into());
             return;
         }
+        // The reducer has already committed to this action. Executing claim,
+        // close, or priority belongs to the BdClient slice; doing it here
+        // would write issue data before that slice exists.
+        Effect::Triage(_) => return,
     };
     worker_handles.push(handle);
 }
@@ -517,8 +522,16 @@ fn refresh_worker_with_state(
         RefreshScope::Repos(repos) => Some(repos.into_iter().collect::<HashSet<_>>()),
     };
     let mut metrics = PipelineMetrics::default();
-    let (verified, warnings) =
-        gather_verified_snapshot(bd, &roster, &paths, &state, only.as_ref(), &mut metrics);
+    let mut syncs = None;
+    let (verified, warnings) = gather_verified_snapshot(
+        bd,
+        &roster,
+        &paths,
+        &state,
+        only.as_ref(),
+        &mut metrics,
+        &mut syncs,
+    );
     let snapshot = verified.map(|(snapshot, hub_token)| {
         // Cache only while the hub this snapshot was read from is still current:
         // a `hank reset` (or a newer refresh's hub) since the sync must win over
@@ -529,7 +542,58 @@ fn refresh_worker_with_state(
         });
         snapshot
     });
+    if let Some((synced_at, repos)) = syncs {
+        let _ = tx.send(Msg::RepoSyncs { synced_at, repos }.into());
+    }
     let _ = tx.send(Msg::RefreshCompleted { snapshot, warnings }.into());
+}
+
+/// Each repo's part in a synced refresh, as the app's [`RepoSync`]: a missing
+/// roster path or the repo's first error (sanitized, with a count of the rest)
+/// is a failure; otherwise it exported cleanly or was carried over.
+fn repo_syncs(repos: &[refresh::RepoRefresh]) -> Vec<RepoSync> {
+    repos
+        .iter()
+        .map(|repo| {
+            let outcome = if !repo.path.exists() {
+                RepoSyncOutcome::Failed("repo path is missing".to_string())
+            } else if let Some(first) = repo.errors.first() {
+                let mut message = sanitize(&first.to_string());
+                if repo.errors.len() > 1 {
+                    message.push_str(&format!(" (+{} more)", repo.errors.len() - 1));
+                }
+                RepoSyncOutcome::Failed(message)
+            } else if repo.carried {
+                RepoSyncOutcome::Carried
+            } else {
+                RepoSyncOutcome::Exported
+            };
+            RepoSync {
+                path: repo.path.clone(),
+                prefix: repo.prefix.clone(),
+                outcome,
+            }
+        })
+        .collect()
+}
+
+/// Spawn the health panel's `hank doctor` run, reporting over `tx`.
+fn spawn_health(tx: &Sender<Incoming>, paths: &Paths, token: u64) -> thread::JoinHandle<()> {
+    let tx = tx.clone();
+    let paths = paths.clone();
+    thread::spawn(move || health_worker(&BdCli::new(), &paths, &tx, token))
+}
+
+/// Run `hank doctor` into a buffer and send its output back for the health
+/// panel. Doctor itself tolerates a missing bd or a broken roster, so only an
+/// output failure reaches the panel as an error.
+fn health_worker(bd: &impl BdClient, paths: &Paths, tx: &Sender<Incoming>, token: u64) {
+    let mut out = Vec::new();
+    let report = match run_doctor(bd, paths, &mut out) {
+        Ok(()) => Ok(String::from_utf8_lossy(&out).into_owned()),
+        Err(error) => Err(sanitize(&format!("hank doctor failed: {error}"))),
+    };
+    let _ = tx.send(Msg::HealthReport { token, report }.into());
 }
 
 /// Spawn a background detail worker that reports over `tx`, returning its join
@@ -761,13 +825,15 @@ fn gather_snapshot_with_metrics(
     only: Option<&HashSet<PathBuf>>,
     metrics: &mut PipelineMetrics,
 ) -> (Option<Snapshot>, Vec<String>) {
-    let (verified, warnings) = gather_verified_snapshot(bd, roster, paths, state, only, metrics);
+    let (verified, warnings) =
+        gather_verified_snapshot(bd, roster, paths, state, only, metrics, &mut None);
     (verified.map(|(snapshot, _)| snapshot), warnings)
 }
 
 /// [`gather_snapshot_with_metrics`], also returning the hub generation token
 /// the snapshot was read under, so a caller can tell whether that hub is still
-/// current before persisting the snapshot.
+/// current before persisting the snapshot. Once the hub sync succeeds, `syncs`
+/// receives its time and each repo's part in it (see [`Msg::RepoSyncs`]).
 fn gather_verified_snapshot(
     bd: &impl BdClient,
     roster: &Config,
@@ -775,6 +841,7 @@ fn gather_verified_snapshot(
     state: &RuntimeRefreshState,
     only: Option<&HashSet<PathBuf>>,
     metrics: &mut PipelineMetrics,
+    syncs: &mut Option<(SystemTime, Vec<RepoSync>)>,
 ) -> (Option<(Snapshot, HubGenerationToken)>, Vec<String>) {
     let total_started = std::time::Instant::now();
     let mut warnings = Vec::new();
@@ -832,6 +899,10 @@ fn gather_verified_snapshot(
                     snapshot::UNKNOWN_REPO,
                 )));
             }
+            *syncs = Some((
+                synced.outcome().synced_at,
+                repo_syncs(&synced.outcome().repos),
+            ));
             synced
         }
         // Another hank holds the lock: keep the current view intact rather than
@@ -1007,8 +1078,19 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     /// Receive the next app message a worker sent, unwrapping the [`Incoming`]
-    /// channel envelope (workers only ever send `Incoming::Msg`).
+    /// channel envelope (workers only ever send `Incoming::Msg`). Skips the
+    /// per-repo [`Msg::RepoSyncs`] report a synced refresh sends ahead of its
+    /// completion; [`recv_any`] sees it.
     fn recv_msg(rx: &Receiver<Incoming>) -> Msg {
+        loop {
+            match recv_any(rx) {
+                Msg::RepoSyncs { .. } => continue,
+                msg => return msg,
+            }
+        }
+    }
+
+    fn recv_any(rx: &Receiver<Incoming>) -> Msg {
         match rx.recv().expect("a worker message") {
             Incoming::Msg(msg) => msg,
             Incoming::AttributedMsg { msg, .. } => msg,
@@ -1552,6 +1634,88 @@ mod tests {
             !cache_file.exists(),
             "a refresh that read the pre-reset hub must not write the cache after reset cleared it"
         );
+    }
+
+    #[test]
+    fn a_synced_refresh_reports_each_repo_before_completing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let rb = seed_repo(tmp.path(), "rb", "rb");
+        let missing = tmp.path().join("gone");
+        let bd = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "t")])
+            .with_export_err(&rb, bd_err());
+        let cfg = roster(&[&ra, &rb, &missing]);
+        let (tx, rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || refresh_worker(bd, cfg, paths, tx));
+        assert_eq!(recv_any(&rx), Msg::RefreshStarted);
+        let repos = match recv_any(&rx) {
+            Msg::RepoSyncs { repos, .. } => repos,
+            other => panic!("expected RepoSyncs before the completion, got {other:?}"),
+        };
+        assert!(matches!(recv_any(&rx), Msg::RefreshCompleted { .. }));
+        handle.join().unwrap();
+
+        let outcome = |path: &Path| {
+            repos
+                .iter()
+                .find(|repo| repo.path == path)
+                .map(|repo| repo.outcome.clone())
+                .unwrap_or_else(|| panic!("{} reported: {repos:?}", path.display()))
+        };
+        assert_eq!(outcome(ra.as_path()), RepoSyncOutcome::Exported);
+        match outcome(rb.as_path()) {
+            RepoSyncOutcome::Failed(message) => {
+                assert!(message.contains("export failed"), "{message}");
+                assert!(!message.chars().any(char::is_control), "sanitized");
+            }
+            other => panic!("rb's export failed, got {other:?}"),
+        }
+        assert_eq!(
+            outcome(missing.as_path()),
+            RepoSyncOutcome::Failed("repo path is missing".into())
+        );
+        assert_eq!(
+            repos.iter().find(|repo| repo.path == ra).unwrap().prefix,
+            Some("ra".into())
+        );
+    }
+
+    #[test]
+    fn a_failed_sync_sends_no_repo_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let bd = FakeBdClient::new().with_repo_sync_err(bd_err());
+        let cfg = roster(&[&ra]);
+        let (tx, rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || refresh_worker(bd, cfg, paths, tx));
+        assert_eq!(recv_any(&rx), Msg::RefreshStarted);
+        assert!(matches!(
+            recv_any(&rx),
+            Msg::RefreshCompleted { snapshot: None, .. }
+        ));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn health_worker_sends_doctor_output_for_its_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let (tx, rx) = mpsc::channel();
+
+        health_worker(&FakeBdClient::new(), &paths, &tx, 7);
+
+        match recv_any(&rx) {
+            Msg::HealthReport {
+                token: 7,
+                report: Ok(output),
+            } => assert!(output.contains("bd version"), "{output}"),
+            other => panic!("expected the doctor report, got {other:?}"),
+        }
     }
 
     #[test]

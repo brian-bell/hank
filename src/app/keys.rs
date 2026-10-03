@@ -6,6 +6,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use super::{InputContext, Msg};
 
+/// Rows PageDown/PageUp scroll the health panel.
+const HEALTH_PAGE_ROWS: i16 = 10;
+
 /// Decode a crossterm key event into a [`Msg`], or `None` for an unmapped key or
 /// a key-release event (so a press+release fires a single message).
 ///
@@ -19,6 +22,14 @@ pub fn map_key(event: KeyEvent, context: InputContext) -> Option<Msg> {
     // terminals without the kitty keyboard protocol crossterm reports `Press`.
     if event.kind == KeyEventKind::Release {
         return None;
+    }
+    if context == InputContext::TriageConfirm {
+        return match event.code {
+            KeyCode::Enter => Some(Msg::ConfirmTriage),
+            KeyCode::Esc => Some(Msg::CancelTriage),
+            KeyCode::Char('q') => Some(Msg::Quit),
+            _ => None,
+        };
     }
     if context == InputContext::SearchEditing {
         return match event.code {
@@ -39,9 +50,23 @@ pub fn map_key(event: KeyEvent, context: InputContext) -> Option<Msg> {
             _ => None,
         };
     }
+    if context == InputContext::Health {
+        return match event.code {
+            KeyCode::Char('q') => Some(Msg::Quit),
+            KeyCode::Char('r') => Some(Msg::Refresh),
+            KeyCode::Char('h') => Some(Msg::ToggleHealth),
+            KeyCode::Char('j' | 'J') | KeyCode::Down => Some(Msg::HealthScroll(1)),
+            KeyCode::Char('k' | 'K') | KeyCode::Up => Some(Msg::HealthScroll(-1)),
+            KeyCode::PageDown => Some(Msg::HealthScroll(HEALTH_PAGE_ROWS)),
+            KeyCode::PageUp => Some(Msg::HealthScroll(-HEALTH_PAGE_ROWS)),
+            KeyCode::Esc => Some(Msg::Back),
+            _ => None,
+        };
+    }
     match event.code {
         KeyCode::Char('q') => Some(Msg::Quit),
         KeyCode::Char('/') => Some(Msg::OpenSearch),
+        KeyCode::Char('h') => Some(Msg::ToggleHealth),
         KeyCode::Char('r') => Some(Msg::Refresh),
         KeyCode::Char('y') => Some(Msg::CopyContext),
         KeyCode::Char('Y') => Some(Msg::CopyMarkdown),
@@ -145,6 +170,35 @@ mod tests {
     }
 
     #[test]
+    fn h_opens_the_health_panel_and_its_keys_scroll_and_close_it() {
+        assert_eq!(
+            map_key(press(KeyCode::Char('h')), InputContext::Normal),
+            Some(Msg::ToggleHealth)
+        );
+        let health = |code| map_key(press(code), InputContext::Health);
+        assert_eq!(health(KeyCode::Char('h')), Some(Msg::ToggleHealth));
+        assert_eq!(health(KeyCode::Esc), Some(Msg::Back));
+        assert_eq!(health(KeyCode::Char('j')), Some(Msg::HealthScroll(1)));
+        assert_eq!(health(KeyCode::Up), Some(Msg::HealthScroll(-1)));
+        assert_eq!(
+            health(KeyCode::PageDown),
+            Some(Msg::HealthScroll(HEALTH_PAGE_ROWS))
+        );
+        assert_eq!(health(KeyCode::Char('r')), Some(Msg::Refresh));
+        assert_eq!(health(KeyCode::Char('q')), Some(Msg::Quit));
+        assert_eq!(
+            health(KeyCode::Enter),
+            None,
+            "list commands are inert under the panel"
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('h')), InputContext::SearchEditing),
+            Some(Msg::SearchInput('h')),
+            "h types into a search query"
+        );
+    }
+
+    #[test]
     fn maps_filter_keys() {
         assert_eq!(
             map_key(press(KeyCode::Char('f')), InputContext::Normal),
@@ -222,6 +276,24 @@ mod tests {
         assert_eq!(map_key(press(KeyCode::Char('r')), context), None);
         assert_eq!(map_key(press(KeyCode::Char('p')), context), None);
         assert_eq!(map_key(press(KeyCode::Char('/')), context), None);
+    }
+
+    #[test]
+    fn triage_confirm_context_only_confirms_cancels_or_quits() {
+        let context = InputContext::TriageConfirm;
+        assert_eq!(
+            map_key(press(KeyCode::Enter), context),
+            Some(Msg::ConfirmTriage)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Esc), context),
+            Some(Msg::CancelTriage)
+        );
+        assert_eq!(map_key(press(KeyCode::Char('q')), context), Some(Msg::Quit));
+        assert_eq!(map_key(press(KeyCode::Char('y')), context), None);
+        assert_eq!(map_key(press(KeyCode::Char('r')), context), None);
+        assert_eq!(map_key(press(KeyCode::Char('j')), context), None);
+        assert_eq!(map_key(press(KeyCode::Char('p')), context), None);
     }
 
     #[test]
