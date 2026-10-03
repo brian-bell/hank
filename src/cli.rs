@@ -1136,9 +1136,16 @@ mod tests {
     fn doctor_reports_journal_on_or_off_per_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
-        let on = seed_repo(tmp.path(), "ron", "ron");
-        let off = seed_repo(tmp.path(), "roff", "roff");
-        let broken = seed_repo(tmp.path(), "rbad", "rbad");
+        // `load_roster` stores canonical paths (`store_path`). On macOS a
+        // tempfile under `/var` prints and is queried as `/private/var`, so
+        // the fake's journal map and the line lookup must use that form too.
+        let on = seed_repo(tmp.path(), "ron", "ron").canonicalize().unwrap();
+        let off = seed_repo(tmp.path(), "roff", "roff")
+            .canonicalize()
+            .unwrap();
+        let broken = seed_repo(tmp.path(), "rbad", "rbad")
+            .canonicalize()
+            .unwrap();
         roster(&[&on, &off, &broken])
             .save(paths.config_file())
             .unwrap();
