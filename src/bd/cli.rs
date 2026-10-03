@@ -565,6 +565,40 @@ esac
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn search_drops_closed_row_from_search_fixture() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/search.json");
+        let fixture = fs::read_to_string(&fixture_path).expect("search.json reads");
+        let parsed: Vec<Issue> = serde_json::from_str(&fixture).expect("search.json parses");
+        assert!(
+            parsed
+                .iter()
+                .any(|issue| issue.id == "ra-9kq" && issue.status == "closed"),
+            "search.json must include closed issue ra-9kq"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let program = tmp.path().join("fake-bd");
+        // `$0` is the script path. The fixture is that path plus `.json`, so a
+        // quote in the checkout path never enters the script text.
+        fs::write(program.with_extension("json"), &fixture).unwrap();
+        fs::write(&program, "#!/bin/sh\ncat \"${0}.json\"\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let bd = BdCli {
+            program: program.to_string_lossy().into_owned(),
+        };
+        let issues = bd
+            .search(Path::new("/tmp/hub"), "task")
+            .expect("bd search --json parses");
+        let ids: Vec<&str> = issues.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(ids, ["ra-z70", "ra-shr", "ra-4zf"]);
+    }
+
     #[test]
     fn drop_closed_keeps_every_non_closed_status() {
         let issues: Vec<Issue> = serde_json::from_str(

@@ -14,6 +14,22 @@
     "comment_count": 0
   },
   {
+    "id": "ra-9kq",
+    "title": "Closed task",
+    "status": "closed",
+    "priority": 1,
+    "issue_type": "task",
+    "owner": "bellbm@gmail.com",
+    "created_at": "2026-07-11T12:41:27Z",
+    "created_by": "Brian Bell",
+    "updated_at": "2026-07-11T12:41:28Z",
+    "closed_at": "2026-07-11T12:41:28Z",
+    "close_reason": "Closed",
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
     "id": "ra-shr",
     "title": "Ready task one",
     "description": "First ready task with a description",
