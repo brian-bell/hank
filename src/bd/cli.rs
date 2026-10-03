@@ -583,8 +583,10 @@ esac
 
         let tmp = tempfile::tempdir().unwrap();
         let program = tmp.path().join("fake-bd");
-        let script = format!("#!/bin/sh\ncat '{}'\n", fixture_path.display());
-        fs::write(&program, script).unwrap();
+        // `$0` is the script path. The fixture is that path plus `.json`, so a
+        // quote in the checkout path never enters the script text.
+        fs::write(program.with_extension("json"), &fixture).unwrap();
+        fs::write(&program, "#!/bin/sh\ncat \"${0}.json\"\n").unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
 
         let bd = BdCli {
