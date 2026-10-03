@@ -2,15 +2,15 @@
 
 ## Project Overview
 
-**Hank (`hank`)** is a read-only Rust terminal UI (ratatui + crossterm)
+**Hank (`hank`)** is a Rust terminal UI (ratatui + crossterm)
 that federates N beads repositories into one persistent `bd` hub workspace and
 answers "what's ready to work on across all my repos?" It shows a cross-repo
 ready list with a detail pane, cross-repo search (`/`), repo/priority filters,
 a copy-context action (`y`/`Y` via OSC 52), and a sync-health panel (`h`:
-per-repo freshness, stale-repo flags, `hank doctor` output). Hank never writes issue data;
-its source-repo writes are `bd export` refreshing `.beads/issues.jsonl` and,
-with live refresh on (or `hank repos watch`/`unwatch`), `bd config set
-events-journal` in the repo's git-tracked `.beads/config.yaml`.
+per-repo freshness, stale-repo flags, `hank doctor` output). Refresh runs `bd export` to
+refresh each source repo's `.beads/issues.jsonl`. With live refresh on (or
+`hank repos watch`/`unwatch`), Hank runs `bd config set events-journal` to
+update the repo's git-tracked `.beads/config.yaml`.
 
 Requires `bd` >= 1.1.0 with `schema_version == 1` on `PATH` at runtime (gated
 at startup; constants in `src/cli.rs`). Rust edition 2024.

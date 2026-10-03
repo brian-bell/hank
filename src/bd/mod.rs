@@ -31,11 +31,23 @@ pub struct ShowDetail {
     pub issue: Issue,
 }
 
+/// One triage shell-out. Each variant is a whole `bd` command, so a claim
+/// cannot also close or change priority in the same invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteCommand {
+    Claim { id: String },
+    Close { id: String },
+    SetPriority { id: String, priority: i64 },
+}
+
 /// Everything hank asks of `bd`. All calls are blocking subprocess invocations in
 /// the real impl; the fake makes them synchronous and programmable for tests.
 ///
 /// `dir`/`hub`/`repo` are passed to `bd -C <dir>`; `hub` is hank's aggregation
 /// workspace, `repo`/`dir` a source beads repo.
+///
+/// [`WriteCommand`] is the triage write: [`BdClient::claim`], [`BdClient::close`],
+/// and [`BdClient::set_priority`] each run exactly one variant.
 pub trait BdClient: Sync {
     /// `bd version --json` — the startup gate.
     fn version(&self) -> Result<BdVersion, BdError>;
@@ -81,6 +93,12 @@ pub trait BdClient: Sync {
     fn show_issue(&self, hub: &Path, id: &str) -> Result<Issue, BdError>;
     /// `bd -C <hub> search <query> --json` — cross-repo full-text search.
     fn search(&self, hub: &Path, query: &str) -> Result<Vec<Issue>, BdError>;
+    /// `bd -C <repo> update <id> --claim` — atomically claim the issue.
+    fn claim(&self, repo: &Path, id: &str) -> Result<(), BdError>;
+    /// `bd -C <repo> close <id>` — close the issue.
+    fn close(&self, repo: &Path, id: &str) -> Result<(), BdError>;
+    /// `bd -C <repo> update <id> --priority <priority>` — set the issue priority.
+    fn set_priority(&self, repo: &Path, id: &str, priority: i64) -> Result<(), BdError>;
 }
 
 /// The most stderr we retain/show from a failed `bd` call.
@@ -88,7 +106,7 @@ const STDERR_LIMIT: usize = 2000;
 
 /// A failed `bd` invocation, carrying the command line and captured stderr for
 /// display, plus a machine-inspectable [`BdErrorKind`].
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub struct BdError {
     /// Human-readable command line, e.g. `bd -C <hub> ready --json`.
     pub command: String,
