@@ -6,6 +6,7 @@
 that federates N beads repositories into one persistent `bd` hub workspace and
 answers "what's ready to work on across all my repos?" It shows a cross-repo
 ready list with a detail pane, cross-repo search (`/`), repo/priority filters,
+a status switch (`s`: ready/open/in_progress/blocked, also `hank snapshot --status`),
 a copy-context action (`y`/`Y` via OSC 52), and a sync-health panel (`h`:
 per-repo freshness, stale-repo flags, `hank doctor` output). Refresh runs `bd export` to
 refresh each source repo's `.beads/issues.jsonl`. With live refresh on (or

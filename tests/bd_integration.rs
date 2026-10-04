@@ -16,6 +16,7 @@ use hank::bd::{BdCli, BdClient, RepoSyncReport};
 use hank::cli::{load_roster, run_repos_add, run_repos_remove, run_repos_watch, run_snapshot};
 use hank::config::{Config, Paths, RepoEntry};
 use hank::hub::{ensure_hub, hub_dir, read_hub_roster};
+use hank::snapshot::StatusFilter;
 use hank::watch::{BdJournal, Checkpoints, WatchList, Watcher};
 use hank::{refresh, snapshot};
 use helpers::{
@@ -320,8 +321,16 @@ fn snapshot_command_end_to_end() {
     // CLI runner and the real BdCli.
     let mut out = Vec::new();
     let mut err = Vec::new();
-    run_snapshot(&roster, &BdCli::new(), &paths, false, &mut out, &mut err)
-        .expect("run_snapshot succeeds against real fixture repos");
+    run_snapshot(
+        &roster,
+        &BdCli::new(),
+        &paths,
+        StatusFilter::Ready,
+        false,
+        &mut out,
+        &mut err,
+    )
+    .expect("run_snapshot succeeds against real fixture repos");
 
     let stdout = String::from_utf8(out).expect("utf8 stdout");
     // Both repos' ready issues appear, attributed by directory basename, with the
@@ -367,6 +376,7 @@ fn repos_remove_prunes_the_hub_end_to_end() {
         &roster,
         &BdCli::new(),
         &paths,
+        StatusFilter::Ready,
         false,
         &mut Vec::new(),
         &mut Vec::new(),
@@ -405,6 +415,7 @@ fn repos_remove_prunes_the_hub_end_to_end() {
         &roster,
         &BdCli::new(),
         &paths,
+        StatusFilter::Ready,
         false,
         &mut stdout,
         &mut Vec::new(),
@@ -718,4 +729,72 @@ fn repos_watch_and_unwatch_round_trip_end_to_end() {
     build_ready_fixture_repo_with_prefix(&stranger, "rs");
     assert!(run_repos_watch(&bd, &paths, Some(stranger.as_path()), true, &mut Vec::new()).is_err());
     assert!(!bd.events_journal_enabled(&stranger).expect("read stranger"));
+}
+
+#[test]
+fn snapshot_status_reads_each_list_from_the_hub() {
+    if !bd_available() {
+        eprintln!("SKIP: bd not installed");
+        return;
+    }
+
+    // The fixture has a ready task, a blocker, and a task blocked by that
+    // blocker through a dependency (its own status stays open). Add a claimed
+    // task and one whose status is set to blocked.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ra = tmp.path().join("ra");
+    std::fs::create_dir_all(&ra).expect("mkdir ra");
+    build_ready_fixture_repo(&ra);
+    let claimed = created_id(&bd_in(&ra, &["create", "Claimed task", "--json"]));
+    bd_in(&ra, &["update", &claimed, "--status", "in_progress"]);
+    let flagged = created_id(&bd_in(&ra, &["create", "Flagged task", "--json"]));
+    bd_in(&ra, &["update", &flagged, "--status", "blocked"]);
+
+    let paths = Paths::with_base(tmp.path());
+    let roster = Config {
+        watch: false,
+        repos: vec![RepoEntry::new(ra.clone())],
+    };
+    let titles = |status: StatusFilter| -> Vec<String> {
+        let mut out = Vec::new();
+        run_snapshot(
+            &roster,
+            &BdCli::new(),
+            &paths,
+            status,
+            false,
+            &mut out,
+            &mut Vec::new(),
+        )
+        .expect("snapshot succeeds");
+        let mut titles: Vec<String> = String::from_utf8(out)
+            .expect("utf8")
+            .lines()
+            .map(|line| line.rsplit_once(" ra-").expect("row line").1.to_string())
+            .map(|rest| rest.split_once(' ').expect("id then title").1.to_string())
+            .collect();
+        titles.sort();
+        titles
+    };
+
+    let ready = titles(StatusFilter::Ready);
+    assert!(ready.contains(&"Ready task one".to_string()), "{ready:?}");
+    assert!(!ready.contains(&"Blocked task".to_string()), "{ready:?}");
+
+    assert_eq!(
+        titles(StatusFilter::Open),
+        ["Blocked task", "Blocker task", "Ready task one"]
+    );
+    assert_eq!(titles(StatusFilter::InProgress), ["Claimed task"]);
+    assert_eq!(
+        titles(StatusFilter::Blocked),
+        ["Blocked task", "Flagged task"],
+        "bd blocked plus status blocked, each once"
+    );
+}
+
+/// The id from a `bd create --json` payload.
+fn created_id(json: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(json).expect("create --json");
+    value["id"].as_str().expect("id").to_string()
 }

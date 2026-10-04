@@ -180,6 +180,7 @@ fn baseline_iteration(fixture: &Fixture) -> PipelineMetrics {
         &hub_dir(&fixture.paths),
         &refresh::PrefixMap::from_pairs(pairs),
         SystemTime::now(),
+        snapshot::StatusFilter::Ready,
     )
     .expect("baseline ready");
     let ready = ready_started.elapsed();
@@ -228,6 +229,7 @@ fn optimized_iteration(
         &hub_dir(&fixture.paths),
         &synced.outcome().prefix_map,
         synced.outcome().synced_at,
+        snapshot::StatusFilter::Ready,
     )
     .expect("optimized ready");
     let ready = ready_started.elapsed();

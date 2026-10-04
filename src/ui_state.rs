@@ -6,8 +6,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::app::RepoFilter;
+use crate::app::{RepoFilter, UiState};
+use crate::snapshot::StatusFilter;
 
+/// The file version. `status` was added to version 2 as an optional key rather
+/// than a new version: an older hank ignores it and keeps the repository view.
 const VERSION: u64 = 2;
 
 #[derive(Deserialize, Serialize)]
@@ -15,6 +18,10 @@ struct UiStateFile {
     version: u64,
     #[serde(default)]
     repository: Option<StoredRepository>,
+    /// The ready list's status by name. Read as a string, so a value this
+    /// build doesn't know falls back to ready without losing the repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -34,8 +41,8 @@ enum StoredRepository {
     Unknown,
 }
 
-/// Atomically persist a confirmed repository view.
-pub fn save(path: &Path, repo: &RepoFilter) -> Result<()> {
+/// Atomically persist the confirmed repository view and status.
+pub fn save(path: &Path, state: &UiState) -> Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(parent) = parent {
         fs::create_dir_all(parent)
@@ -43,10 +50,14 @@ pub fn save(path: &Path, repo: &RepoFilter) -> Result<()> {
     }
     let state = UiStateFile {
         version: VERSION,
-        repository: match repo {
+        repository: match &state.repository {
             RepoFilter::All => None,
             RepoFilter::Only(prefix) => Some(StoredRepository::Prefix(prefix.clone())),
             RepoFilter::Unknown => Some(StoredRepository::Unknown),
+        },
+        status: match state.status {
+            StatusFilter::Ready => None,
+            status => Some(status.as_str().to_string()),
         },
     };
     let bytes = serde_json::to_vec_pretty(&state).context("serializing UI state")?;
@@ -66,38 +77,49 @@ pub fn save(path: &Path, repo: &RepoFilter) -> Result<()> {
     Ok(())
 }
 
-/// Load the last confirmed repository view.
+/// Load the last confirmed repository view and status.
 ///
 /// UI state is a preference, never required launch data: any read, parse, or
-/// schema error safely falls back to `All`.
-pub fn load(path: &Path) -> RepoFilter {
+/// schema error safely falls back to all repos, and a missing or unknown
+/// status to ready.
+pub fn load(path: &Path) -> UiState {
     let Ok(bytes) = fs::read(path) else {
-        return RepoFilter::All;
+        return UiState::default();
     };
     let Ok(header) = serde_json::from_slice::<UiStateVersion>(&bytes) else {
-        return RepoFilter::All;
+        return UiState::default();
     };
     match header.version {
         1 => {
             let Ok(state) = serde_json::from_slice::<LegacyUiStateFile>(&bytes) else {
-                return RepoFilter::All;
+                return UiState::default();
             };
-            match state.repository {
+            let repository = match state.repository {
                 Some(prefix) if prefix != crate::snapshot::UNKNOWN_REPO => RepoFilter::Only(prefix),
                 _ => RepoFilter::All,
+            };
+            UiState {
+                repository,
+                ..UiState::default()
             }
         }
         VERSION => {
             let Ok(state) = serde_json::from_slice::<UiStateFile>(&bytes) else {
-                return RepoFilter::All;
+                return UiState::default();
             };
-            match state.repository {
-                Some(StoredRepository::Prefix(prefix)) => RepoFilter::Only(prefix),
-                Some(StoredRepository::Unknown) => RepoFilter::Unknown,
-                None => RepoFilter::All,
+            UiState {
+                repository: match state.repository {
+                    Some(StoredRepository::Prefix(prefix)) => RepoFilter::Only(prefix),
+                    Some(StoredRepository::Unknown) => RepoFilter::Unknown,
+                    None => RepoFilter::All,
+                },
+                status: state
+                    .status
+                    .and_then(|name| name.parse().ok())
+                    .unwrap_or_default(),
             }
         }
-        _ => RepoFilter::All,
+        _ => UiState::default(),
     }
 }
 
@@ -106,18 +128,25 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn repo(repository: RepoFilter) -> UiState {
+        UiState {
+            repository,
+            ..UiState::default()
+        }
+    }
+
     #[test]
     fn missing_corrupt_and_unsupported_state_load_all_repos() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("ui_state.json");
 
-        assert_eq!(load(&path), RepoFilter::All);
+        assert_eq!(load(&path), UiState::default());
 
         fs::write(&path, "{not json").unwrap();
-        assert_eq!(load(&path), RepoFilter::All);
+        assert_eq!(load(&path), UiState::default());
 
         fs::write(&path, r#"{"version":999,"repository":"repo-a"}"#).unwrap();
-        assert_eq!(load(&path), RepoFilter::All);
+        assert_eq!(load(&path), UiState::default());
     }
 
     #[test]
@@ -125,14 +154,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nested").join("ui_state.json");
 
-        save(&path, &RepoFilter::All).unwrap();
-        assert_eq!(load(&path), RepoFilter::All);
+        save(&path, &repo(RepoFilter::All)).unwrap();
+        assert_eq!(load(&path), repo(RepoFilter::All));
 
-        save(&path, &RepoFilter::Only("repo-a".into())).unwrap();
-        assert_eq!(load(&path), RepoFilter::Only("repo-a".into()));
+        save(&path, &repo(RepoFilter::Only("repo-a".into()))).unwrap();
+        assert_eq!(load(&path), repo(RepoFilter::Only("repo-a".into())));
 
-        save(&path, &RepoFilter::Unknown).unwrap();
-        assert_eq!(load(&path), RepoFilter::Unknown);
+        save(&path, &repo(RepoFilter::Unknown)).unwrap();
+        assert_eq!(load(&path), repo(RepoFilter::Unknown));
         assert_eq!(
             fs::read_dir(path.parent().unwrap())
                 .unwrap()
@@ -149,13 +178,46 @@ mod tests {
         let path = tmp.path().join("ui_state.json");
 
         fs::write(&path, r#"{"version":1,"repository":"repo-a"}"#).unwrap();
-        assert_eq!(load(&path), RepoFilter::Only("repo-a".into()));
+        assert_eq!(load(&path), repo(RepoFilter::Only("repo-a".into())));
 
         fs::write(&path, r#"{"version":1,"repository":"unknown"}"#).unwrap();
         assert_eq!(
             load(&path),
-            RepoFilter::All,
+            repo(RepoFilter::All),
             "legacy unknown could mean a real prefix or the unattributed bucket"
         );
+    }
+
+    #[test]
+    fn status_round_trips_beside_the_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ui_state.json");
+
+        for status in StatusFilter::ALL {
+            let state = UiState {
+                repository: RepoFilter::Only("repo-a".into()),
+                status,
+            };
+            save(&path, &state).unwrap();
+            assert_eq!(load(&path), state);
+        }
+    }
+
+    #[test]
+    fn missing_or_unknown_status_loads_as_ready_and_keeps_the_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ui_state.json");
+
+        // A file saved before the status filter existed.
+        fs::write(&path, r#"{"version":2,"repository":{"Prefix":"repo-a"}}"#).unwrap();
+        assert_eq!(load(&path), repo(RepoFilter::Only("repo-a".into())));
+
+        // A status from a newer hank.
+        fs::write(
+            &path,
+            r#"{"version":2,"repository":{"Prefix":"repo-a"},"status":"deferred"}"#,
+        )
+        .unwrap();
+        assert_eq!(load(&path), repo(RepoFilter::Only("repo-a".into())));
     }
 }

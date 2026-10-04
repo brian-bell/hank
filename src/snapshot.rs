@@ -43,34 +43,132 @@ pub struct Row {
     pub attribution_generation: Option<AttributionGeneration>,
 }
 
-/// Everything the ready screen needs: attributed, display-sorted rows plus the
+/// Which issues a list shows. `Ready` is `bd ready`; the others read every
+/// issue with that bd status, and `Blocked` adds the issues `bd blocked`
+/// reports as waiting on a dependency. Hank never decides readiness or
+/// blockage itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusFilter {
+    #[default]
+    Ready,
+    Open,
+    InProgress,
+    Blocked,
+}
+
+impl StatusFilter {
+    /// Every value, in the order the status key steps through them.
+    pub const ALL: [StatusFilter; 4] = [
+        StatusFilter::Ready,
+        StatusFilter::Open,
+        StatusFilter::InProgress,
+        StatusFilter::Blocked,
+    ];
+
+    /// The next value in [`StatusFilter::ALL`], wrapping to the first.
+    pub fn next(self) -> StatusFilter {
+        let at = StatusFilter::ALL
+            .iter()
+            .position(|status| *status == self)
+            .expect("ALL lists every status");
+        StatusFilter::ALL[(at + 1) % StatusFilter::ALL.len()]
+    }
+
+    /// The name used on the command line, in saved UI state, and on screen.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StatusFilter::Ready => "ready",
+            StatusFilter::Open => "open",
+            StatusFilter::InProgress => "in_progress",
+            StatusFilter::Blocked => "blocked",
+        }
+    }
+}
+
+impl std::fmt::Display for StatusFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for StatusFilter {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        StatusFilter::ALL
+            .into_iter()
+            .find(|status| status.as_str() == s)
+            .ok_or_else(|| {
+                let names: Vec<&str> = StatusFilter::ALL.iter().map(|s| s.as_str()).collect();
+                format!(
+                    "unknown status `{s}` (expected one of: {})",
+                    names.join(", ")
+                )
+            })
+    }
+}
+
+/// Everything the ready screen needs: attributed, display-sorted rows, the
 /// time the underlying data was fetched (injected, never read from a hidden
-/// clock — see the module/slice notes on determinism).
+/// clock — see the module/slice notes on determinism), and which issues the
+/// rows are. Snapshots written before the status filter existed were all
+/// `bd ready`, so a missing `status` reads as [`StatusFilter::Ready`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub rows: Vec<Row>,
     pub fetched_at: SystemTime,
+    #[serde(default)]
+    pub status: StatusFilter,
 }
 
-/// Fetch the hub's ready issues, attribute each to its source repo via
-/// `prefix_map`, and sort for display: priority ascending (0 = highest, first),
+/// Read the hub's issues for `status`. `Blocked` is the union of `bd blocked`
+/// and `bd list --status blocked`, keeping the first copy of an id both
+/// return.
+pub fn read_issues(
+    bd: &impl BdClient,
+    hub: &Path,
+    status: StatusFilter,
+) -> Result<Vec<Issue>, BdError> {
+    match status {
+        StatusFilter::Ready => bd.ready(hub),
+        StatusFilter::Open | StatusFilter::InProgress => bd.list_status(hub, status.as_str()),
+        StatusFilter::Blocked => {
+            let mut issues = bd.blocked(hub)?;
+            let mut seen: HashSet<String> = issues.iter().map(|i| i.id.clone()).collect();
+            issues.extend(
+                bd.list_status(hub, "blocked")?
+                    .into_iter()
+                    .filter(|issue| seen.insert(issue.id.clone())),
+            );
+            Ok(issues)
+        }
+    }
+}
+
+/// Fetch the hub's issues for `status` (see [`read_issues`]), attribute each
+/// to its source repo via `prefix_map`, and sort for display: priority ascending (0 = highest, first),
 /// then `dependent_count` descending (unblocks-the-most-work first, absent
 /// last), then `updated_at` descending (newest instant first, absent last), then id
 /// ascending (a total, deterministic order for the serialized output).
 ///
 /// `fetched_at` is supplied by the caller (typically `RefreshOutcome::synced_at`
-/// or a real `now`) so this stays a pure, deterministic transform of `bd ready`.
+/// or a real `now`) so this stays a pure, deterministic transform of bd's output.
 pub fn fetch(
     bd: &impl BdClient,
     hub: &Path,
     prefix_map: &PrefixMap,
     fetched_at: SystemTime,
+    status: StatusFilter,
 ) -> Result<Snapshot, BdError> {
-    Ok(attribute(bd.ready(hub)?, prefix_map, fetched_at))
+    let mut snapshot = attribute(read_issues(bd, hub, status)?, prefix_map, fetched_at);
+    snapshot.status = status;
+    Ok(snapshot)
 }
 
 /// The pure core of [`fetch`]: attribute a list of issues to their source repos
-/// via `prefix_map` and sort them for display. Shared with cross-repo search
+/// via `prefix_map` and sort them for display. The result is stamped
+/// [`StatusFilter::Ready`]; a caller reading another status sets it. Shared with cross-repo search
 /// (Slice 11), whose worker feeds `bd search` results through this same path so
 /// search rows carry `repo_name` and sort exactly as ready rows do.
 pub fn attribute(issues: Vec<Issue>, prefix_map: &PrefixMap, fetched_at: SystemTime) -> Snapshot {
@@ -157,7 +255,11 @@ fn attribute_with_optional_generation(
             .then_with(|| a.issue.id.cmp(&b.issue.id))
     });
 
-    Snapshot { rows, fetched_at }
+    Snapshot {
+        rows,
+        fetched_at,
+        status: StatusFilter::Ready,
+    }
 }
 
 /// Order two `updated_at` values newest first. Parseable RFC3339 timestamps
@@ -283,8 +385,8 @@ fn display_name(prefix: &str, path: &Path, by_basename: &HashMap<String, HashSet
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bd::FakeBdClient;
     use crate::bd::{BdError, BdErrorKind};
+    use crate::bd::{Call, FakeBdClient};
     use crate::config::RepoEntry;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -350,7 +452,8 @@ mod tests {
         let map = prefix_map(&[("ra", "/dev/session-tui")]);
         let when = at(1_700_000_000);
 
-        let snap = fetch(&bd, Path::new("/hub"), &map, when).expect("fetch ok");
+        let snap =
+            fetch(&bd, Path::new("/hub"), &map, when, StatusFilter::Ready).expect("fetch ok");
 
         assert_eq!(snap.fetched_at, when, "fetch time is the injected instant");
         assert_eq!(snap.rows.len(), 2, "both ready issues become rows");
@@ -375,7 +478,8 @@ mod tests {
         let bd = FakeBdClient::new().with_ready(issues);
         let map = prefix_map(&[("rb", "/dev/repo-b")]);
 
-        let snap = fetch(&bd, Path::new("/hub"), &map, at(0)).expect("fetch ok");
+        let snap =
+            fetch(&bd, Path::new("/hub"), &map, at(0), StatusFilter::Ready).expect("fetch ok");
 
         let order: Vec<&str> = snap.rows.iter().map(|r| r.issue.id.as_str()).collect();
         assert_eq!(
@@ -401,7 +505,8 @@ mod tests {
         let bd = FakeBdClient::new().with_ready(issues);
         let map = prefix_map(&[("rb", "/dev/repo-b")]);
 
-        let snap = fetch(&bd, Path::new("/hub"), &map, at(0)).expect("fetch ok");
+        let snap =
+            fetch(&bd, Path::new("/hub"), &map, at(0), StatusFilter::Ready).expect("fetch ok");
 
         let order: Vec<&str> = snap.rows.iter().map(|r| r.issue.id.as_str()).collect();
         assert_eq!(
@@ -421,7 +526,8 @@ mod tests {
         let bd = FakeBdClient::new().with_ready(issues);
         let map = prefix_map(&[("rb", "/dev/repo-b")]);
 
-        let snap = fetch(&bd, Path::new("/hub"), &map, at(0)).expect("fetch ok");
+        let snap =
+            fetch(&bd, Path::new("/hub"), &map, at(0), StatusFilter::Ready).expect("fetch ok");
 
         let order: Vec<&str> = snap.rows.iter().map(|r| r.issue.id.as_str()).collect();
         assert_eq!(order, vec!["rb-old", "rb-junk", "rb-none"]);
@@ -489,7 +595,8 @@ mod tests {
         let bd = FakeBdClient::new().with_ready(issues);
         let map = prefix_map(&[("rb", "/dev/repo-b")]);
 
-        let snap = fetch(&bd, Path::new("/hub"), &map, at(0)).expect("fetch ok");
+        let snap =
+            fetch(&bd, Path::new("/hub"), &map, at(0), StatusFilter::Ready).expect("fetch ok");
 
         let order: Vec<&str> = snap.rows.iter().map(|r| r.issue.id.as_str()).collect();
         assert_eq!(
@@ -509,7 +616,8 @@ mod tests {
         let bd = FakeBdClient::new().with_ready(issues);
         let map = prefix_map(&[("ra", "/dev/repo-a"), ("rb", "/dev/repo-b")]);
 
-        let snap = fetch(&bd, Path::new("/hub"), &map, at(0)).expect("fetch ok");
+        let snap =
+            fetch(&bd, Path::new("/hub"), &map, at(0), StatusFilter::Ready).expect("fetch ok");
 
         // Grouping is a view concern; the data to group by lives on each row.
         let mut groups: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
@@ -533,7 +641,8 @@ mod tests {
         let bd = FakeBdClient::new().with_ready(issues);
         let map = prefix_map(&[("ra", "/dev/repo-a")]);
 
-        let snap = fetch(&bd, Path::new("/hub"), &map, at(0)).expect("fetch ok");
+        let snap =
+            fetch(&bd, Path::new("/hub"), &map, at(0), StatusFilter::Ready).expect("fetch ok");
 
         let unknown = snap
             .rows
@@ -562,7 +671,8 @@ mod tests {
         let bd = FakeBdClient::new().with_ready(issues);
         let map = prefix_map(&[("ra", "/work/a/api"), ("rb", "/work/b/api")]);
 
-        let snap = fetch(&bd, Path::new("/hub"), &map, at(0)).expect("fetch ok");
+        let snap =
+            fetch(&bd, Path::new("/hub"), &map, at(0), StatusFilter::Ready).expect("fetch ok");
 
         let name = |id: &str| {
             snap.rows
@@ -611,7 +721,14 @@ mod tests {
         let bd = FakeBdClient::new().with_ready(ready_fixture());
         let map = prefix_map(&[("ra", "/dev/session-tui")]);
 
-        let snap = fetch(&bd, Path::new("/hub"), &map, at(1_700_000_000)).expect("fetch ok");
+        let snap = fetch(
+            &bd,
+            Path::new("/hub"),
+            &map,
+            at(1_700_000_000),
+            StatusFilter::Ready,
+        )
+        .expect("fetch ok");
         let json = serde_json::to_value(&snap).expect("Snapshot serializes to JSON");
 
         let rows = json
@@ -670,7 +787,8 @@ mod tests {
         let direct = attribute(issues.clone(), &map, when);
         // Via fetch (which reads the same issues from `bd ready`).
         let bd = FakeBdClient::new().with_ready(issues);
-        let via_fetch = fetch(&bd, Path::new("/hub"), &map, when).expect("fetch ok");
+        let via_fetch =
+            fetch(&bd, Path::new("/hub"), &map, when, StatusFilter::Ready).expect("fetch ok");
 
         assert_eq!(direct, via_fetch, "fetch delegates to attribute");
         let order: Vec<&str> = direct.rows.iter().map(|r| r.issue.id.as_str()).collect();
@@ -685,6 +803,121 @@ mod tests {
         );
     }
 
+    fn with_status(id: &str, status: &str) -> Issue {
+        Issue {
+            status: status.into(),
+            ..issue(id, 1, None)
+        }
+    }
+
+    fn fetched_ids(bd: &FakeBdClient, status: StatusFilter) -> Vec<String> {
+        let map = prefix_map(&[("ra", "/dev/repo-a")]);
+        let snap = fetch(bd, Path::new("/hub"), &map, at(0), status).expect("fetch ok");
+        assert_eq!(snap.status, status, "the snapshot names the list it read");
+        let mut ids: Vec<String> = snap.rows.into_iter().map(|r| r.issue.id).collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn open_and_in_progress_read_bd_list_by_status() {
+        let bd = FakeBdClient::new()
+            .with_ready(vec![with_status("ra-ready", "open")])
+            .with_list_status("open", vec![with_status("ra-open", "open")])
+            .with_list_status("in_progress", vec![with_status("ra-wip", "in_progress")]);
+
+        assert_eq!(fetched_ids(&bd, StatusFilter::Ready), ["ra-ready"]);
+        assert_eq!(fetched_ids(&bd, StatusFilter::Open), ["ra-open"]);
+        assert_eq!(fetched_ids(&bd, StatusFilter::InProgress), ["ra-wip"]);
+        assert_eq!(
+            bd.calls(),
+            vec![
+                Call::Ready(PathBuf::from("/hub")),
+                Call::ListStatus(PathBuf::from("/hub"), "open".into()),
+                Call::ListStatus(PathBuf::from("/hub"), "in_progress".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn blocked_is_bd_blocked_plus_blocked_status_without_duplicates() {
+        // ra-dep waits on a dependency (status open); ra-flag has status
+        // blocked; ra-both is in both lists and must appear once.
+        let bd = FakeBdClient::new()
+            .with_blocked(vec![
+                with_status("ra-dep", "open"),
+                with_status("ra-both", "blocked"),
+            ])
+            .with_list_status(
+                "blocked",
+                vec![
+                    with_status("ra-both", "blocked"),
+                    with_status("ra-flag", "blocked"),
+                ],
+            );
+
+        assert_eq!(
+            fetched_ids(&bd, StatusFilter::Blocked),
+            ["ra-both", "ra-dep", "ra-flag"]
+        );
+    }
+
+    #[test]
+    fn blocked_fails_when_either_read_fails() {
+        let err = || BdError {
+            command: "bd ...".into(),
+            stderr: "boom".into(),
+            kind: BdErrorKind::NonZeroExit { code: Some(1) },
+        };
+        let hub = Path::new("/hub");
+        assert!(
+            read_issues(
+                &FakeBdClient::new().with_blocked_err(err()),
+                hub,
+                StatusFilter::Blocked
+            )
+            .is_err()
+        );
+        assert!(
+            read_issues(
+                &FakeBdClient::new().with_list_status_err("blocked", err()),
+                hub,
+                StatusFilter::Blocked
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn status_filter_steps_round_and_parses_its_names() {
+        let mut status = StatusFilter::default();
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            seen.push(status.as_str());
+            status = status.next();
+        }
+        assert_eq!(seen, ["ready", "open", "in_progress", "blocked", "ready"]);
+        for status in StatusFilter::ALL {
+            assert_eq!(status.as_str().parse::<StatusFilter>(), Ok(status));
+        }
+        assert!("closed".parse::<StatusFilter>().is_err());
+    }
+
+    #[test]
+    fn snapshot_without_status_reads_as_ready() {
+        let snap: Snapshot = serde_json::from_str(
+            r#"{"rows":[],"fetched_at":{"secs_since_epoch":0,"nanos_since_epoch":0}}"#,
+        )
+        .expect("pre-status snapshot parses");
+        assert_eq!(snap.status, StatusFilter::Ready);
+        let json = serde_json::to_value(Snapshot {
+            status: StatusFilter::InProgress,
+            ..snap
+        })
+        .unwrap();
+        assert_eq!(json["status"], "in_progress");
+    }
+
     #[test]
     fn ready_error_propagates() {
         let bd = FakeBdClient::new().with_ready_err(BdError {
@@ -694,7 +927,8 @@ mod tests {
         });
         let map = prefix_map(&[("ra", "/dev/repo-a")]);
 
-        let err = fetch(&bd, Path::new("/hub"), &map, at(0)).expect_err("ready failure propagates");
+        let err = fetch(&bd, Path::new("/hub"), &map, at(0), StatusFilter::Ready)
+            .expect_err("ready failure propagates");
         assert!(matches!(
             err.kind,
             BdErrorKind::NonZeroExit { code: Some(1) }
