@@ -16,7 +16,7 @@ use crate::cache;
 use crate::config::{Config, Paths, RepoEntry};
 use crate::hub::{self, HubError, hub_dir};
 use crate::refresh::{self, PrefixMap, RefreshError};
-use crate::snapshot::{self, Row};
+use crate::snapshot::{self, Row, StatusFilter};
 
 /// The minimum bd the version gate accepts.
 const MIN_BD_VERSION: (u64, u64, u64) = (1, 1, 0);
@@ -124,11 +124,13 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
 
 /// `ensure_hub → refresh → fetch → print`. See `plans/slices/slice-6.md` for the
 /// full control flow (version gate fatal; per-repo errors and `AlreadyRefreshing`
-/// degrade with a warning; sync/hub/ready failures fatal).
+/// degrade with a warning; sync/hub/read failures fatal). `status` picks which
+/// issues to print (see [`snapshot::read_issues`]).
 pub fn run_snapshot(
     roster: &Config,
     bd: &impl BdClient,
     paths: &Paths,
+    status: StatusFilter,
     json: bool,
     out: &mut impl Write,
     err: &mut impl Write,
@@ -137,8 +139,8 @@ pub fn run_snapshot(
     // hank's `--json` parsing was not written against, before touching the hub.
     version_gate(&bd.version()?).map_err(CliError::VersionGate)?;
 
-    let status = hub::ensure_hub(bd, paths, roster)?;
-    for warning in &status.warnings {
+    let hub_status = hub::ensure_hub(bd, paths, roster)?;
+    for warning in &hub_status.warnings {
         // Warnings embed config/repo-derived text (paths, bd stderr, prefixes)
         // and go to a terminal, so sanitize them like rows and doctor output.
         writeln!(err, "warning: {}", sanitize(warning))?;
@@ -170,6 +172,7 @@ pub fn run_snapshot(
                 &hub,
                 &synced.outcome().prefix_map,
                 synced.outcome().synced_at,
+                status,
             )?;
             drop(synced);
             (snapshot, warnings)
@@ -177,7 +180,7 @@ pub fn run_snapshot(
         // Degraded, not fatal: another hank holds the lock, so print the last
         // synced data (attribution unavailable → every row falls to `unknown`).
         Err(RefreshError::AlreadyRefreshing) => (
-            snapshot::fetch(bd, &hub, &fallback_map, SystemTime::now())?,
+            snapshot::fetch(bd, &hub, &fallback_map, SystemTime::now(), status)?,
             vec!["another hank is refreshing this hub; showing the last synced data".to_string()],
         ),
         Err(fatal) => return Err(fatal.into()),
@@ -931,7 +934,16 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
 
-        run_snapshot(&roster(&[&ra]), &bd, &paths, false, &mut out, &mut err).expect("ok");
+        run_snapshot(
+            &roster(&[&ra]),
+            &bd,
+            &paths,
+            StatusFilter::Ready,
+            false,
+            &mut out,
+            &mut err,
+        )
+        .expect("ok");
 
         let stdout = String::from_utf8(out).unwrap();
         assert!(
@@ -970,7 +982,16 @@ mod tests {
         };
         let mut err = Vec::new();
 
-        run_snapshot(&roster(&[&ra]), &bd, &paths, false, &mut out, &mut err).expect("ok");
+        run_snapshot(
+            &roster(&[&ra]),
+            &bd,
+            &paths,
+            StatusFilter::Ready,
+            false,
+            &mut out,
+            &mut err,
+        )
+        .expect("ok");
 
         assert!(
             out.lock_was_available,
@@ -987,7 +1008,16 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
 
-        run_snapshot(&roster(&[&ra]), &bd, &paths, true, &mut out, &mut err).expect("ok");
+        run_snapshot(
+            &roster(&[&ra]),
+            &bd,
+            &paths,
+            StatusFilter::Ready,
+            true,
+            &mut out,
+            &mut err,
+        )
+        .expect("ok");
 
         // stdout must be clean JSON (no warning leaked in).
         let v: serde_json::Value =
@@ -998,6 +1028,52 @@ mod tests {
             "serialized snapshot exposes the row's issue id: {v}"
         );
         assert!(v.get("fetched_at").is_some(), "fetch time serialized: {v}");
+    }
+
+    #[test]
+    fn snapshot_status_prints_that_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let mut claimed = issue("ra-wip", 1, "Claimed task");
+        claimed.status = "in_progress".into();
+        let bd = FakeBdClient::new()
+            .with_ready(vec![issue("ra-2hc", 1, "Ready task one")])
+            .with_list_status("in_progress", vec![claimed]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run_snapshot(
+            &roster(&[&ra]),
+            &bd,
+            &paths,
+            StatusFilter::InProgress,
+            false,
+            &mut out,
+            &mut err,
+        )
+        .expect("ok");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("ra-wip"), "{text}");
+        assert!(
+            !text.contains("ra-2hc"),
+            "the ready list is not printed: {text}"
+        );
+
+        let mut out = Vec::new();
+        run_snapshot(
+            &roster(&[&ra]),
+            &bd,
+            &paths,
+            StatusFilter::InProgress,
+            true,
+            &mut out,
+            &mut err,
+        )
+        .expect("ok");
+        let v: serde_json::Value = serde_json::from_slice(&out).expect("JSON snapshot");
+        assert_eq!(v["status"], "in_progress", "{v}");
+        assert_eq!(v["rows"][0]["issue"]["id"], "ra-wip", "{v}");
     }
 
     #[test]
@@ -1019,7 +1095,16 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
 
-        run_snapshot(&roster(&[&ra, &rb]), &bd, &paths, false, &mut out, &mut err).expect("ok");
+        run_snapshot(
+            &roster(&[&ra, &rb]),
+            &bd,
+            &paths,
+            StatusFilter::Ready,
+            false,
+            &mut out,
+            &mut err,
+        )
+        .expect("ok");
 
         let stdout = String::from_utf8(out).unwrap();
         let stderr = String::from_utf8(err).unwrap();
@@ -1047,8 +1132,16 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
 
-        run_snapshot(&roster(&[&ra]), &bd, &paths, false, &mut out, &mut err)
-            .expect("degrades, ok");
+        run_snapshot(
+            &roster(&[&ra]),
+            &bd,
+            &paths,
+            StatusFilter::Ready,
+            false,
+            &mut out,
+            &mut err,
+        )
+        .expect("degrades, ok");
 
         let stdout = String::from_utf8(out).unwrap();
         let stderr = String::from_utf8(err).unwrap();
@@ -1071,8 +1164,16 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
 
-        let e = run_snapshot(&roster(&[&ra]), &bd, &paths, false, &mut out, &mut err)
-            .expect_err("gate is fatal");
+        let e = run_snapshot(
+            &roster(&[&ra]),
+            &bd,
+            &paths,
+            StatusFilter::Ready,
+            false,
+            &mut out,
+            &mut err,
+        )
+        .expect_err("gate is fatal");
         assert!(matches!(e, CliError::VersionGate(_)), "got {e:?}");
         assert!(out.is_empty(), "no snapshot printed when the gate fails");
     }
@@ -1090,8 +1191,16 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
 
-        let e = run_snapshot(&roster(&[&ra]), &bd, &paths, false, &mut out, &mut err)
-            .expect_err("sync failure is fatal");
+        let e = run_snapshot(
+            &roster(&[&ra]),
+            &bd,
+            &paths,
+            StatusFilter::Ready,
+            false,
+            &mut out,
+            &mut err,
+        )
+        .expect_err("sync failure is fatal");
         assert!(
             matches!(e, CliError::Refresh(RefreshError::Sync(_))),
             "got {e:?}"
@@ -1319,15 +1428,16 @@ mod tests {
             &crate::snapshot::Snapshot {
                 rows: Vec::new(),
                 fetched_at: SystemTime::now(),
+                status: crate::snapshot::StatusFilter::Ready,
             },
             &Config::default(),
         )
         .expect("seed cache");
-        crate::ui_state::save(
-            paths.ui_state_file(),
-            &crate::app::RepoFilter::Only("repo-a".into()),
-        )
-        .expect("seed UI state");
+        let saved = crate::app::UiState {
+            repository: crate::app::RepoFilter::Only("repo-a".into()),
+            status: StatusFilter::InProgress,
+        };
+        crate::ui_state::save(paths.ui_state_file(), &saved).expect("seed UI state");
         let mut out = Vec::new();
 
         run_reset(&paths, &mut out).expect("ok");
@@ -1338,8 +1448,8 @@ mod tests {
         );
         assert_eq!(
             crate::ui_state::load(paths.ui_state_file()),
-            crate::app::RepoFilter::Only("repo-a".into()),
-            "reset preserves the user's repository preference"
+            saved,
+            "reset preserves the user's repository view and status"
         );
     }
 
@@ -1870,7 +1980,16 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
 
-        run_snapshot(&roster(&[&hostile]), &bd, &paths, false, &mut out, &mut err).expect("ok");
+        run_snapshot(
+            &roster(&[&hostile]),
+            &bd,
+            &paths,
+            StatusFilter::Ready,
+            false,
+            &mut out,
+            &mut err,
+        )
+        .expect("ok");
 
         let stderr = String::from_utf8(err).unwrap();
         assert!(

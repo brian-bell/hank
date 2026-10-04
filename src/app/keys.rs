@@ -72,6 +72,7 @@ pub fn map_key(event: KeyEvent, context: InputContext) -> Option<Msg> {
         KeyCode::Char('Y') => Some(Msg::CopyMarkdown),
         KeyCode::Char('f') => Some(Msg::OpenRepoPicker),
         KeyCode::Char('p') => Some(Msg::TogglePriorityFilter),
+        KeyCode::Char('s') => Some(Msg::CycleStatus),
         KeyCode::Char('j') | KeyCode::Down => Some(Msg::SelectNext),
         KeyCode::Char('k') | KeyCode::Up => Some(Msg::SelectPrev),
         KeyCode::Char('J') => Some(Msg::DetailScrollDown),
@@ -207,6 +208,15 @@ mod tests {
         assert_eq!(
             map_key(press(KeyCode::Char('p')), InputContext::Normal),
             Some(Msg::TogglePriorityFilter)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('s')), InputContext::Normal),
+            Some(Msg::CycleStatus)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('s')), InputContext::SearchEditing),
+            Some(Msg::SearchInput('s')),
+            "while editing a query, s is text"
         );
     }
 

@@ -239,6 +239,7 @@ mod tests {
                 attribution_generation: None,
             }],
             fetched_at,
+            status: crate::snapshot::StatusFilter::Ready,
         }
     }
 

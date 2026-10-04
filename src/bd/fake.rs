@@ -30,6 +30,8 @@ pub enum Call {
     SetEventsJournal(PathBuf, bool),
     RepoSync(PathBuf),
     Ready(PathBuf),
+    ListStatus(PathBuf, String),
+    Blocked(PathBuf),
     Show(PathBuf, String),
     ShowIssue(PathBuf, String),
     Search(PathBuf, String),
@@ -61,6 +63,8 @@ pub struct FakeBdClient {
     repo_list: Option<Result<serde_json::Value, BdError>>,
     repo_sync: Option<Result<RepoSyncReport, BdError>>,
     ready: Option<Result<Vec<Issue>, BdError>>,
+    list_status: HashMap<String, Result<Vec<Issue>, BdError>>,
+    blocked: Option<Result<Vec<Issue>, BdError>>,
     show: Option<Result<String, BdError>>,
     show_issue: Option<Result<Issue, BdError>>,
     search: Option<Result<Vec<Issue>, BdError>>,
@@ -138,6 +142,28 @@ impl FakeBdClient {
 
     pub fn with_ready_err(mut self, err: BdError) -> Self {
         self.ready = Some(Err(err));
+        self
+    }
+
+    /// Program `list_status(status)` for exactly this status; unset statuses
+    /// list nothing.
+    pub fn with_list_status(mut self, status: &str, issues: Vec<Issue>) -> Self {
+        self.list_status.insert(status.to_string(), Ok(issues));
+        self
+    }
+
+    pub fn with_list_status_err(mut self, status: &str, err: BdError) -> Self {
+        self.list_status.insert(status.to_string(), Err(err));
+        self
+    }
+
+    pub fn with_blocked(mut self, issues: Vec<Issue>) -> Self {
+        self.blocked = Some(Ok(issues));
+        self
+    }
+
+    pub fn with_blocked_err(mut self, err: BdError) -> Self {
+        self.blocked = Some(Err(err));
         self
     }
 
@@ -385,6 +411,19 @@ impl BdClient for FakeBdClient {
         resolve(&self.ready, Vec::new)
     }
 
+    fn list_status(&self, hub: &Path, status: &str) -> Result<Vec<Issue>, BdError> {
+        self.record(Call::ListStatus(hub.to_path_buf(), status.to_string()));
+        self.list_status
+            .get(status)
+            .cloned()
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    fn blocked(&self, hub: &Path) -> Result<Vec<Issue>, BdError> {
+        self.record(Call::Blocked(hub.to_path_buf()));
+        resolve(&self.blocked, Vec::new)
+    }
+
     fn show(&self, hub: &Path, id: &str) -> Result<String, BdError> {
         self.record(Call::Show(hub.to_path_buf(), id.to_string()));
         match &self.show {
@@ -543,6 +582,18 @@ mod tests {
             FakeBdClient::new()
                 .with_repo_sync_err(err())
                 .repo_sync(hub)
+                .is_err()
+        );
+        assert!(
+            FakeBdClient::new()
+                .with_list_status_err("open", err())
+                .list_status(hub, "open")
+                .is_err()
+        );
+        assert!(
+            FakeBdClient::new()
+                .with_blocked_err(err())
+                .blocked(hub)
                 .is_err()
         );
         assert!(
