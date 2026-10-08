@@ -688,6 +688,9 @@ pub struct App {
     /// The newest status load is still in flight; the list shows a loading
     /// line instead of rows.
     status_loading: bool,
+    /// A status load worker is running. Only one runs at a time: each holds
+    /// the hub lock, which a second load would fail to take.
+    status_load_running: bool,
     /// Why the newest status load failed, shown in place of the list.
     status_error: Option<String>,
     /// The cross-repo search flow, `Some` while it is live (see [`SearchState`]).
@@ -796,6 +799,7 @@ impl App {
             status: state.status,
             status_seq: 0,
             status_loading: false,
+            status_load_running: false,
             status_error: None,
             repo_picker: None,
             pending_triage: None,
@@ -890,7 +894,7 @@ impl App {
                     if snapshot.status == self.status {
                         self.apply_snapshot(snapshot);
                     } else {
-                        effects.push(self.load_status());
+                        effects.extend(self.load_status());
                     }
                 }
                 // The runtime sends the full warning set per cycle, so replace.
@@ -1017,7 +1021,23 @@ impl App {
                     self.status = self.status.next();
                     self.ready.selection = 0;
                     self.ready.set_rows(Vec::new(), &self.repo_view);
-                    return vec![self.load_status(), Effect::PersistUiState(self.ui_state())];
+                    let mut effects: Vec<Effect> = self.load_status().into_iter().collect();
+                    effects.push(Effect::PersistUiState(self.ui_state()));
+                    return effects;
+                }
+                // The launch refresh finished without a list (its read of the
+                // saved status failed): step the status and refresh for it, so
+                // a status that cannot load never strands the app here.
+                ViewMode::Loading if !self.stale => {
+                    self.status = self.status.next();
+                    self.stale = true;
+                    return vec![
+                        Effect::Refresh {
+                            scope: RefreshScope::Full,
+                            status: self.status,
+                        },
+                        Effect::PersistUiState(self.ui_state()),
+                    ];
                 }
                 // Search results: narrow them in place, like `p`.
                 ViewMode::Search => {
@@ -1029,6 +1049,8 @@ impl App {
                 ViewMode::Detail | ViewMode::Loading => {}
             },
             Msg::StatusLoaded { token, rows } => {
+                // Only one load runs at a time, so this is its reply.
+                self.status_load_running = false;
                 if token == self.status_seq {
                     self.status_loading = false;
                     match rows {
@@ -1038,6 +1060,10 @@ impl App {
                         }
                         Err(message) => self.status_error = Some(message),
                     }
+                } else if self.status_loading {
+                    // Steps taken while it ran coalesce into one load of the
+                    // status now chosen.
+                    return self.load_status().into_iter().collect();
                 }
             }
             Msg::Refresh => {
@@ -1486,15 +1512,21 @@ impl App {
     }
 
     /// Start loading the ready list's rows for the current status: stamp a
-    /// fresh generation, mark the load in flight, and return the effect.
-    fn load_status(&mut self) -> Effect {
+    /// fresh generation, mark the load in flight, and return the effect. While
+    /// another load is running, return none: its now-stale reply starts this
+    /// one (see [`Msg::StatusLoaded`]).
+    fn load_status(&mut self) -> Option<Effect> {
         self.status_seq += 1;
         self.status_loading = true;
         self.status_error = None;
-        Effect::LoadStatus {
+        if self.status_load_running {
+            return None;
+        }
+        self.status_load_running = true;
+        Some(Effect::LoadStatus {
             status: self.status,
             token: self.status_seq,
-        }
+        })
     }
 
     /// The preferences to save: the repository view and status now in effect.
@@ -4218,8 +4250,12 @@ mod tests {
         let mut app = app_with(vec![row("ra", "ra-1", 1)]);
         let mut seen = vec![app.status()];
         for _ in 0..4 {
-            step_status(&mut app);
+            let token = step_status(&mut app);
             seen.push(app.status());
+            app.reduce(Msg::StatusLoaded {
+                token,
+                rows: Ok(Vec::new()),
+            });
         }
         assert_eq!(
             seen,
@@ -4252,23 +4288,101 @@ mod tests {
     }
 
     #[test]
-    fn a_load_for_a_status_already_stepped_past_is_dropped() {
+    fn steps_taken_while_a_load_runs_coalesce_into_one_load() {
         let mut app = app_with(vec![row("ra", "ra-1", 1)]);
         let open = step_status(&mut app);
-        let in_progress = step_status(&mut app);
+        // Two more steps while the open load runs: each is saved, but none
+        // starts a worker to contend for the hub lock.
+        for _ in 0..2 {
+            assert_eq!(
+                app.reduce(Msg::CycleStatus),
+                vec![Effect::PersistUiState(app.ui_state())]
+            );
+        }
+        assert_eq!(app.status(), StatusFilter::Blocked);
 
-        app.reduce(Msg::StatusLoaded {
+        let effects = app.reduce(Msg::StatusLoaded {
             token: open,
             rows: Ok(vec![row("ra", "ra-open", 1)]),
         });
-        assert!(app.status_loading(), "the newest load is still pending");
+        assert!(app.status_loading(), "the open rows are dropped");
         assert!(app.rows().is_empty());
+        let blocked = match effects.as_slice() {
+            [
+                Effect::LoadStatus {
+                    status: StatusFilter::Blocked,
+                    token,
+                },
+            ] => *token,
+            other => panic!("expected one load of the blocked list, got {other:?}"),
+        };
 
-        app.reduce(Msg::StatusLoaded {
-            token: in_progress,
-            rows: Ok(vec![with_status(row("ra", "ra-wip", 1), "in_progress")]),
+        assert_eq!(
+            app.reduce(Msg::StatusLoaded {
+                token: blocked,
+                rows: Ok(vec![with_status(row("ra", "ra-flag", 1), "blocked")]),
+            }),
+            vec![]
+        );
+        assert_eq!(ids(&app.filtered_rows()), vec!["ra-flag"]);
+        assert_eq!(step_status(&mut app), blocked + 1, "the next step loads");
+    }
+
+    #[test]
+    fn a_load_superseded_by_a_refresh_starts_no_other_load() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        let token = step_status(&mut app);
+        app.reduce(Msg::RefreshCompleted {
+            snapshot: Some(Snapshot {
+                status: StatusFilter::Open,
+                ..snapshot(vec![row("ra", "ra-fresh", 1)])
+            }),
+            warnings: Vec::new(),
         });
-        assert_eq!(ids(&app.filtered_rows()), vec!["ra-wip"]);
+        assert_eq!(
+            app.reduce(Msg::StatusLoaded {
+                token,
+                rows: Ok(Vec::new()),
+            }),
+            vec![]
+        );
+        step_status(&mut app);
+    }
+
+    #[test]
+    fn status_key_recovers_a_launch_whose_saved_status_failed_to_load() {
+        let mut app = App::with_ui_state(UiState {
+            status: StatusFilter::Blocked,
+            ..UiState::default()
+        });
+        app.reduce(Msg::RefreshCompleted {
+            snapshot: None,
+            warnings: vec!["reading blocked list failed: boom".into()],
+        });
+        assert_eq!(app.view_mode(), ViewMode::Loading);
+
+        let effects = app.reduce(Msg::CycleStatus);
+        assert_eq!(app.status(), StatusFilter::Ready);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Refresh {
+                    scope: RefreshScope::Full,
+                    status: StatusFilter::Ready,
+                },
+                Effect::PersistUiState(app.ui_state()),
+            ]
+        );
+        assert!(app.is_stale());
+        assert_eq!(
+            app.reduce(Msg::CycleStatus),
+            vec![],
+            "one refresh at a time"
+        );
+
+        app.reduce(completed(vec![row("ra", "ra-1", 1)]));
+        assert_eq!(app.view_mode(), ViewMode::List);
+        assert_eq!(ids(&app.filtered_rows()), vec!["ra-1"]);
     }
 
     #[test]
@@ -4322,9 +4436,19 @@ mod tests {
         app.reduce(Msg::Refresh);
         let first = step_status(&mut app);
 
-        // The in-flight refresh read the ready list before the switch.
-        let effects = app.reduce(completed(vec![row("ra", "ra-ready", 1)]));
+        // The in-flight refresh read the ready list before the switch. The
+        // first load may have lost the hub lock to it, so its reply starts a
+        // fresh load once it lands.
+        assert_eq!(
+            app.reduce(completed(vec![row("ra", "ra-ready", 1)])),
+            vec![]
+        );
         assert!(app.rows().is_empty(), "ready rows never show as open");
+        let effects = app.reduce(Msg::StatusLoaded {
+            token: first,
+            rows: Err("open list unavailable while another hank is refreshing".into()),
+        });
+        assert_eq!(app.status_error(), None);
         match effects.as_slice() {
             [
                 Effect::LoadStatus {
@@ -4457,7 +4581,7 @@ mod tests {
             Some("couldn't save view settings: denied")
         );
 
-        step_status(&mut app);
+        app.reduce(Msg::CycleStatus);
         app.reduce(Msg::UiStatePersisted {
             state: open,
             result: Ok(()),

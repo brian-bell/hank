@@ -37,7 +37,10 @@ Source repos            Hank                              Hub (bd workspace)
   `open`, `in_progress`, `blocked`; `snapshot::read_issues`). Refreshes read
   the current status and stamp it on the snapshot, and the app drops a
   snapshot of any other status. Stepping the status (`s`) reloads from the
-  already-synced hub (`Effect::LoadStatus`) instead of re-exporting. `blocked`
+  already-synced hub (`Effect::LoadStatus`) instead of re-exporting; one load
+  runs at a time (each holds the hub lock), and steps taken meanwhile coalesce
+  into one load of the final status. Before any list has loaded (a launch
+  whose read of the saved status failed), `s` runs a full refresh instead. `blocked`
   is the union of `bd blocked` and `bd list --status blocked`; search asks
   `bd blocked` too, so its in-place status filter agrees.
 

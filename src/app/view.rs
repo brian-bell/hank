@@ -1736,7 +1736,7 @@ DESIGN
             status_line(&app, at(1000))
         );
         step_status(&mut app);
-        step_status(&mut app);
+        app.reduce(Msg::CycleStatus);
         assert!(status_line(&app, at(1000)).starts_with("in_progress · "));
     }
 
