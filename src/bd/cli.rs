@@ -215,6 +215,25 @@ fn argv_ready(hub: &Path) -> Vec<OsString> {
     ]
 }
 
+fn argv_list_status(hub: &Path, status: &str) -> Vec<OsString> {
+    // `--status=<value>` keeps the value literal; `--limit 0` defeats bd's
+    // default cap, as for `ready`.
+    vec![
+        "-C".into(),
+        arg(hub),
+        "list".into(),
+        format!("--status={status}").into(),
+        "--limit".into(),
+        "0".into(),
+        "--json".into(),
+    ]
+}
+
+fn argv_blocked(hub: &Path) -> Vec<OsString> {
+    // `bd blocked` has no result cap, so it takes no `--limit`.
+    vec!["-C".into(), arg(hub), "blocked".into(), "--json".into()]
+}
+
 fn argv_show(hub: &Path, id: &str) -> Vec<OsString> {
     vec!["-C".into(), arg(hub), "show".into(), id.into()]
 }
@@ -335,6 +354,14 @@ impl BdClient for BdCli {
         self.run_json(argv_ready(hub))
     }
 
+    fn list_status(&self, hub: &Path, status: &str) -> Result<Vec<Issue>, BdError> {
+        self.run_json(argv_list_status(hub, status))
+    }
+
+    fn blocked(&self, hub: &Path) -> Result<Vec<Issue>, BdError> {
+        self.run_json(argv_blocked(hub))
+    }
+
     fn show(&self, hub: &Path, id: &str) -> Result<String, BdError> {
         self.run_text(argv_show(hub, id))
     }
@@ -451,6 +478,23 @@ mod tests {
         assert_eq!(
             argv_ready(Path::new("/tmp/hub")),
             os(&["-C", "/tmp/hub", "ready", "--limit", "0", "--json"])
+        );
+
+        assert_eq!(
+            argv_list_status(Path::new("/tmp/hub"), "in_progress"),
+            os(&[
+                "-C",
+                "/tmp/hub",
+                "list",
+                "--status=in_progress",
+                "--limit",
+                "0",
+                "--json"
+            ])
+        );
+        assert_eq!(
+            argv_blocked(Path::new("/tmp/hub")),
+            os(&["-C", "/tmp/hub", "blocked", "--json"])
         );
 
         assert_eq!(

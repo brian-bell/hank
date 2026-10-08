@@ -8,7 +8,7 @@ Source repos            Hank                              Hub (bd workspace)
 ──────────────   ──────────────────────────────   ─────────────────────────
 ~/dev/megaclock  refresh:  bd export per repo  →   <XDG data dir>/
 ~/dev/reading-…            bd repo sync (once)  →     hank/hub/
-     …           read:     bd ready/show/search --json (all through the hub)
+     …           read:     bd ready/list/blocked/show/search --json (all through the hub)
 ```
 
 - **Central DB**: a `bd` "hub" workspace using built-in multi-repo hydration
@@ -31,8 +31,18 @@ Source repos            Hank                              Hub (bd workspace)
 - **State core**: the whole TUI is a pure `reduce(&mut App, Msg) -> Vec<Effect>`
   state machine (no I/O, no clock, no threads inside), so it is exhaustively
   unit-tested; the runtime performs the effects. The last confirmed repository
-  view is stored separately in versioned `ui_state.json`; snapshot-cache
-  freshness and roster configuration remain independent.
+  view and status are stored separately in versioned `ui_state.json`;
+  snapshot-cache freshness and roster configuration remain independent.
+- **Status filter**: the ready list holds one status at a time (`ready`,
+  `open`, `in_progress`, `blocked`; `snapshot::read_issues`). Refreshes read
+  the current status and stamp it on the snapshot, and the app drops a
+  snapshot of any other status. Stepping the status (`s`) reloads from the
+  already-synced hub (`Effect::LoadStatus`) instead of re-exporting; one load
+  runs at a time (each holds the hub lock), and steps taken meanwhile coalesce
+  into one load of the final status. Before any list has loaded (a launch
+  whose read of the saved status failed), `s` runs a full refresh instead. `blocked`
+  is the union of `bd blocked` and `bd list --status blocked`; search asks
+  `bd blocked` too, so its in-place status filter agrees.
 
 Module map: `config` (roster + XDG paths) · `ui_state` (persisted TUI
 preferences) · `bd` (the `BdClient` trait, real subprocess + fake impls, serde

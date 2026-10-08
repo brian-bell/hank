@@ -9,11 +9,13 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Parser, Subcommand};
 
 use hank::bd::BdCli;
 use hank::cli::{self, CliError};
 use hank::config::Paths;
+use hank::snapshot::StatusFilter;
 
 #[derive(Parser)]
 #[command(
@@ -46,6 +48,15 @@ struct Cli {
 enum Command {
     /// Print the merged cross-repo ready list (the headless tracer bullet).
     Snapshot {
+        /// Which issues to print: `ready` (bd ready), every `open` or
+        /// `in_progress` issue, or `blocked` (bd blocked plus status blocked).
+        #[arg(
+            long,
+            default_value = "ready",
+            value_parser = PossibleValuesParser::new(StatusFilter::ALL.map(StatusFilter::as_str))
+                .map(|status| status.parse::<StatusFilter>().expect("listed status parses")),
+        )]
+        status: StatusFilter,
         /// Emit the serialized snapshot as JSON instead of human-readable lines.
         #[arg(long)]
         json: bool,
@@ -129,9 +140,9 @@ fn run() -> Result<(), CliError> {
     // `doctor` loads it itself so it can report a bad config instead of aborting.
     // Only `snapshot` treats a malformed config as fatal.
     match cli.command {
-        Some(Command::Snapshot { json }) => {
+        Some(Command::Snapshot { status, json }) => {
             let roster = cli::load_roster(&paths)?;
-            cli::run_snapshot(&roster, &bd, &paths, json, &mut stdout, &mut stderr)
+            cli::run_snapshot(&roster, &bd, &paths, status, json, &mut stdout, &mut stderr)
         }
         Some(Command::Reset) => cli::run_reset(&paths, &mut stdout),
         Some(Command::Doctor) => cli::run_doctor(&bd, &paths, &mut stdout),

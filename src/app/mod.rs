@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::bd::ShowDetail;
 use crate::refresh::AttributionGeneration;
-use crate::snapshot::{Row, Snapshot};
+use crate::snapshot::{Row, Snapshot, StatusFilter};
 
 /// First delay before retrying a watcher refresh that failed; doubles per
 /// consecutive failure up to [`WATCH_RETRY_MAX`].
@@ -91,8 +91,19 @@ pub enum Msg {
     /// late reply is dropped. `rows` are **already attributed** `Row`s (the worker
     /// ran them through the same `PrefixMap` path as ready rows) on success, or a
     /// pre-formatted, sanitized message on failure — keeping this core free of
-    /// `bd`/`PrefixMap` types and preserving `Msg`'s `Eq` derive.
+    /// `bd`/`PrefixMap` types and preserving `Msg`'s `Eq` derive. `blocked` is
+    /// the ids `bd blocked` reports, so the results' status filter counts a
+    /// dependency-blocked issue as blocked the way the ready list does.
     SearchResults {
+        token: u64,
+        rows: Result<Vec<Row>, String>,
+        blocked: BTreeSet<String>,
+    },
+    /// The ready list's rows for a newly chosen status (runtime worker → app).
+    /// `token` echoes [`Effect::LoadStatus`], so a load for a status the user
+    /// has already stepped past is dropped. `rows` are attributed on success,
+    /// or a pre-formatted, sanitized message on failure.
+    StatusLoaded {
         token: u64,
         rows: Result<Vec<Row>, String>,
     },
@@ -133,6 +144,11 @@ pub enum Msg {
     ConfirmRepoPicker,
     /// Toggle the priority filter `All ↔ P0/P1-only` (`p`).
     TogglePriorityFilter,
+    /// Step the status filter (`s`). On the ready list this changes which
+    /// issues are loaded (ready → open → in_progress → blocked) and is saved;
+    /// on search results it narrows them in place (all → open → in_progress →
+    /// blocked), like `p`.
+    CycleStatus,
 
     // ---- Commands / modes ----
     /// Request a refresh (`r`); `reduce` emits [`Effect::Refresh`].
@@ -178,10 +194,10 @@ pub enum Msg {
         payload: String,
         summary: String,
     },
-    /// Persistence of a confirmed repository view completed. Results for a
-    /// superseded view are ignored.
-    RepoViewPersisted {
-        repo: RepoFilter,
+    /// Persistence of the UI preferences completed. Results for superseded
+    /// preferences are ignored.
+    UiStatePersisted {
+        state: UiState,
         result: Result<(), String>,
     },
     /// The live-refresh watcher saw journal records (or lost its place in a
@@ -226,7 +242,15 @@ pub enum Msg {
 pub enum Effect {
     /// Spawn a refresh worker over `scope`: [`RefreshScope::Full`] for the `r`
     /// keypress (`Msg::Refresh`), or the repos a [`Msg::WatchChanged`] named.
-    Refresh(RefreshScope),
+    /// `status` is the list the worker reads once the hub has synced.
+    Refresh {
+        scope: RefreshScope,
+        status: StatusFilter,
+    },
+    /// Read the ready list's rows for `status` from the already-synced hub,
+    /// without re-exporting any repo. The runtime echoes `token` back in
+    /// [`Msg::StatusLoaded`].
+    LoadStatus { status: StatusFilter, token: u64 },
     /// Fetch one issue's detail via `bd show <id>` (the `Enter` keypress →
     /// `Msg::OpenDetail`). `token` is the request's generation; the runtime runs
     /// the fetch on a worker thread and echoes `token` back in [`Msg::DetailReady`]
@@ -255,8 +279,8 @@ pub enum Effect {
     /// [`Msg::Copied`] follow-up). Performed on the UI thread, which owns the tty,
     /// so the escape can never interleave with a ratatui draw from a worker.
     WriteClipboard(String),
-    /// Persist one newly confirmed repository view.
-    PersistRepoView(RepoFilter),
+    /// Persist the UI preferences after the repository view or status changed.
+    PersistUiState(UiState),
     /// Run `hank doctor` off the UI thread for the health panel and send its
     /// output back as [`Msg::HealthReport`] echoing `token`.
     CheckHealth { token: u64 },
@@ -293,6 +317,14 @@ impl RefreshScope {
             _ => RefreshScope::Full,
         }
     }
+}
+
+/// The TUI preferences saved across launches: the repository view and the
+/// ready list's status.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UiState {
+    pub repository: RepoFilter,
+    pub status: StatusFilter,
 }
 
 /// How one roster repo fared in a refresh cycle, as the runtime reports it.
@@ -425,8 +457,12 @@ struct RowList {
     filtered_ix: Vec<usize>,
     /// Offset into `filtered_ix` (never into `rows`).
     selection: usize,
-    /// The list-local priority filter. The repository view belongs to `App`.
+    /// The list-local priority and status filters. The repository view
+    /// belongs to `App`.
     filter: FilterSet,
+    /// Ids `bd blocked` reported for these rows, which the status filter
+    /// counts as blocked whatever their own status says.
+    blocked_ids: BTreeSet<String>,
 }
 
 impl RowList {
@@ -440,7 +476,10 @@ impl RowList {
     /// the one place the selection invariant is re-established.
     fn recompute(&mut self, repo_view: &RepoFilter) {
         self.filtered_ix = (0..self.rows.len())
-            .filter(|&i| self.filter.matches(repo_view, &self.rows[i]))
+            .filter(|&i| {
+                self.filter
+                    .matches(repo_view, &self.rows[i], &self.blocked_ids)
+            })
             .collect();
         if self.filtered_ix.is_empty() {
             self.selection = 0;
@@ -466,6 +505,17 @@ impl RowList {
         self.filter.priority = match self.filter.priority {
             PriorityFilter::All => PriorityFilter::HighOnly,
             PriorityFilter::HighOnly => PriorityFilter::All,
+        };
+        self.recompute(repo_view);
+    }
+
+    /// Step the list-local status filter `all → open → in_progress → blocked
+    /// → all`, then recompute.
+    fn cycle_status_filter(&mut self, repo_view: &RepoFilter) {
+        self.filter.status = match self.filter.status {
+            None => Some(StatusFilter::Open),
+            Some(StatusFilter::Blocked) => None,
+            Some(status) => Some(status.next()),
         };
         self.recompute(repo_view);
     }
@@ -567,16 +617,22 @@ pub enum PriorityFilter {
     HighOnly,
 }
 
-/// The list-local priority filter. [`App::repo_view`] supplies the independent
-/// repository axis when [`FilterSet::matches`] evaluates a row.
+/// The list-local priority and status filters. [`App::repo_view`] supplies the
+/// independent repository axis when [`FilterSet::matches`] evaluates a row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FilterSet {
     priority: PriorityFilter,
+    /// Narrows search results by status; `None` shows every status. The ready
+    /// list leaves it `None`, because its rows are already the status the
+    /// app loaded ([`App::status`]).
+    status: Option<StatusFilter>,
 }
 
 impl FilterSet {
-    /// Whether a row passes the global repository and local priority axes.
-    pub fn matches(&self, repo_view: &RepoFilter, row: &Row) -> bool {
+    /// Whether a row passes the global repository axis and the local priority
+    /// and status axes. `blocked` holds the ids `bd blocked` reported; the
+    /// blocked status matches those as well as status `blocked`.
+    pub fn matches(&self, repo_view: &RepoFilter, row: &Row, blocked: &BTreeSet<String>) -> bool {
         let repo_ok = match repo_view {
             RepoFilter::All => true,
             RepoFilter::Only(identity) => row.repo_id.as_deref() == Some(identity),
@@ -586,12 +642,25 @@ impl FilterSet {
             PriorityFilter::All => true,
             PriorityFilter::HighOnly => row.issue.priority <= 1,
         };
-        repo_ok && priority_ok
+        let status_ok = match self.status {
+            None | Some(StatusFilter::Ready) => true,
+            Some(StatusFilter::Open) => row.issue.status == "open",
+            Some(StatusFilter::InProgress) => row.issue.status == "in_progress",
+            Some(StatusFilter::Blocked) => {
+                row.issue.status == "blocked" || blocked.contains(&row.issue.id)
+            }
+        };
+        repo_ok && priority_ok && status_ok
     }
 
     /// The active priority filter.
     pub fn priority(&self) -> PriorityFilter {
         self.priority
+    }
+
+    /// The active list-local status filter (`None` shows every status).
+    pub fn status(&self) -> Option<StatusFilter> {
+        self.status
     }
 }
 
@@ -610,6 +679,20 @@ pub struct App {
     /// The cross-repo ready list (rows, filter, selection), always maintained by
     /// refresh even while a search overlays it.
     ready: RowList,
+    /// Which issues the ready list holds. Refreshes read this status, and a
+    /// snapshot of any other status is not shown.
+    status: StatusFilter,
+    /// A monotonic generation stamped on each status load, echoed by the
+    /// worker so a load for a status already stepped past is dropped.
+    status_seq: u64,
+    /// The newest status load is still in flight; the list shows a loading
+    /// line instead of rows.
+    status_loading: bool,
+    /// A status load worker is running. Only one runs at a time: each holds
+    /// the hub lock, which a second load would fail to take.
+    status_load_running: bool,
+    /// Why the newest status load failed, shown in place of the list.
+    status_error: Option<String>,
     /// The cross-repo search flow, `Some` while it is live (see [`SearchState`]).
     /// The ready list stays untouched behind it, so `Esc` restores it exactly.
     search: Option<SearchState>,
@@ -697,14 +780,27 @@ impl App {
     /// `RefreshStarted`. The flag clears when that first refresh concludes with a
     /// `RefreshCompleted`, like any other cycle.
     pub fn new() -> App {
-        App::with_repo_view(RepoFilter::All)
+        App::with_ui_state(UiState::default())
     }
 
-    /// Construct an app with the repository view restored from persisted UI
-    /// state. The view is installed before cache or refresh rows can arrive.
+    /// Construct an app showing `repo_view` and the ready status.
     pub fn with_repo_view(repo_view: RepoFilter) -> App {
+        App::with_ui_state(UiState {
+            repository: repo_view,
+            ..UiState::default()
+        })
+    }
+
+    /// Construct an app with the repository view and status restored from
+    /// persisted UI state, installed before cache or refresh rows can arrive.
+    pub fn with_ui_state(state: UiState) -> App {
         App {
-            repo_view,
+            repo_view: state.repository,
+            status: state.status,
+            status_seq: 0,
+            status_loading: false,
+            status_load_running: false,
+            status_error: None,
             repo_picker: None,
             pending_triage: None,
             persistence_warning: None,
@@ -789,8 +885,17 @@ impl App {
                         None
                     }
                 };
+                // A snapshot read for a status the user has since stepped
+                // away from is dropped. Its hub is verified now, so load the
+                // current status from it, in case an earlier load ran before
+                // any hub was.
+                let mut effects = Vec::new();
                 if let Some(snapshot) = snapshot {
-                    self.apply_snapshot(snapshot);
+                    if snapshot.status == self.status {
+                        self.apply_snapshot(snapshot);
+                    } else {
+                        effects.extend(self.load_status());
+                    }
                 }
                 // The runtime sends the full warning set per cycle, so replace.
                 self.status_warnings = warnings;
@@ -807,15 +912,20 @@ impl App {
                     };
                     self.stale = true;
                     self.watch_in_flight = Some(scope.clone());
-                    return vec![Effect::Refresh(scope)];
+                    effects.push(Effect::Refresh {
+                        scope,
+                        status: self.status,
+                    });
+                    return effects;
                 }
                 if let Some(scope) = failed_watch {
                     let after = WATCH_RETRY_BASE
                         .saturating_mul(1 << self.watch_failures.min(6))
                         .min(WATCH_RETRY_MAX);
                     self.watch_failures = self.watch_failures.saturating_add(1);
-                    return vec![Effect::RetryWatch { scope, after }];
+                    effects.push(Effect::RetryWatch { scope, after });
                 }
+                return effects;
             }
             // `j`/`k` move the selection of the active browsing list (ready in
             // `List`, the results in `Search`+`Results`). With the detail pane
@@ -890,17 +1000,70 @@ impl App {
                 };
                 let selected = picker.choices[picker.cursor].clone();
                 if selected != self.repo_view {
-                    self.apply_repo_view(selected.clone());
-                    return vec![Effect::PersistRepoView(selected)];
+                    self.apply_repo_view(selected);
+                    return vec![Effect::PersistUiState(self.ui_state())];
                 }
                 if self.persistence_warning.is_some() {
-                    return vec![Effect::PersistRepoView(selected)];
+                    return vec![Effect::PersistUiState(self.ui_state())];
                 }
             }
             Msg::TogglePriorityFilter => {
                 let repo_view = self.repo_view.clone();
                 if let Some(list) = self.browsing_list_mut() {
                     list.toggle_priority_filter(&repo_view);
+                }
+            }
+            Msg::CycleStatus => match self.view_mode {
+                // The ready list: load the next status's rows from the hub and
+                // save the choice. The old status's rows are cleared rather
+                // than shown under the new status's name.
+                ViewMode::List => {
+                    self.status = self.status.next();
+                    self.ready.selection = 0;
+                    self.ready.set_rows(Vec::new(), &self.repo_view);
+                    let mut effects: Vec<Effect> = self.load_status().into_iter().collect();
+                    effects.push(Effect::PersistUiState(self.ui_state()));
+                    return effects;
+                }
+                // The launch refresh finished without a list (its read of the
+                // saved status failed): step the status and refresh for it, so
+                // a status that cannot load never strands the app here.
+                ViewMode::Loading if !self.stale => {
+                    self.status = self.status.next();
+                    self.stale = true;
+                    return vec![
+                        Effect::Refresh {
+                            scope: RefreshScope::Full,
+                            status: self.status,
+                        },
+                        Effect::PersistUiState(self.ui_state()),
+                    ];
+                }
+                // Search results: narrow them in place, like `p`.
+                ViewMode::Search => {
+                    let repo_view = self.repo_view.clone();
+                    if let Some(list) = self.browsing_list_mut() {
+                        list.cycle_status_filter(&repo_view);
+                    }
+                }
+                ViewMode::Detail | ViewMode::Loading => {}
+            },
+            Msg::StatusLoaded { token, rows } => {
+                // Only one load runs at a time, so this is its reply.
+                self.status_load_running = false;
+                if token == self.status_seq {
+                    self.status_loading = false;
+                    match rows {
+                        Ok(rows) => {
+                            self.status_error = None;
+                            self.ready.set_rows(rows, &self.repo_view);
+                        }
+                        Err(message) => self.status_error = Some(message),
+                    }
+                } else if self.status_loading {
+                    // Steps taken while it ran coalesce into one load of the
+                    // status now chosen.
+                    return self.load_status().into_iter().collect();
                 }
             }
             Msg::Refresh => {
@@ -916,7 +1079,10 @@ impl App {
                     return Vec::new();
                 }
                 self.stale = true;
-                return vec![Effect::Refresh(RefreshScope::Full)];
+                return vec![Effect::Refresh {
+                    scope: RefreshScope::Full,
+                    status: self.status,
+                }];
             }
             Msg::WatchChanged(scope) => {
                 if self.stale {
@@ -928,7 +1094,10 @@ impl App {
                 }
                 self.stale = true;
                 self.watch_in_flight = Some(scope.clone());
-                return vec![Effect::Refresh(scope)];
+                return vec![Effect::Refresh {
+                    scope,
+                    status: self.status,
+                }];
             }
             Msg::WatchWarning(warning) => {
                 if !self.watch_warnings.contains(&warning) {
@@ -1111,7 +1280,11 @@ impl App {
                     return vec![Effect::Search { query, token }];
                 }
             }
-            Msg::SearchResults { token, rows } => {
+            Msg::SearchResults {
+                token,
+                rows,
+                blocked,
+            } => {
                 let repo_view = self.repo_view.clone();
                 // Accept only the response for the current, still-pending query; a
                 // superseded one (re-submitted, or `Esc`'d back to editing) is
@@ -1122,10 +1295,12 @@ impl App {
                 {
                     match rows {
                         Ok(rows) => {
+                            s.list.blocked_ids = blocked;
                             s.list.set_rows(rows, &repo_view);
                             s.phase = SearchPhase::Results;
                         }
                         Err(message) => {
+                            s.list.blocked_ids.clear();
                             s.list.set_rows(Vec::new(), &repo_view);
                             s.phase = SearchPhase::Error(message);
                         }
@@ -1170,8 +1345,8 @@ impl App {
                     return effects;
                 }
             }
-            Msg::RepoViewPersisted { repo, result } => {
-                if repo == self.repo_view {
+            Msg::UiStatePersisted { state, result } => {
+                if state == self.ui_state() {
                     self.persistence_warning = result.err();
                 }
             }
@@ -1333,6 +1508,32 @@ impl App {
             choices,
             labels,
             cursor,
+        }
+    }
+
+    /// Start loading the ready list's rows for the current status: stamp a
+    /// fresh generation, mark the load in flight, and return the effect. While
+    /// another load is running, return none: its now-stale reply starts this
+    /// one (see [`Msg::StatusLoaded`]).
+    fn load_status(&mut self) -> Option<Effect> {
+        self.status_seq += 1;
+        self.status_loading = true;
+        self.status_error = None;
+        if self.status_load_running {
+            return None;
+        }
+        self.status_load_running = true;
+        Some(Effect::LoadStatus {
+            status: self.status,
+            token: self.status_seq,
+        })
+    }
+
+    /// The preferences to save: the repository view and status now in effect.
+    fn ui_state(&self) -> UiState {
+        UiState {
+            repository: self.repo_view.clone(),
+            status: self.status,
         }
     }
 
@@ -1517,6 +1718,11 @@ impl App {
     /// [`App::hydrate_from_cache`]. Does not touch `stale`/`status_warnings`/
     /// `copy_flash` — each caller owns those per its own semantics.
     fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        // Rows of another status never reach the list (a cache written before
+        // the status changed, or a refresh that read the old status).
+        if snapshot.status != self.status {
+            return;
+        }
         // With a detail opened *from the ready list*, remember the opened
         // issue so the refresh's re-sort does not move the selection to a
         // *different* row: the pane pins one issue, and `Esc` must return to
@@ -1535,6 +1741,13 @@ impl App {
         // detail overlay; `set_rows` keeps the active filter and re-clamps
         // the selection. (`None` keeps the last-good rows.)
         self.ready.set_rows(snapshot.rows, &self.repo_view);
+        // These rows are the current status's, so any load still in flight is
+        // superseded; its late reply is dropped by token.
+        if self.status_loading || self.status_error.is_some() {
+            self.status_seq += 1;
+            self.status_loading = false;
+            self.status_error = None;
+        }
         self.fetched_at = Some(snapshot.fetched_at);
         // Only promote the first-snapshot transition; a refresh landing under
         // an open `Detail`/`Search` overlay must not slam it shut (the 1s
@@ -1588,6 +1801,21 @@ impl App {
     /// The confirmed application-wide repository view.
     pub fn repo_view(&self) -> &RepoFilter {
         &self.repo_view
+    }
+
+    /// Which issues the ready list holds.
+    pub fn status(&self) -> StatusFilter {
+        self.status
+    }
+
+    /// Whether the ready list's rows for a newly chosen status are loading.
+    pub fn status_loading(&self) -> bool {
+        self.status_loading
+    }
+
+    /// Why the newest status load failed, if it did.
+    pub fn status_error(&self) -> Option<&str> {
+        self.status_error.as_deref()
     }
 
     /// Whether the repository picker overlay is open.
@@ -1716,6 +1944,14 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, UNIX_EPOCH};
 
+    /// The saved preferences for `repository` with the default ready status.
+    fn ui(repository: RepoFilter) -> UiState {
+        UiState {
+            repository,
+            ..UiState::default()
+        }
+    }
+
     fn row(repo: &str, id: &str, priority: i64) -> Row {
         Row {
             issue: Issue {
@@ -1756,6 +1992,7 @@ mod tests {
         Snapshot {
             rows,
             fetched_at: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            status: crate::snapshot::StatusFilter::Ready,
         }
     }
 
@@ -1830,6 +2067,7 @@ mod tests {
         ]);
         let token = submit(&mut app, "work");
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Ok(vec![
                 row("repo-a", "a-search", 1),
@@ -1840,7 +2078,9 @@ mod tests {
 
         assert_eq!(
             choose_repo(&mut app, RepoFilter::Only("repo-b".into())),
-            vec![Effect::PersistRepoView(RepoFilter::Only("repo-b".into()))]
+            vec![Effect::PersistUiState(ui(RepoFilter::Only(
+                "repo-b".into()
+            )))]
         );
         assert_eq!(ids(&app.filtered_rows()), vec!["b-search"]);
         assert_eq!(app.selection(), Some(0));
@@ -1891,7 +2131,7 @@ mod tests {
         app.reduce(Msg::Back);
         assert_eq!(
             choose_repo(&mut app, RepoFilter::Only("ra".into())),
-            vec![Effect::PersistRepoView(RepoFilter::Only("ra".into()))],
+            vec![Effect::PersistUiState(ui(RepoFilter::Only("ra".into())))],
             "the persisted value is the stable identity"
         );
         assert_eq!(
@@ -1902,6 +2142,7 @@ mod tests {
 
         let token = submit(&mut app, "work");
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Ok(vec![attributed_row("ra", "api", "ra-search", 1)]),
         });
@@ -1951,6 +2192,7 @@ mod tests {
         let mut app = app_with(vec![attributed_row("ra", "api", "ra-ready", 1)]);
         let token = submit(&mut app, "work");
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Ok(vec![attributed_row("rb", "api", "rb-search", 1)]),
         });
@@ -1990,6 +2232,7 @@ mod tests {
         ]);
         let token = submit(&mut app, "work");
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Ok(vec![attributed_row("rb", "api", "rb-search", 1)]),
         });
@@ -2010,8 +2253,8 @@ mod tests {
         let mut app = app_with(vec![row("repo-a", "a-1", 1), row("repo-b", "b-1", 1)]);
         choose_repo(&mut app, RepoFilter::Only("repo-b".into()));
 
-        app.reduce(Msg::RepoViewPersisted {
-            repo: RepoFilter::Only("repo-b".into()),
+        app.reduce(Msg::UiStatePersisted {
+            state: ui(RepoFilter::Only("repo-b".into())),
             result: Err("couldn't save repository view: denied".into()),
         });
         assert_eq!(
@@ -2020,8 +2263,8 @@ mod tests {
         );
 
         choose_repo(&mut app, RepoFilter::All);
-        app.reduce(Msg::RepoViewPersisted {
-            repo: RepoFilter::Only("repo-b".into()),
+        app.reduce(Msg::UiStatePersisted {
+            state: ui(RepoFilter::Only("repo-b".into())),
             result: Err("stale failure".into()),
         });
         assert_eq!(
@@ -2029,8 +2272,8 @@ mod tests {
             Some("couldn't save repository view: denied"),
             "stale completion cannot replace the warning"
         );
-        app.reduce(Msg::RepoViewPersisted {
-            repo: RepoFilter::All,
+        app.reduce(Msg::UiStatePersisted {
+            state: ui(RepoFilter::All),
             result: Ok(()),
         });
         assert_eq!(app.persistence_warning(), None);
@@ -2041,20 +2284,20 @@ mod tests {
         let mut app = app_with(vec![row("repo-a", "a-1", 1), row("repo-b", "b-1", 1)]);
         let repo_b = RepoFilter::Only("repo-b".into());
         choose_repo(&mut app, repo_b.clone());
-        app.reduce(Msg::RepoViewPersisted {
-            repo: repo_b.clone(),
+        app.reduce(Msg::UiStatePersisted {
+            state: ui(repo_b.clone()),
             result: Err("couldn't save repository view: denied".into()),
         });
 
         assert_eq!(
             choose_repo(&mut app, repo_b.clone()),
-            vec![Effect::PersistRepoView(repo_b.clone())],
+            vec![Effect::PersistUiState(ui(repo_b.clone()))],
             "confirming the unchanged choice retries the failed write"
         );
         assert_eq!(app.repo_view(), &repo_b);
 
-        app.reduce(Msg::RepoViewPersisted {
-            repo: repo_b,
+        app.reduce(Msg::UiStatePersisted {
+            state: ui(repo_b),
             result: Ok(()),
         });
         assert_eq!(
@@ -2381,6 +2624,7 @@ mod tests {
         app.reduce(Msg::SelectNext); // ready selection -> ra-2
         let token = submit(&mut app, "foo");
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Ok(vec![row("mc", "mc-1", 1), row("mc", "mc-2", 1)]),
         });
@@ -2597,6 +2841,7 @@ mod tests {
 
         // The worker delivers already-attributed rows (its repo_name carried).
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Ok(vec![
                 row("megaclock", "mc-1", 0),
@@ -2621,6 +2866,7 @@ mod tests {
 
         // A non-current token is dropped: the phase stays Loading.
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token: first + 99,
             rows: Ok(vec![row("ra", "ra-1", 1)]),
         });
@@ -2639,6 +2885,7 @@ mod tests {
 
         // The first request answers late (after the re-submit): dropped.
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token: first,
             rows: Ok(vec![row("ra", "ra-1", 1)]),
         });
@@ -2649,6 +2896,7 @@ mod tests {
         );
         // The current request lands.
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token: second,
             rows: Ok(vec![row("ra", "ra-2", 2)]),
         });
@@ -2674,6 +2922,7 @@ mod tests {
 
         let token = submit(&mut app, "foo");
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Ok(vec![row("megaclock", "mc-1", 0)]),
         });
@@ -2702,6 +2951,7 @@ mod tests {
         let mut app = app_with(vec![row("ra", "ra-1", 1)]);
         let token = submit(&mut app, "foo");
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Ok(vec![
                 row("megaclock", "mc-1", 0),
@@ -2745,6 +2995,7 @@ mod tests {
         let mut app = app_with(vec![row("ra", "ra-1", 1)]);
         let token = submit(&mut app, "foo");
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Err("bd search failed: boom".into()),
         });
@@ -2798,6 +3049,7 @@ mod tests {
         let mut app = app_with(vec![row("ra", "ra-1", 1)]);
         let token = submit(&mut app, "foo");
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Ok(vec![
                 row("megaclock", "mc-1", 0),
@@ -2872,6 +3124,7 @@ mod tests {
         let mut app = app_with(vec![row("ra", "ra-1", 1)]);
         let token = submit(&mut app, "foo");
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Ok(vec![row("megaclock", "mc-1", 0)]),
         });
@@ -3043,6 +3296,7 @@ mod tests {
 
         // Results arrive; the earlier `y` must not have copied one.
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token: stoken,
             rows: Ok(vec![row("session-tui", "st-9", 1)]),
         });
@@ -3075,6 +3329,7 @@ mod tests {
         let mut app = app_with(vec![row("ra", "ra-1", 1)]);
         let token = submit(&mut app, "foo");
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Ok(vec![row("megaclock", "mc-1", 0)]),
         });
@@ -3115,6 +3370,7 @@ mod tests {
         // Search returns ra-2 (which is also a ready row); open its detail.
         let token = submit(&mut app, "foo");
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Ok(vec![row("ra", "ra-2", 1)]),
         });
@@ -3362,7 +3618,13 @@ mod tests {
         let before = app.clone();
 
         let effects = app.reduce(Msg::Refresh);
-        assert_eq!(effects, vec![Effect::Refresh(RefreshScope::Full)]);
+        assert_eq!(
+            effects,
+            vec![Effect::Refresh {
+                scope: RefreshScope::Full,
+                status: StatusFilter::Ready
+            }]
+        );
         // Marks the shown rows stale/in-flight, but touches nothing else: the
         // runtime spawns the worker.
         assert!(app.is_stale());
@@ -3381,7 +3643,10 @@ mod tests {
 
         assert_eq!(
             app.reduce(Msg::Refresh),
-            vec![Effect::Refresh(RefreshScope::Full)]
+            vec![Effect::Refresh {
+                scope: RefreshScope::Full,
+                status: StatusFilter::Ready
+            }]
         );
         assert_eq!(
             app.reduce(Msg::Refresh),
@@ -3394,7 +3659,10 @@ mod tests {
         assert!(!app.is_stale());
         assert_eq!(
             app.reduce(Msg::Refresh),
-            vec![Effect::Refresh(RefreshScope::Full)]
+            vec![Effect::Refresh {
+                scope: RefreshScope::Full,
+                status: StatusFilter::Ready
+            }]
         );
     }
 
@@ -3410,7 +3678,10 @@ mod tests {
 
         assert_eq!(
             app.reduce(Msg::Refresh),
-            vec![Effect::Refresh(RefreshScope::Full)]
+            vec![Effect::Refresh {
+                scope: RefreshScope::Full,
+                status: StatusFilter::Ready
+            }]
         );
         assert!(app.is_stale());
         // First cycle concludes atomically with a snapshot and warnings.
@@ -3425,7 +3696,10 @@ mod tests {
         // message from the first cycle exists to clear it.
         assert_eq!(
             app.reduce(Msg::Refresh),
-            vec![Effect::Refresh(RefreshScope::Full)]
+            vec![Effect::Refresh {
+                scope: RefreshScope::Full,
+                status: StatusFilter::Ready
+            }]
         );
         assert!(app.is_stale());
         assert_eq!(
@@ -3454,7 +3728,10 @@ mod tests {
         assert!(!app.is_stale());
         assert_eq!(
             app.reduce(Msg::Refresh),
-            vec![Effect::Refresh(RefreshScope::Full)]
+            vec![Effect::Refresh {
+                scope: RefreshScope::Full,
+                status: StatusFilter::Ready
+            }]
         );
     }
 
@@ -3557,7 +3834,10 @@ mod tests {
         let mut app = app_with(vec![row("ra", "ra-1", 1)]);
         assert_eq!(
             app.reduce(Msg::WatchChanged(repos(&["/a"]))),
-            vec![Effect::Refresh(repos(&["/a"]))]
+            vec![Effect::Refresh {
+                scope: repos(&["/a"]),
+                status: StatusFilter::Ready
+            }]
         );
         assert!(
             app.is_stale(),
@@ -3574,7 +3854,10 @@ mod tests {
 
         assert_eq!(
             app.reduce(completed(vec![row("ra", "ra-1", 1)])),
-            vec![Effect::Refresh(repos(&["/a", "/b"]))],
+            vec![Effect::Refresh {
+                scope: repos(&["/a", "/b"]),
+                status: StatusFilter::Ready
+            }],
             "changes seen mid-cycle get a cycle of their own"
         );
         assert!(app.is_stale());
@@ -3593,7 +3876,10 @@ mod tests {
         app.reduce(Msg::WatchChanged(repos(&["/b"])));
         assert_eq!(
             app.reduce(completed(Vec::new())),
-            vec![Effect::Refresh(RefreshScope::Full)]
+            vec![Effect::Refresh {
+                scope: RefreshScope::Full,
+                status: StatusFilter::Ready
+            }]
         );
     }
 
@@ -3654,7 +3940,10 @@ mod tests {
         app.reduce(Msg::WatchChanged(repos(&["/b"])));
         assert_eq!(
             app.reduce(failed()),
-            vec![Effect::Refresh(repos(&["/a", "/b"]))]
+            vec![Effect::Refresh {
+                scope: repos(&["/a", "/b"]),
+                status: StatusFilter::Ready
+            }]
         );
     }
 
@@ -3929,5 +4218,378 @@ mod tests {
         assert_eq!(app.pending_triage(), None);
         assert_eq!(app.view_mode(), ViewMode::Detail);
         assert_eq!(app.reduce(Msg::ConfirmTriage), vec![]);
+    }
+
+    // ---- Status filter ----
+
+    fn with_status(mut row: Row, status: &str) -> Row {
+        row.issue.status = status.into();
+        row
+    }
+
+    /// Press `s` on the ready list, returning the load token it emitted and
+    /// checking the choice is saved.
+    fn step_status(app: &mut App) -> u64 {
+        let effects = app.reduce(Msg::CycleStatus);
+        match effects.as_slice() {
+            [
+                Effect::LoadStatus { status, token },
+                Effect::PersistUiState(state),
+            ] => {
+                assert_eq!(*status, app.status());
+                assert_eq!(state.status, app.status());
+                assert_eq!(&state.repository, app.repo_view());
+                *token
+            }
+            other => panic!("expected a status load and a save, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_key_steps_the_ready_list_through_each_status_and_back() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        let mut seen = vec![app.status()];
+        for _ in 0..4 {
+            let token = step_status(&mut app);
+            seen.push(app.status());
+            app.reduce(Msg::StatusLoaded {
+                token,
+                rows: Ok(Vec::new()),
+            });
+        }
+        assert_eq!(
+            seen,
+            [
+                StatusFilter::Ready,
+                StatusFilter::Open,
+                StatusFilter::InProgress,
+                StatusFilter::Blocked,
+                StatusFilter::Ready,
+            ]
+        );
+    }
+
+    #[test]
+    fn stepping_status_clears_rows_until_the_load_lands() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1), row("ra", "ra-2", 2)]);
+        app.reduce(Msg::SelectNext);
+
+        let token = step_status(&mut app);
+        assert!(app.status_loading());
+        assert!(app.rows().is_empty(), "ready rows are not shown as open");
+
+        app.reduce(Msg::StatusLoaded {
+            token,
+            rows: Ok(vec![row("ra", "ra-open", 2)]),
+        });
+        assert!(!app.status_loading());
+        assert_eq!(ids(&app.filtered_rows()), vec!["ra-open"]);
+        assert_eq!(app.selection(), Some(0));
+    }
+
+    #[test]
+    fn steps_taken_while_a_load_runs_coalesce_into_one_load() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        let open = step_status(&mut app);
+        // Two more steps while the open load runs: each is saved, but none
+        // starts a worker to contend for the hub lock.
+        for _ in 0..2 {
+            assert_eq!(
+                app.reduce(Msg::CycleStatus),
+                vec![Effect::PersistUiState(app.ui_state())]
+            );
+        }
+        assert_eq!(app.status(), StatusFilter::Blocked);
+
+        let effects = app.reduce(Msg::StatusLoaded {
+            token: open,
+            rows: Ok(vec![row("ra", "ra-open", 1)]),
+        });
+        assert!(app.status_loading(), "the open rows are dropped");
+        assert!(app.rows().is_empty());
+        let blocked = match effects.as_slice() {
+            [
+                Effect::LoadStatus {
+                    status: StatusFilter::Blocked,
+                    token,
+                },
+            ] => *token,
+            other => panic!("expected one load of the blocked list, got {other:?}"),
+        };
+
+        assert_eq!(
+            app.reduce(Msg::StatusLoaded {
+                token: blocked,
+                rows: Ok(vec![with_status(row("ra", "ra-flag", 1), "blocked")]),
+            }),
+            vec![]
+        );
+        assert_eq!(ids(&app.filtered_rows()), vec!["ra-flag"]);
+        assert_eq!(step_status(&mut app), blocked + 1, "the next step loads");
+    }
+
+    #[test]
+    fn a_load_superseded_by_a_refresh_starts_no_other_load() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        let token = step_status(&mut app);
+        app.reduce(Msg::RefreshCompleted {
+            snapshot: Some(Snapshot {
+                status: StatusFilter::Open,
+                ..snapshot(vec![row("ra", "ra-fresh", 1)])
+            }),
+            warnings: Vec::new(),
+        });
+        assert_eq!(
+            app.reduce(Msg::StatusLoaded {
+                token,
+                rows: Ok(Vec::new()),
+            }),
+            vec![]
+        );
+        step_status(&mut app);
+    }
+
+    #[test]
+    fn status_key_recovers_a_launch_whose_saved_status_failed_to_load() {
+        let mut app = App::with_ui_state(UiState {
+            status: StatusFilter::Blocked,
+            ..UiState::default()
+        });
+        app.reduce(Msg::RefreshCompleted {
+            snapshot: None,
+            warnings: vec!["reading blocked list failed: boom".into()],
+        });
+        assert_eq!(app.view_mode(), ViewMode::Loading);
+
+        let effects = app.reduce(Msg::CycleStatus);
+        assert_eq!(app.status(), StatusFilter::Ready);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Refresh {
+                    scope: RefreshScope::Full,
+                    status: StatusFilter::Ready,
+                },
+                Effect::PersistUiState(app.ui_state()),
+            ]
+        );
+        assert!(app.is_stale());
+        assert_eq!(
+            app.reduce(Msg::CycleStatus),
+            vec![],
+            "one refresh at a time"
+        );
+
+        app.reduce(completed(vec![row("ra", "ra-1", 1)]));
+        assert_eq!(app.view_mode(), ViewMode::List);
+        assert_eq!(ids(&app.filtered_rows()), vec!["ra-1"]);
+    }
+
+    #[test]
+    fn a_failed_status_load_is_shown_until_the_next_load() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        let token = step_status(&mut app);
+        app.reduce(Msg::StatusLoaded {
+            token,
+            rows: Err("open list failed: boom".into()),
+        });
+        assert!(!app.status_loading());
+        assert_eq!(app.status_error(), Some("open list failed: boom"));
+
+        let token = step_status(&mut app);
+        assert_eq!(app.status_error(), None);
+        app.reduce(Msg::StatusLoaded {
+            token,
+            rows: Ok(Vec::new()),
+        });
+        assert_eq!(app.status_error(), None);
+    }
+
+    #[test]
+    fn refreshes_read_the_current_status() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        step_status(&mut app);
+
+        assert_eq!(
+            app.reduce(Msg::Refresh),
+            vec![Effect::Refresh {
+                scope: RefreshScope::Full,
+                status: StatusFilter::Open,
+            }]
+        );
+        app.reduce(Msg::RefreshCompleted {
+            snapshot: None,
+            warnings: Vec::new(),
+        });
+        assert_eq!(
+            app.reduce(Msg::WatchChanged(RefreshScope::Full)),
+            vec![Effect::Refresh {
+                scope: RefreshScope::Full,
+                status: StatusFilter::Open,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_refresh_of_the_old_status_is_dropped_and_the_current_one_reloaded() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        app.reduce(Msg::Refresh);
+        let first = step_status(&mut app);
+
+        // The in-flight refresh read the ready list before the switch. The
+        // first load may have lost the hub lock to it, so its reply starts a
+        // fresh load once it lands.
+        assert_eq!(
+            app.reduce(completed(vec![row("ra", "ra-ready", 1)])),
+            vec![]
+        );
+        assert!(app.rows().is_empty(), "ready rows never show as open");
+        let effects = app.reduce(Msg::StatusLoaded {
+            token: first,
+            rows: Err("open list unavailable while another hank is refreshing".into()),
+        });
+        assert_eq!(app.status_error(), None);
+        match effects.as_slice() {
+            [
+                Effect::LoadStatus {
+                    status: StatusFilter::Open,
+                    token,
+                },
+            ] => assert!(*token > first, "a fresh load supersedes the first"),
+            other => panic!("expected a reload of the open list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refresh_of_the_current_status_supersedes_a_pending_load() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        let token = step_status(&mut app);
+
+        app.reduce(Msg::RefreshCompleted {
+            snapshot: Some(Snapshot {
+                status: StatusFilter::Open,
+                ..snapshot(vec![row("ra", "ra-fresh", 1)])
+            }),
+            warnings: Vec::new(),
+        });
+        assert!(!app.status_loading());
+        assert_eq!(ids(&app.filtered_rows()), vec!["ra-fresh"]);
+
+        app.reduce(Msg::StatusLoaded {
+            token,
+            rows: Ok(vec![row("ra", "ra-older", 1)]),
+        });
+        assert_eq!(ids(&app.filtered_rows()), vec!["ra-fresh"]);
+    }
+
+    #[test]
+    fn restored_status_ignores_a_cache_of_another_status() {
+        let mut app = App::with_ui_state(UiState {
+            status: StatusFilter::Blocked,
+            ..UiState::default()
+        });
+        app.hydrate_from_cache(snapshot(vec![row("ra", "ra-1", 1)]));
+        assert_eq!(app.status(), StatusFilter::Blocked);
+        assert_eq!(app.view_mode(), ViewMode::Loading);
+        assert!(app.rows().is_empty());
+
+        app.hydrate_from_cache(Snapshot {
+            status: StatusFilter::Blocked,
+            ..snapshot(vec![row("ra", "ra-2", 1)])
+        });
+        assert_eq!(ids(&app.filtered_rows()), vec!["ra-2"]);
+    }
+
+    #[test]
+    fn status_key_is_inert_outside_a_browsable_list() {
+        let mut app = App::new();
+        assert_eq!(app.reduce(Msg::CycleStatus), vec![]);
+
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        app.reduce(Msg::OpenDetail);
+        assert_eq!(app.reduce(Msg::CycleStatus), vec![]);
+        assert_eq!(app.status(), StatusFilter::Ready);
+
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        app.reduce(Msg::OpenSearch);
+        app.reduce(Msg::SearchInput('x'));
+        app.reduce(Msg::SubmitSearch);
+        assert_eq!(app.reduce(Msg::CycleStatus), vec![], "search is loading");
+        assert_eq!(app.status(), StatusFilter::Ready);
+    }
+
+    #[test]
+    fn status_key_narrows_search_results_in_place_like_priority() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        let token = submit(&mut app, "x");
+        app.reduce(Msg::SearchResults {
+            token,
+            rows: Ok(vec![
+                with_status(row("ra", "ra-open", 1), "open"),
+                with_status(row("ra", "ra-dep", 1), "open"),
+                with_status(row("ra", "ra-wip", 1), "in_progress"),
+                with_status(row("ra", "ra-flag", 1), "blocked"),
+            ]),
+            blocked: BTreeSet::from(["ra-dep".to_string()]),
+        });
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            seen.push((app.filter().status(), ids(&app.filtered_rows())));
+            assert_eq!(app.reduce(Msg::CycleStatus), vec![], "nothing is saved");
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (None, vec!["ra-open", "ra-dep", "ra-wip", "ra-flag"]),
+                (Some(StatusFilter::Open), vec!["ra-open", "ra-dep"]),
+                (Some(StatusFilter::InProgress), vec!["ra-wip"]),
+                (Some(StatusFilter::Blocked), vec!["ra-dep", "ra-flag"]),
+                (None, vec!["ra-open", "ra-dep", "ra-wip", "ra-flag"]),
+            ]
+            .into_iter()
+            .map(|(status, ids)| (status, ids.into_iter().map(String::from).collect()))
+            .collect::<Vec<(Option<StatusFilter>, Vec<String>)>>()
+        );
+        assert_eq!(
+            app.status(),
+            StatusFilter::Ready,
+            "the ready list is untouched"
+        );
+
+        // A new search starts unfiltered, as the priority filter does.
+        app.reduce(Msg::CycleStatus);
+        app.reduce(Msg::Back);
+        app.reduce(Msg::Back);
+        app.reduce(Msg::OpenSearch);
+        assert_eq!(app.filter().status(), None);
+    }
+
+    #[test]
+    fn persistence_warning_tracks_the_saved_status_too() {
+        let mut app = app_with(vec![row("ra", "ra-1", 1)]);
+        step_status(&mut app);
+        let open = UiState {
+            status: StatusFilter::Open,
+            ..UiState::default()
+        };
+        app.reduce(Msg::UiStatePersisted {
+            state: open.clone(),
+            result: Err("couldn't save view settings: denied".into()),
+        });
+        assert_eq!(
+            app.persistence_warning(),
+            Some("couldn't save view settings: denied")
+        );
+
+        app.reduce(Msg::CycleStatus);
+        app.reduce(Msg::UiStatePersisted {
+            state: open,
+            result: Ok(()),
+        });
+        assert_eq!(
+            app.persistence_warning(),
+            Some("couldn't save view settings: denied"),
+            "a superseded save cannot clear the warning"
+        );
     }
 }

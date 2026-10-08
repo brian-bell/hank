@@ -5,7 +5,7 @@
 //! [`crate::app::view::draw`]. Terminal setup/teardown installs a panic hook that
 //! restores the terminal (the session-tui pattern). See `plans/slices/slice-9.md`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,13 +24,13 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::app::{App, Effect, Msg, RefreshScope, RepoSync, RepoSyncOutcome, context, keys, view};
-use crate::bd::{BdCli, BdClient, RepoSyncReport};
+use crate::bd::{BdCli, BdClient, BdError, RepoSyncReport};
 use crate::cache;
 use crate::cli::{CliError, load_roster, run_doctor, sanitize, version_gate};
 use crate::config::{Config, Paths};
 use crate::hub::{ReconcileWitness, ensure_hub, hub_dir, reconcile_witness};
 use crate::refresh::{self, AttributionGeneration, HubGenerationToken, RefreshError};
-use crate::snapshot::{self, Row, Snapshot};
+use crate::snapshot::{self, Row, Snapshot, StatusFilter};
 use crate::ui_state;
 use crate::watch::{BdJournal, WatchList, Watcher};
 
@@ -238,6 +238,7 @@ fn event_loop(
         paths,
         Arc::clone(&refresh_state),
         RefreshScope::Full,
+        app.status(),
     ));
 
     // Run the render/reduce loop, then join threads *unconditionally* — for a
@@ -267,7 +268,7 @@ fn event_loop(
 /// Restore persisted UI preferences before hydrating cached rows, preserving
 /// the app's born-stale launch-refresh guard.
 fn initial_app(paths: &Paths, roster: &Config, now: SystemTime) -> App {
-    let mut app = App::with_repo_view(ui_state::load(paths.ui_state_file()));
+    let mut app = App::with_ui_state(ui_state::load(paths.ui_state_file()));
     if let Some(snapshot) = cache::load(paths.cache_file(), now, roster) {
         app.hydrate_from_cache(snapshot);
     }
@@ -338,7 +339,12 @@ fn execute_effect(
 ) {
     worker_handles.retain(|h| !h.is_finished());
     let handle = match effect {
-        Effect::Refresh(scope) => spawn_refresh(tx, paths, Arc::clone(refresh_state), scope),
+        Effect::Refresh { scope, status } => {
+            spawn_refresh(tx, paths, Arc::clone(refresh_state), scope, status)
+        }
+        Effect::LoadStatus { status, token } => {
+            spawn_status_load(tx, paths, status, token, Arc::clone(refresh_state))
+        }
         Effect::FetchDetail { id, token } => spawn_detail(tx, paths, id, token),
         Effect::Search { query, token } => {
             spawn_search(tx, paths, query, token, Arc::clone(refresh_state))
@@ -371,10 +377,10 @@ fn execute_effect(
             return;
         }
         Effect::CheckHealth { token } => spawn_health(tx, paths, token),
-        Effect::PersistRepoView(repo) => {
-            let result = ui_state::save(paths.ui_state_file(), &repo)
-                .map_err(|error| sanitize(&format!("couldn't save repository view: {error}")));
-            let _ = tx.send(Msg::RepoViewPersisted { repo, result }.into());
+        Effect::PersistUiState(state) => {
+            let result = ui_state::save(paths.ui_state_file(), &state)
+                .map_err(|error| sanitize(&format!("couldn't save view settings: {error}")));
+            let _ = tx.send(Msg::UiStatePersisted { state, result }.into());
             return;
         }
         // The reducer has already committed to this action. Executing claim,
@@ -409,10 +415,11 @@ fn spawn_refresh(
     paths: &Paths,
     state: Arc<RuntimeRefreshState>,
     scope: RefreshScope,
+    status: StatusFilter,
 ) -> thread::JoinHandle<()> {
     let tx = tx.clone();
     let paths = paths.clone();
-    thread::spawn(move || reloading_refresh_worker(&BdCli::new(), paths, tx, state, scope))
+    thread::spawn(move || reloading_refresh_worker(&BdCli::new(), paths, tx, state, scope, status))
 }
 
 /// The TUI's refresh body: re-read the roster from `config.toml`, then run
@@ -429,11 +436,12 @@ fn reloading_refresh_worker(
     tx: Sender<Incoming>,
     state: Arc<RuntimeRefreshState>,
     scope: RefreshScope,
+    status: StatusFilter,
 ) {
     match load_roster(&paths) {
         Ok(roster) => {
             state.watch_roster(&paths, &roster);
-            refresh_worker_with_state(bd, roster, paths, tx, state, scope)
+            refresh_worker_with_state(bd, roster, paths, tx, state, scope, status)
         }
         Err(error) => {
             let _ = tx.send(Msg::RefreshStarted.into());
@@ -505,6 +513,7 @@ pub(crate) fn refresh_worker(
         tx,
         Arc::new(RuntimeRefreshState::default()),
         RefreshScope::Full,
+        StatusFilter::Ready,
     );
 }
 
@@ -515,6 +524,7 @@ fn refresh_worker_with_state(
     tx: Sender<Incoming>,
     state: Arc<RuntimeRefreshState>,
     scope: RefreshScope,
+    status: StatusFilter,
 ) {
     let _ = tx.send(Msg::RefreshStarted.into());
     let only = match scope {
@@ -529,6 +539,7 @@ fn refresh_worker_with_state(
         &paths,
         &state,
         only.as_ref(),
+        status,
         &mut metrics,
         &mut syncs,
     );
@@ -657,11 +668,12 @@ fn search_worker_with_state(
     state: Arc<RuntimeRefreshState>,
 ) {
     match gather_search_with_state(&bd, &paths, &query, &state) {
-        Ok((rows, verified)) => {
+        Ok((rows, blocked, verified)) => {
             let _ = tx.send(Incoming::AttributedMsg {
                 msg: Msg::SearchResults {
                     token,
                     rows: Ok(rows),
+                    blocked,
                 },
                 generation: verified.generation,
                 map: Arc::clone(&verified.candidate.prefix_map),
@@ -672,6 +684,7 @@ fn search_worker_with_state(
                 Msg::SearchResults {
                     token,
                     rows: Err(message),
+                    blocked: BTreeSet::new(),
                 }
                 .into(),
             );
@@ -679,39 +692,24 @@ fn search_worker_with_state(
     }
 }
 
+/// Search the verified hub. Also returns which results `bd blocked` reports,
+/// so the results' status filter agrees with the ready list's blocked view.
 fn gather_search_with_state(
     bd: &impl BdClient,
     paths: &Paths,
     query: &str,
     state: &RuntimeRefreshState,
-) -> Result<(Vec<Row>, VerifiedAttribution), String> {
-    let generation_state = state
-        .hub_access
-        .read()
-        .expect("hub generation state poisoned");
-    let verified = generation_state
-        .current_hub
-        .clone()
-        .ok_or_else(|| "search unavailable until a verified refresh completes".to_string())?;
-    let hub = hub_dir(paths);
-    let _hub_lock = match refresh::HubLock::try_acquire(&hub)
-        .map_err(|error| sanitize(&format!("search failed: {error}")))?
-    {
-        Some(lock) => lock,
-        None => {
-            return Err(
-                "search unavailable while another hank is refreshing; retry shortly".to_string(),
-            );
-        }
-    };
-    let marker = refresh::read_hub_generation(paths)
-        .map_err(|error| sanitize(&format!("search failed: {error}")))?;
-    if marker.as_ref() != Some(&verified.hub_token) {
-        return Err("hub changed in another hank process; refresh required".to_string());
-    }
-    let issues = bd
-        .search(&hub, query)
-        .map_err(|error| sanitize(&format!("search failed: {error}")))?;
+) -> Result<(Vec<Row>, BTreeSet<String>, VerifiedAttribution), String> {
+    let ((issues, blocked), verified) = with_verified_hub(paths, state, "search", |hub| {
+        let issues = bd.search(hub, query)?;
+        let blocked = bd.blocked(hub)?;
+        Ok((issues, blocked))
+    })?;
+    let blocked = blocked
+        .into_iter()
+        .map(|issue| issue.id)
+        .filter(|id| issues.iter().any(|issue| &issue.id == id))
+        .collect();
     let rows = snapshot::attribute_with_generation(
         issues,
         &verified.candidate.prefix_map,
@@ -719,7 +717,101 @@ fn gather_search_with_state(
         verified.generation,
     )
     .rows;
-    Ok((rows, verified))
+    Ok((rows, blocked, verified))
+}
+
+/// Run `read` against the hub the last verified refresh synced, holding the
+/// hub lock and checking no other hank has replaced that hub since. `action`
+/// names the read in error messages.
+fn with_verified_hub<T>(
+    paths: &Paths,
+    state: &RuntimeRefreshState,
+    action: &str,
+    read: impl FnOnce(&Path) -> Result<T, BdError>,
+) -> Result<(T, VerifiedAttribution), String> {
+    let generation_state = state
+        .hub_access
+        .read()
+        .expect("hub generation state poisoned");
+    let verified = generation_state
+        .current_hub
+        .clone()
+        .ok_or_else(|| format!("{action} unavailable until a verified refresh completes"))?;
+    let hub = hub_dir(paths);
+    let _hub_lock = match refresh::HubLock::try_acquire(&hub)
+        .map_err(|error| sanitize(&format!("{action} failed: {error}")))?
+    {
+        Some(lock) => lock,
+        None => {
+            return Err(format!(
+                "{action} unavailable while another hank is refreshing; retry shortly"
+            ));
+        }
+    };
+    let marker = refresh::read_hub_generation(paths)
+        .map_err(|error| sanitize(&format!("{action} failed: {error}")))?;
+    if marker.as_ref() != Some(&verified.hub_token) {
+        return Err("hub changed in another hank process; refresh required".to_string());
+    }
+    let value = read(&hub).map_err(|error| sanitize(&format!("{action} failed: {error}")))?;
+    Ok((value, verified))
+}
+
+/// Spawn a worker that reads the ready list's rows for `status` from the
+/// verified hub, reporting over `tx`.
+fn spawn_status_load(
+    tx: &Sender<Incoming>,
+    paths: &Paths,
+    status: StatusFilter,
+    token: u64,
+    state: Arc<RuntimeRefreshState>,
+) -> thread::JoinHandle<()> {
+    let tx = tx.clone();
+    let paths = paths.clone();
+    thread::spawn(move || status_load_worker(&BdCli::new(), &paths, status, token, &tx, &state))
+}
+
+/// Read `status`'s issues from the verified hub (no export or sync) and send
+/// one [`Msg::StatusLoaded`] echoing `token`.
+fn status_load_worker(
+    bd: &impl BdClient,
+    paths: &Paths,
+    status: StatusFilter,
+    token: u64,
+    tx: &Sender<Incoming>,
+    state: &RuntimeRefreshState,
+) {
+    let action = format!("{status} list");
+    match with_verified_hub(paths, state, &action, |hub| {
+        snapshot::read_issues(bd, hub, status)
+    }) {
+        Ok((issues, verified)) => {
+            let rows = snapshot::attribute_with_generation(
+                issues,
+                &verified.candidate.prefix_map,
+                SystemTime::now(),
+                verified.generation,
+            )
+            .rows;
+            let _ = tx.send(Incoming::AttributedMsg {
+                msg: Msg::StatusLoaded {
+                    token,
+                    rows: Ok(rows),
+                },
+                generation: verified.generation,
+                map: Arc::clone(&verified.candidate.prefix_map),
+            });
+        }
+        Err(message) => {
+            let _ = tx.send(
+                Msg::StatusLoaded {
+                    token,
+                    rows: Err(message),
+                }
+                .into(),
+            );
+        }
+    }
 }
 
 /// Spawn a background copy worker that reports over `tx`, returning its join
@@ -825,8 +917,16 @@ fn gather_snapshot_with_metrics(
     only: Option<&HashSet<PathBuf>>,
     metrics: &mut PipelineMetrics,
 ) -> (Option<Snapshot>, Vec<String>) {
-    let (verified, warnings) =
-        gather_verified_snapshot(bd, roster, paths, state, only, metrics, &mut None);
+    let (verified, warnings) = gather_verified_snapshot(
+        bd,
+        roster,
+        paths,
+        state,
+        only,
+        StatusFilter::Ready,
+        metrics,
+        &mut None,
+    );
     (verified.map(|(snapshot, _)| snapshot), warnings)
 }
 
@@ -834,12 +934,15 @@ fn gather_snapshot_with_metrics(
 /// the snapshot was read under, so a caller can tell whether that hub is still
 /// current before persisting the snapshot. Once the hub sync succeeds, `syncs`
 /// receives its time and each repo's part in it (see [`Msg::RepoSyncs`]).
+/// `status` picks the issues the snapshot holds.
+#[allow(clippy::too_many_arguments)]
 fn gather_verified_snapshot(
     bd: &impl BdClient,
     roster: &Config,
     paths: &Paths,
     state: &RuntimeRefreshState,
     only: Option<&HashSet<PathBuf>>,
+    status: StatusFilter,
     metrics: &mut PipelineMetrics,
     syncs: &mut Option<(SystemTime, Vec<RepoSync>)>,
 ) -> (Option<(Snapshot, HubGenerationToken)>, Vec<String>) {
@@ -946,21 +1049,19 @@ fn gather_verified_snapshot(
 
     let ready_started = std::time::Instant::now();
     metrics.calls.ready = 1;
-    let result = match bd.ready(&hub) {
-        Ok(issues) => (
-            Some((
-                snapshot::attribute_with_generation(
-                    issues,
-                    &synced.outcome().prefix_map,
-                    synced.outcome().synced_at,
-                    generation,
-                ),
-                hub_token,
-            )),
-            warnings,
-        ),
+    let result = match snapshot::read_issues(bd, &hub, status) {
+        Ok(issues) => {
+            let mut snapshot = snapshot::attribute_with_generation(
+                issues,
+                &synced.outcome().prefix_map,
+                synced.outcome().synced_at,
+                generation,
+            );
+            snapshot.status = status;
+            (Some((snapshot, hub_token)), warnings)
+        }
         Err(e) => {
-            warnings.push(sanitize(&format!("reading ready list failed: {e}")));
+            warnings.push(sanitize(&format!("reading {status} list failed: {e}")));
             (None, warnings)
         }
     };
@@ -1071,7 +1172,8 @@ fn set_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bd::{BdError, BdErrorKind, FakeBdClient, Issue};
+    use crate::app::UiState;
+    use crate::bd::{BdErrorKind, FakeBdClient, Issue};
     use crate::config::RepoEntry;
     use crate::refresh::HubLock;
     use std::fs;
@@ -1113,7 +1215,7 @@ mod tests {
                 Err(error) if error.contains("another hank is refreshing") => {
                     thread::sleep(Duration::from_millis(1));
                 }
-                result => return result,
+                result => return result.map(|(rows, _, verified)| (rows, verified)),
             }
         }
         Err("completed refresh lock remained held for 100 ms".to_string())
@@ -1187,7 +1289,10 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         ui_state::save(
             paths.ui_state_file(),
-            &crate::app::RepoFilter::Only("rb".into()),
+            &UiState {
+                repository: crate::app::RepoFilter::Only("rb".into()),
+                status: StatusFilter::Ready,
+            },
         )
         .unwrap();
         cache::save(
@@ -1208,6 +1313,7 @@ mod tests {
                     },
                 ],
                 fetched_at: now - Duration::from_secs(60),
+                status: crate::snapshot::StatusFilter::Ready,
             },
             &roster,
         )
@@ -1227,17 +1333,57 @@ mod tests {
     }
 
     #[test]
-    fn persist_repo_view_effect_writes_state_and_reports_completion() {
+    fn startup_skips_a_cache_of_another_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let roster = Config::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        ui_state::save(
+            paths.ui_state_file(),
+            &UiState {
+                status: StatusFilter::InProgress,
+                ..UiState::default()
+            },
+        )
+        .unwrap();
+        cache::save(
+            paths.cache_file(),
+            &Snapshot {
+                rows: vec![Row {
+                    issue: issue("a-1", 1, "A"),
+                    repo_id: Some("ra".into()),
+                    repo_name: "repo-a".into(),
+                    attribution_generation: None,
+                }],
+                fetched_at: now - Duration::from_secs(60),
+                status: StatusFilter::Ready,
+            },
+            &roster,
+        )
+        .unwrap();
+
+        let app = initial_app(&paths, &roster, now);
+
+        assert_eq!(app.status(), StatusFilter::InProgress);
+        assert!(app.rows().is_empty(), "cached ready rows are not shown");
+        assert_eq!(app.view_mode(), crate::app::ViewMode::Loading);
+    }
+
+    #[test]
+    fn persist_ui_state_effect_writes_state_and_reports_completion() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let (tx, rx) = mpsc::channel();
         let mut handles = Vec::new();
-        let repo = crate::app::RepoFilter::Only("repo-b".into());
+        let state = UiState {
+            repository: crate::app::RepoFilter::Only("repo-b".into()),
+            status: StatusFilter::Blocked,
+        };
         fs::create_dir_all(paths.data_dir()).unwrap();
         fs::write(paths.cache_file(), b"cache sentinel").unwrap();
 
         execute_effect(
-            Effect::PersistRepoView(repo.clone()),
+            Effect::PersistUiState(state.clone()),
             &tx,
             &mut handles,
             &paths,
@@ -1250,12 +1396,12 @@ mod tests {
         );
         assert_eq!(
             recv_msg(&rx),
-            Msg::RepoViewPersisted {
-                repo: repo.clone(),
+            Msg::UiStatePersisted {
+                state: state.clone(),
                 result: Ok(())
             }
         );
-        assert_eq!(ui_state::load(paths.ui_state_file()), repo);
+        assert_eq!(ui_state::load(paths.ui_state_file()), state);
         assert_eq!(
             fs::read(paths.cache_file()).unwrap(),
             b"cache sentinel",
@@ -1264,16 +1410,19 @@ mod tests {
     }
 
     #[test]
-    fn persist_repo_view_failure_is_reported_without_aborting() {
+    fn persist_ui_state_failure_is_reported_without_aborting() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("hank"), "not a directory").unwrap();
         let paths = Paths::with_base(tmp.path());
         let (tx, rx) = mpsc::channel();
         let mut handles = Vec::new();
-        let repo = crate::app::RepoFilter::Only("repo-b".into());
+        let state = UiState {
+            repository: crate::app::RepoFilter::Only("repo-b".into()),
+            ..UiState::default()
+        };
 
         execute_effect(
-            Effect::PersistRepoView(repo.clone()),
+            Effect::PersistUiState(state.clone()),
             &tx,
             &mut handles,
             &paths,
@@ -1281,12 +1430,12 @@ mod tests {
         );
 
         match recv_msg(&rx) {
-            Msg::RepoViewPersisted {
-                repo: attempted,
+            Msg::UiStatePersisted {
+                state: attempted,
                 result: Err(message),
             } => {
-                assert_eq!(attempted, repo);
-                assert!(message.contains("couldn't save repository view"));
+                assert_eq!(attempted, state);
+                assert!(message.contains("couldn't save view settings"));
                 assert!(!message.chars().any(char::is_control));
             }
             other => panic!("expected non-fatal persistence result, got {other:?}"),
@@ -1339,6 +1488,7 @@ mod tests {
             tx,
             Arc::clone(state),
             RefreshScope::Full,
+            StatusFilter::Ready,
         );
         assert_eq!(recv_msg(&rx), Msg::RefreshStarted);
         match recv_msg(&rx) {
@@ -1858,7 +2008,7 @@ mod tests {
         );
 
         match run_search_worker(make_bd, &paths, &state, 7) {
-            Msg::SearchResults { token, rows } => {
+            Msg::SearchResults { token, rows, .. } => {
                 assert_eq!(token, 7, "the request token is echoed back");
                 let rows = rows.expect("results on success");
                 let found = rows
@@ -1893,7 +2043,7 @@ mod tests {
         );
 
         match run_search_worker(make_bd, &paths, &state, 3) {
-            Msg::SearchResults { token, rows } => {
+            Msg::SearchResults { token, rows, .. } => {
                 assert_eq!(token, 3);
                 let msg = rows.expect_err("a message on failure");
                 assert!(
@@ -1903,6 +2053,163 @@ mod tests {
             }
             other => panic!("expected SearchResults, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn search_worker_reports_which_results_bd_blocked_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let make_bd = || {
+            FakeBdClient::new()
+                .with_ready(vec![issue("ra-1", 1, "ready")])
+                .with_search(vec![issue("ra-1", 1, "hit"), issue("ra-2", 1, "hit")])
+                // ra-9 is blocked but not a result, so it is left out.
+                .with_blocked(vec![issue("ra-2", 1, "waits"), issue("ra-9", 1, "waits")])
+                .with_export_content(&ra, b"{\"id\":\"ra-1\"}\n".to_vec())
+        };
+        let state = Arc::new(RuntimeRefreshState::default());
+        assert!(
+            gather_snapshot_with_state(&make_bd(), &roster(&[&ra]), &paths, &state)
+                .0
+                .is_some()
+        );
+
+        match run_search_worker(make_bd, &paths, &state, 4) {
+            Msg::SearchResults { rows, blocked, .. } => {
+                assert_eq!(rows.expect("results").len(), 2);
+                assert_eq!(blocked, BTreeSet::from(["ra-2".to_string()]));
+            }
+            other => panic!("expected SearchResults, got {other:?}"),
+        }
+    }
+
+    /// Run the status-load worker, retrying while a just-finished refresh
+    /// still holds the hub lock (as [`run_search_worker`] does).
+    fn run_status_load(
+        bd: &FakeBdClient,
+        paths: &Paths,
+        state: &RuntimeRefreshState,
+        status: StatusFilter,
+        token: u64,
+    ) -> Msg {
+        for _ in 0..100 {
+            let (tx, rx) = mpsc::channel();
+            status_load_worker(bd, paths, status, token, &tx, state);
+            drop(tx);
+            let msg = recv_msg(&rx);
+            assert!(rx.recv().is_err(), "exactly one StatusLoaded, then closed");
+            match &msg {
+                Msg::StatusLoaded { rows: Err(e), .. }
+                    if e.contains("another hank is refreshing") =>
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                _ => return msg,
+            }
+        }
+        panic!("hub lock never released");
+    }
+
+    #[test]
+    fn status_load_reads_the_verified_hub_without_exporting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let mut claimed = issue("ra-2", 1, "claimed");
+        claimed.status = "in_progress".into();
+        let bd = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "ready")])
+            .with_list_status("in_progress", vec![claimed])
+            .with_export_content(&ra, b"{\"id\":\"ra-1\"}\n".to_vec());
+        let state = RuntimeRefreshState::default();
+
+        match run_status_load(&bd, &paths, &state, StatusFilter::InProgress, 1) {
+            Msg::StatusLoaded { token, rows } => {
+                assert_eq!(token, 1);
+                let message = rows.expect_err("no verified hub yet");
+                assert!(
+                    message.contains("in_progress list unavailable"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected StatusLoaded, got {other:?}"),
+        }
+
+        assert!(
+            gather_snapshot_with_state(&bd, &roster(&[&ra]), &paths, &state)
+                .0
+                .is_some()
+        );
+        let exports_before = bd
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, crate::bd::Call::Export(..)))
+            .count();
+
+        match run_status_load(&bd, &paths, &state, StatusFilter::InProgress, 2) {
+            Msg::StatusLoaded { token, rows } => {
+                assert_eq!(token, 2, "the request token is echoed back");
+                let rows = rows.expect("rows on success");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].issue.id, "ra-2");
+                assert_eq!(rows[0].repo_name, "ra", "attributed via the verified map");
+                assert!(rows[0].attribution_generation.is_some());
+            }
+            other => panic!("expected StatusLoaded, got {other:?}"),
+        }
+        let exports_after = bd
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, crate::bd::Call::Export(..)))
+            .count();
+        assert_eq!(
+            exports_before, exports_after,
+            "a status load exports nothing"
+        );
+    }
+
+    #[test]
+    fn refresh_reads_and_caches_the_requested_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let mut flagged = issue("ra-3", 1, "flagged");
+        flagged.status = "blocked".into();
+        let bd = FakeBdClient::new()
+            .with_ready(vec![issue("ra-1", 1, "ready")])
+            .with_blocked(vec![issue("ra-2", 1, "waits")])
+            .with_list_status("blocked", vec![flagged]);
+        let cfg = roster(&[&ra]);
+        let (tx, rx) = mpsc::channel();
+
+        let worker_paths = paths.clone();
+        let handle = thread::spawn(move || {
+            refresh_worker_with_state(
+                &bd,
+                cfg,
+                worker_paths,
+                tx,
+                Arc::new(RuntimeRefreshState::default()),
+                RefreshScope::Full,
+                StatusFilter::Blocked,
+            )
+        });
+        let snapshot = loop {
+            match recv_any(&rx) {
+                Msg::RefreshCompleted { snapshot, .. } => break snapshot.expect("a snapshot"),
+                _ => continue,
+            }
+        };
+        handle.join().unwrap();
+
+        assert_eq!(snapshot.status, StatusFilter::Blocked);
+        let mut ids: Vec<&str> = snapshot.rows.iter().map(|r| r.issue.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["ra-2", "ra-3"]);
+        let cached =
+            cache::load(paths.cache_file(), SystemTime::now(), &roster(&[&ra])).expect("cached");
+        assert_eq!(cached.status, StatusFilter::Blocked);
     }
 
     fn copy_row(repo_name: &str, id: &str) -> Row {
@@ -2518,6 +2825,7 @@ mod tests {
             snapshot: Some(Snapshot {
                 rows: Vec::new(),
                 fetched_at: SystemTime::now(),
+                status: crate::snapshot::StatusFilter::Ready,
             }),
             warnings: Vec::new(),
         });

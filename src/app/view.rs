@@ -21,6 +21,7 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 
 use super::{App, DetailState, DoctorState, RepoHealth, Row, SearchPhase, ViewMode};
 use crate::cli::{format_row_body, sanitize};
+use crate::snapshot::StatusFilter;
 
 /// Shown when the roster has no rows at all (no repos configured / nothing
 /// hydrated yet — see slice-9 decision 3).
@@ -28,13 +29,12 @@ const EMPTY_HINT: &str = "no repos configured — run: hank repos discover ~/dev
 
 /// Shown when there are rows but the active filters hide them all, so the user
 /// is not misdirected to reconfigure the roster.
-const NO_MATCH_HINT: &str = "no issues match the current filters — press f/p to change";
+const NO_MATCH_HINT: &str = "no issues match the current filters — press f/p/s to change";
 
 /// One-line key hints for the list view. Only keys that act are advertised, so
-/// the UI never promises an inert command; `enter detail` is live as of Slice 10
-/// and `/ search` as of Slice 11.
-const LIST_HINTS: &str =
-    "hank · q quit · r refresh · / search · f repos · p prio · j/k move · enter detail · h health";
+/// the UI never promises an inert command. Ordered so everything through
+/// `enter open` fits in 80 columns.
+const LIST_HINTS: &str = "hank · q quit · r refresh · / search · f repos · p prio · s status · enter open · j/k move · h health";
 
 /// One-line key hints for the detail pane: `j`/`k` move through beads, while
 /// `J`/`K` and PageUp/PageDown scroll the pane.
@@ -47,9 +47,10 @@ const HEALTH_HINTS: &str = "hank health · j/k scroll · r refresh · esc/h clos
 const SEARCH_EDIT_HINTS: &str = "hank search · type query · enter run · esc cancel";
 
 /// One-line key hints while browsing search results: the keys that act there
-/// (`f`/`p` filter the results the same as the ready list).
+/// (`f`/`p` filter the results the same as the ready list; `s` narrows them by
+/// status).
 const SEARCH_RESULTS_HINTS: &str =
-    "hank search · j/k move · f repos · p prio · enter open · esc edit · q quit";
+    "hank search · j/k move · f repos · p prio · s status · enter open · esc edit · q quit";
 
 /// One-line key hints while a search is pending or failed: only these act there
 /// (navigation and detail-open are inert until results arrive).
@@ -375,14 +376,26 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let status = app.status();
+    if app.status_loading() {
+        frame.render_widget(Paragraph::new(format!("Loading {status} issues…")), area);
+        return;
+    }
+    if let Some(message) = app.status_error() {
+        frame.render_widget(Paragraph::new(sanitize(message)), area);
+        return;
+    }
+
     let rows = app.filtered_rows();
     if rows.is_empty() {
-        // Zero rows at all vs. rows hidden by the active filters: only the former
-        // is a roster problem, so only it points at `repos discover`.
-        let hint = if app.rows().is_empty() {
-            EMPTY_HINT
+        // Zero rows at all vs. rows hidden by the active filters: only an empty
+        // ready list is a roster problem, so only it points at `repos discover`.
+        let hint = if !app.rows().is_empty() {
+            NO_MATCH_HINT.to_string()
+        } else if status == StatusFilter::Ready {
+            EMPTY_HINT.to_string()
         } else {
-            NO_MATCH_HINT
+            format!("no {status} issues — press s to change")
         };
         frame.render_widget(Paragraph::new(hint), area);
         return;
@@ -420,10 +433,16 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
     let status = match app.search_phase() {
         Some(SearchPhase::Editing) => "type a query · enter to search · esc to cancel".to_string(),
         Some(SearchPhase::Loading) => format!("searching for \"{query}\"…"),
-        Some(SearchPhase::Results) => format!(
-            "{count} result{} for \"{query}\"",
-            if count == 1 { "" } else { "s" }
-        ),
+        Some(SearchPhase::Results) => {
+            let mut line = format!(
+                "{count} result{} for \"{query}\"",
+                if count == 1 { "" } else { "s" }
+            );
+            if let Some(status) = app.filter().status() {
+                line.push_str(&format!(" · showing {status}"));
+            }
+            line
+        }
         // The worker already prefixes ("search failed: …") and the boundary
         // re-sanitizes; don't prefix again (was "search failed: search failed: …").
         Some(SearchPhase::Error(msg)) => sanitize(msg),
@@ -561,6 +580,11 @@ fn status_line(app: &App, now: SystemTime) -> String {
         None if app.is_stale() => "refreshing…".to_string(),
         None => "never refreshed".to_string(),
     };
+    // Name the ready list's status first, so it's never clipped. Search shows
+    // its own status filter on its count line instead.
+    if app.search_query().is_none() {
+        status = format!("{} · {status}", app.status());
+    }
     // A refresh over already-shown rows: annotate without hiding the age.
     if app.is_stale() && app.fetched_at().is_some() {
         status.push_str(" · refreshing…");
@@ -625,12 +649,13 @@ fn format_age(now: SystemTime, fetched: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Msg, RepoFilter, TriageAction};
+    use crate::app::{Msg, TriageAction, UiState};
     use crate::bd::Issue;
     use crate::snapshot::{Row, Snapshot};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use std::collections::BTreeSet;
     use std::time::{Duration, UNIX_EPOCH};
 
     const W: u16 = 80;
@@ -672,6 +697,7 @@ mod tests {
             snapshot: Some(Snapshot {
                 rows,
                 fetched_at: at(1000),
+                status: crate::snapshot::StatusFilter::Ready,
             }),
             warnings,
         });
@@ -834,8 +860,8 @@ mod tests {
             vec![row("repo-a", "a-1", 1, "A")],
             vec!["refresh warning".into()],
         );
-        app.reduce(Msg::RepoViewPersisted {
-            repo: RepoFilter::All,
+        app.reduce(Msg::UiStatePersisted {
+            state: UiState::default(),
             result: Err("save warning".into()),
         });
 
@@ -1391,6 +1417,10 @@ DESIGN
             list_title.contains("/ search"),
             "list advertises the search key: {list_title:?}"
         );
+        assert!(
+            list_title.contains("s status"),
+            "list advertises the status key: {list_title:?}"
+        );
 
         let detail = app_in_detail("ra-1", None);
         let detail_title = line_text(&render_sized(&detail, at(1000), w, h), 0);
@@ -1416,6 +1446,7 @@ DESIGN
             other => panic!("expected one Search effect, got {other:?}"),
         };
         app.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Ok(rows),
         });
@@ -1547,6 +1578,7 @@ DESIGN
             other => panic!("expected one Search effect, got {other:?}"),
         };
         err.reduce(Msg::SearchResults {
+            blocked: BTreeSet::new(),
             token,
             rows: Err("search failed: boom".into()),
         });
@@ -1683,5 +1715,77 @@ DESIGN
         let buf = render(&app, at(1600));
         assert!(find_line(&buf, "gate: OK").is_some(), "doctor output shown");
         assert!(find_line(&buf, "running hank doctor").is_none());
+    }
+
+    // ---- Status filter ----
+
+    /// Press `s` on the ready list and return the load token it emitted.
+    fn step_status(app: &mut App) -> u64 {
+        match app.reduce(Msg::CycleStatus).as_slice() {
+            [crate::app::Effect::LoadStatus { token, .. }, _] => *token,
+            other => panic!("expected a status load, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_bar_names_the_ready_lists_status() {
+        let mut app = app_with(vec![row("repo-a", "ra-1", 1, "t")], vec![]);
+        assert!(
+            status_line(&app, at(1000)).starts_with("ready · refreshed"),
+            "{}",
+            status_line(&app, at(1000))
+        );
+        step_status(&mut app);
+        app.reduce(Msg::CycleStatus);
+        assert!(status_line(&app, at(1000)).starts_with("in_progress · "));
+    }
+
+    #[test]
+    fn status_list_shows_loading_empty_and_error_states() {
+        let mut app = app_with(vec![row("repo-a", "ra-1", 1, "t")], vec![]);
+        let token = step_status(&mut app);
+        let buf = render(&app, at(1000));
+        assert!(find_line(&buf, "Loading open issues…").is_some());
+
+        app.reduce(Msg::StatusLoaded {
+            token,
+            rows: Ok(Vec::new()),
+        });
+        let buf = render(&app, at(1000));
+        assert!(find_line(&buf, "no open issues — press s to change").is_some());
+        assert!(
+            find_line(&buf, EMPTY_HINT).is_none(),
+            "an empty status list is not a roster problem"
+        );
+
+        let token = step_status(&mut app);
+        app.reduce(Msg::StatusLoaded {
+            token,
+            rows: Err("in_progress list failed: boom".into()),
+        });
+        let buf = render(&app, at(1000));
+        assert!(find_line(&buf, "in_progress list failed: boom").is_some());
+    }
+
+    #[test]
+    fn search_count_line_names_its_status_filter() {
+        let mut app = app_in_search("foo", vec![row("ra", "ra-1", 1, "a hit")]);
+        let (w, h) = (80, 24);
+        assert!(find_at(&render_sized(&app, at(1000), w, h), "showing", w, h).is_none());
+
+        app.reduce(Msg::CycleStatus);
+        assert!(
+            find_at(
+                &render_sized(&app, at(1000), w, h),
+                "1 result for \"foo\" · showing open",
+                w,
+                h
+            )
+            .is_some()
+        );
+        assert!(
+            !status_line(&app, at(1000)).starts_with("ready"),
+            "search does not show the ready list's status"
+        );
     }
 }

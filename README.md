@@ -105,6 +105,7 @@ every launch is also a full refresh.
 | `PgDn` / `PgUp`| Scroll the detail pane one page down / up                 |
 | `f`            | Open the repository picker (`All repos` is first)          |
 | `p`            | Toggle the priority filter: All ↔ P0/P1 only              |
+| `s`            | Step the status: ready → open → in_progress → blocked     |
 | `/`            | Open cross-repo search                                    |
 | `Enter`        | Open the detail pane for the selected issue               |
 | `y`            | Copy `cd <repo> && bd show <id>` for the selected issue   |
@@ -119,6 +120,15 @@ results. Move its pending choice with `j`/`k` or the arrow keys, confirm with
 `Enter`, or cancel with `Esc`. A confirmed repository view applies globally to
 both ready and search results and is restored on the next launch. `All repos`
 is used on first run and whenever saved UI state is missing or invalid.
+
+The status key (`s`) changes which issues the list holds: `ready` (`bd
+ready`, the default), every `open` or `in_progress` issue, or `blocked`
+(everything `bd blocked` reports plus every issue whose status is `blocked`,
+each once). The list reloads from the hub without re-exporting your repos,
+later refreshes read the same status, and the choice is restored on the next
+launch. The status bar names the current status. In search results `s` instead
+narrows the results in place (all → open → in_progress → blocked), like `p`,
+and is not saved.
 
 The sync-health panel (`h`) lists each roster repo with how fresh the hub's
 copy is (when it last exported cleanly: "synced 3m ago") and, when a repo's latest refresh failed, flags it
@@ -141,7 +151,7 @@ sequence and does not wrap it for tmux passthrough in v1.
 ## Commands (headless)
 
 ```bash
-hank snapshot [--json]   # print the merged, attributed ready list (no TUI)
+hank snapshot [--status <s>] [--json]   # print the merged, attributed list (no TUI)
 hank doctor              # bd version + gate, config/hub paths, per-repo health + journal
 hank reset               # delete the hub DB; rebuilt on the next snapshot/launch
 hank repos add <path>    # add a beads repo to the roster
@@ -152,14 +162,18 @@ hank repos watch <path>|--all       # turn a repo's events journal on (live refr
 hank repos unwatch <path>|--all     # turn it off and opt the repo out
 ```
 
+`hank snapshot --status` takes `ready` (the default), `open`, `in_progress`,
+or `blocked`, with the same meaning as the TUI's status key; `--json` output
+carries the status it read.
+
 The roster's source of truth is `hank/config.toml` under your
 platform config dir (`~/.config` on Linux, `~/Library/Application Support` on
 macOS); the `repos` subcommands edit it, and `hank doctor` prints the exact
 paths in use. Missing paths warn, never fail.
 
-The last confirmed repository view is stored independently at
+The last confirmed repository view and status are stored independently at
 `hank/ui_state.json` under the platform data directory. `hank reset`
-does not remove this user preference; it only discards derived hub/cache data.
+does not remove these user preferences; it only discards derived hub/cache data.
 
 ## How it works
 
@@ -195,7 +209,6 @@ Recorded phase timings live in `docs/performance/refresh.md`.
 
 ## Not in v1 (planned)
 
-- A blocked-issues view (v1 shows only ready work).
 - A background daemon. Live refresh (`--watch`) runs only while the TUI is open.
 
 ## License

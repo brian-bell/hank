@@ -85,6 +85,12 @@ pub trait BdClient: Sync {
     fn repo_sync(&self, hub: &Path) -> Result<RepoSyncReport, BdError>;
     /// `bd -C <hub> ready --json` — issues with no open blockers.
     fn ready(&self, hub: &Path) -> Result<Vec<Issue>, BdError>;
+    /// `bd -C <hub> list --status <status> --limit 0 --json` — every issue with
+    /// exactly this bd status (`open`, `in_progress`, `blocked`, ...).
+    fn list_status(&self, hub: &Path, status: &str) -> Result<Vec<Issue>, BdError>;
+    /// `bd -C <hub> blocked --json` — issues waiting on an open dependency,
+    /// whatever their own status says.
+    fn blocked(&self, hub: &Path) -> Result<Vec<Issue>, BdError>;
     /// `bd -C <hub> show <id>` — native text for the detail pane.
     fn show(&self, hub: &Path, id: &str) -> Result<String, BdError>;
     /// `bd -C <hub> show <id> --json` — structured issue data for an explicit

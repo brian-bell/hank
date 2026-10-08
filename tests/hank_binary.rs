@@ -76,3 +76,22 @@ fn repos_watch_needs_a_path_or_all() {
         assert!(!output.status.success(), "a path and --all conflict");
     }
 }
+
+#[test]
+fn snapshot_status_lists_and_checks_its_values() {
+    let output = hank().args(["snapshot", "--help"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("[possible values: ready, open, in_progress, blocked]"),
+        "{stdout}"
+    );
+
+    let output = hank()
+        .args(["snapshot", "--status", "closed"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "an unknown status is refused");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("'closed'"), "{stderr}");
+}
