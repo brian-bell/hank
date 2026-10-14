@@ -2,12 +2,13 @@
 //! paint the ready list instantly from disk while a real refresh runs in the
 //! background instead of sitting in `Loading` until `bd ready` returns.
 //!
-//! Freshness is judged by the snapshot's own embedded `fetched_at`, not the
-//! file's mtime, so the cache and the "last refreshed" age the UI renders
-//! always agree. A cache miss (missing file, corrupt JSON, stale data, or a
-//! roster mismatch) is never an error to the caller — it just means the
-//! ordinary `Loading` boot runs, exactly as if no cache module existed.
+//! Rows retain their original `fetched_at`. Startup may show older rows as
+//! stale while its mandatory full refresh runs; other callers retain the 12h
+//! freshness limit. Membership checks ignore ordering and watch preferences.
+//! New files carry source paths so rows from removed repos can be filtered;
+//! legacy files without those paths miss when a repo is removed.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,39 +20,45 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::snapshot::{Snapshot, UNKNOWN_REPO};
 
-/// A cached snapshot older than this is not loaded at startup — better to wait
-/// for one real refresh than paint a half-day-stale ready list.
+/// Freshness limit for ordinary cache reads. Startup explicitly allows older
+/// rows, preserving their age and the in-flight full-refresh guard.
 pub const MAX_AGE: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Cache schema carrying stable repository identities on attributed rows.
 const CACHE_VERSION: u64 = 1;
 
-/// The on-disk cache payload: the snapshot plus the roster it was fetched
-/// under. `roster` lets [`load`] reject a cache written before a `repos add`/
-/// `remove` — otherwise a cache from before a removed repo's entry would show
-/// that repo's rows for up to [`MAX_AGE`] regardless of the roster change.
+/// Cached rows, their stable identities, and optional source paths. Source
+/// paths allow safe filtering on roster removals without guessing from labels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheFile {
     version: u64,
     roster: Config,
     snapshot: Snapshot,
     repo_ids: Vec<Option<String>>,
+    #[serde(default)]
+    row_sources: Option<Vec<Option<PathBuf>>>,
 }
 
-/// Load the snapshot cached at `path` if it exists, parses, was written under
-/// `roster` (bytewise `==`, so a `repos add`/`remove`/reorder invalidates it),
-/// and its embedded `fetched_at` is within [`MAX_AGE`] of `now`. Any failure —
-/// missing file, corrupt JSON, a roster mismatch, a legacy attributed row that
-/// predates stable repository identities, or a `fetched_at` more than `MAX_AGE`
-/// before (or after, guarding against clock skew) `now` — yields `None`
-/// silently.
+/// Load a valid snapshot no older than `MAX_AGE`. Repository ordering and
+/// watch settings do not affect cache identity. Added repos preserve old rows;
+/// removed repos require source metadata to filter their rows safely.
 pub fn load(path: &Path, now: SystemTime, roster: &Config) -> Option<Snapshot> {
-    let cached = read(path)?;
+    load_diagnostic(path, now, roster, false).0
+}
+
+/// Startup can paint older rows as stale while its mandatory full refresh runs.
+/// The reason is retained for opt-in startup diagnostics.
+pub fn load_diagnostic(
+    path: &Path,
+    now: SystemTime,
+    roster: &Config,
+    allow_old: bool,
+) -> (Option<Snapshot>, &'static str) {
+    let Some(mut cached) = read(path) else {
+        return (None, if path.exists() { "invalid" } else { "missing" });
+    };
     if cached.version != CACHE_VERSION {
-        return None;
-    }
-    if &cached.roster != roster {
-        return None;
+        return (None, "schema");
     }
     if cached
         .snapshot
@@ -59,13 +66,43 @@ pub fn load(path: &Path, now: SystemTime, roster: &Config) -> Option<Snapshot> {
         .iter()
         .any(|row| row.repo_id.is_none() && row.repo_name != UNKNOWN_REPO)
     {
-        return None;
+        return (None, "identity");
     }
-    let age = now.duration_since(cached.snapshot.fetched_at).ok()?;
-    if age > MAX_AGE {
-        return None;
+    let Some(age) = now.duration_since(cached.snapshot.fetched_at).ok() else {
+        return (None, "future_timestamp");
+    };
+    if age > MAX_AGE && !allow_old {
+        return (None, "age");
     }
-    Some(cached.snapshot)
+    let members = |config: &Config| -> HashSet<PathBuf> {
+        config
+            .repos
+            .iter()
+            .map(|entry| crate::refresh::normalize_path(&entry.path))
+            .collect()
+    };
+    let current = members(roster);
+    let previous = members(&cached.roster);
+    if !previous.is_subset(&current) {
+        let Some(sources) = cached.row_sources else {
+            return (None, "roster_without_sources");
+        };
+        cached.snapshot.rows = cached
+            .snapshot
+            .rows
+            .into_iter()
+            .zip(sources)
+            .filter_map(|(row, source)| {
+                source
+                    .filter(|source| current.contains(&crate::refresh::normalize_path(source)))
+                    .map(|_| row)
+            })
+            .collect();
+    }
+    (
+        Some(cached.snapshot),
+        if age > MAX_AGE { "hit_stale" } else { "hit" },
+    )
 }
 
 /// Persist `snapshot` (fetched under `roster`) to `path` as JSON, creating
@@ -101,6 +138,16 @@ pub fn save_if(
     roster: &Config,
     still_current: impl FnOnce() -> bool,
 ) -> io::Result<()> {
+    save_if_with_sources(path, snapshot, roster, None, still_current)
+}
+
+pub(crate) fn save_if_with_sources(
+    path: &Path,
+    snapshot: &Snapshot,
+    roster: &Config,
+    map: Option<&crate::refresh::PrefixMap>,
+    still_current: impl FnOnce() -> bool,
+) -> io::Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(parent) = parent {
         fs::create_dir_all(parent)?;
@@ -122,6 +169,13 @@ pub fn save_if(
         version: CACHE_VERSION,
         roster: roster.clone(),
         snapshot: snapshot.clone(),
+        row_sources: map.map(|map| {
+            snapshot
+                .rows
+                .iter()
+                .map(|row| map.repo_for(&row.issue.id).map(|repo| repo.path.clone()))
+                .collect()
+        }),
         repo_ids: snapshot
             .rows
             .iter()
@@ -163,7 +217,12 @@ fn lock(path: &Path) -> io::Result<File> {
 fn read(path: &Path) -> Option<CacheFile> {
     let bytes = fs::read(path).ok()?;
     let mut cached: CacheFile = serde_json::from_slice(&bytes).ok()?;
-    if cached.repo_ids.len() != cached.snapshot.rows.len() {
+    if cached
+        .row_sources
+        .as_ref()
+        .is_some_and(|sources| sources.len() != cached.snapshot.rows.len())
+        || cached.repo_ids.len() != cached.snapshot.rows.len()
+    {
         return None;
     }
     for (row, repo_id) in cached.snapshot.rows.iter_mut().zip(&cached.repo_ids) {
@@ -252,6 +311,59 @@ mod tests {
             watch: false,
             repos: paths.iter().map(|p| RepoEntry::new(p.into())).collect(),
         }
+    }
+
+    #[test]
+    fn startup_reuses_old_rows_without_changing_their_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache.json");
+        let snapshot = snapshot_at(at(10));
+        let roster = roster(&["/dev/repo-a"]);
+        save(&path, &snapshot, &roster).unwrap();
+        let now = at(10) + MAX_AGE + Duration::from_secs(1);
+        let (loaded, reason) = load_diagnostic(&path, now, &roster, true);
+        assert_eq!(loaded, Some(snapshot));
+        assert_eq!(reason, "hit_stale");
+        assert!(load(&path, now, &roster).is_none());
+    }
+
+    #[test]
+    fn watch_preferences_and_order_do_not_invalidate_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache.json");
+        let original = roster(&["/dev/repo-a", "/dev/repo-b"]);
+        let snapshot = snapshot_at(at(10));
+        save(&path, &snapshot, &original).unwrap();
+        let mut current = roster(&["/dev/repo-b", "/dev/repo-a"]);
+        current.watch = true;
+        current.repos[0].unwatched = true;
+        assert_eq!(load(&path, at(20), &current), Some(snapshot));
+    }
+
+    #[test]
+    fn removed_repositories_are_filtered_using_source_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache.json");
+        let mut snapshot = snapshot_at(at(10));
+        let mut removed = snapshot.rows[0].clone();
+        removed.issue.id = "rb-1".into();
+        removed.repo_id = Some("rb".into());
+        let mut unknown = snapshot.rows[0].clone();
+        unknown.issue.id = "other-1".into();
+        unknown.repo_id = None;
+        unknown.repo_name = UNKNOWN_REPO.into();
+        snapshot.rows.extend([removed, unknown]);
+        let previous = roster(&["/dev/repo-a", "/dev/repo-b"]);
+        let map = crate::refresh::PrefixMap::from_pairs(vec![
+            ("ra".into(), previous.repos[0].clone()),
+            ("rb".into(), previous.repos[1].clone()),
+        ]);
+        save_if_with_sources(&path, &snapshot, &previous, Some(&map), || true).unwrap();
+        let current = roster(&["/dev/repo-a", "/dev/repo-c"]);
+        let loaded = load(&path, at(20), &current).unwrap();
+        assert_eq!(loaded.rows.len(), 1);
+        assert_eq!(loaded.rows[0].issue.id, "ra-1");
+        assert_eq!(loaded.fetched_at, snapshot.fetched_at);
     }
 
     #[test]
@@ -356,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_cache_written_under_a_different_roster() {
+    fn added_repos_reuse_cache_but_legacy_removed_repos_miss() {
         // A `repos add`/`remove` between the write and the load must miss,
         // so a launch never shows rows from a repo the roster no longer has.
         let tmp = tempfile::tempdir().unwrap();
@@ -366,8 +478,8 @@ mod tests {
 
         let now = at(1_000_000) + Duration::from_secs(60);
         assert!(
-            load(&path, now, &roster(&["/dev/repo-a", "/dev/repo-b"])).is_none(),
-            "an added repo invalidates the cache"
+            load(&path, now, &roster(&["/dev/repo-a", "/dev/repo-b"])).is_some(),
+            "an added repo preserves existing cached rows"
         );
         assert!(
             load(&path, now, &roster(&["/dev/repo-b"])).is_none(),

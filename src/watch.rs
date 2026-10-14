@@ -576,17 +576,31 @@ fn follow_repo_with_backoff(
 pub fn batch_reports(
     reports: &Receiver<Report>,
     checkpoints_file: &Path,
+    saved: Checkpoints,
+    deliver: &mut dyn FnMut(Msg),
+) {
+    batch_reports_observed(reports, checkpoints_file, saved, deliver, &|_| {});
+}
+
+fn batch_reports_observed(
+    reports: &Receiver<Report>,
+    checkpoints_file: &Path,
     mut saved: Checkpoints,
     deliver: &mut dyn FnMut(Msg),
+    observed: &dyn Fn(&Report),
 ) {
     while let Ok(first) = reports.recv() {
         let mut batch = Batch::default();
+        observed(&first);
         batch.add(first);
         let deadline = Instant::now() + DEBOUNCE;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match reports.recv_timeout(left) {
-                Ok(report) => batch.add(report),
+                Ok(report) => {
+                    observed(&report);
+                    batch.add(report);
+                }
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -683,13 +697,33 @@ impl Watcher {
         roster_allows: impl Fn(&Path) -> bool + Send + Sync + 'static,
         deliver: impl FnMut(Msg) + Send + 'static,
     ) -> Watcher {
+        Self::start_observed(
+            source,
+            repos,
+            checkpoints_file,
+            roster_allows,
+            deliver,
+            |_| {},
+        )
+    }
+
+    /// Observe committed reports before debounce, allowing an export that starts
+    /// during the debounce window to cover startup catch-up safely.
+    pub(crate) fn start_observed(
+        source: Arc<dyn JournalSource>,
+        repos: impl Into<WatchList>,
+        checkpoints_file: PathBuf,
+        roster_allows: impl Fn(&Path) -> bool + Send + Sync + 'static,
+        deliver: impl FnMut(Msg) + Send + 'static,
+        observed: impl Fn(&Report) + Send + 'static,
+    ) -> Watcher {
         let saved = Checkpoints::load(&checkpoints_file);
         let (tx, rx) = mpsc::channel::<Report>();
         let batcher = {
             let checkpoints_file = checkpoints_file.clone();
             thread::spawn(move || {
                 let mut deliver = deliver;
-                batch_reports(&rx, &checkpoints_file, saved, &mut deliver);
+                batch_reports_observed(&rx, &checkpoints_file, saved, &mut deliver, &observed);
             })
         };
         let watcher = Watcher {
