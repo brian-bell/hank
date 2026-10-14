@@ -28,6 +28,20 @@ Source repos            Hank                              Hub (bd workspace)
 - **Live refresh** (opt-in): one `bd events tail --follow` per repo feeds a
   debounced batcher; a batch refreshes only the repos that changed, queued
   behind any refresh already running. See [Live refresh](../README.md#live-refresh).
+- **Startup**: valid cached rows paint with their original age, even beyond
+  the ordinary 12h cache freshness limit, while a full refresh runs. Cache
+  membership ignores order and watch preferences; per-row source paths in new
+  files allow removed repos to be filtered. A satisfied on-disk reconciliation
+  witness bypasses redundant hub setup even on the first refresh.
+  `<hub>/.hank-prefixes.json` stores prefix hints under the hub refresh lock;
+  every reused hint must match a fresh non-empty export, and hints never allow
+  an unverified repo to skip export. Hub reset removes these derived hints.
+  During startup the watcher reports changes before debounce. Each source
+  export covers only reports observed before it begins. Reports during/after
+  export remain pending; any export/sync/read failure retains covered reports
+  for retry. Truncation and batches delivered after startup conservatively
+  retain their normal refresh behavior. `--startup-timings <path>` records
+  cache diagnostics, frame timings, phase durations, and operation counts on exit.
 - **State core**: the whole TUI is a pure `reduce(&mut App, Msg) -> Vec<Effect>`
   state machine (no I/O, no clock, no threads inside), so it is exhaustively
   unit-tested; the runtime performs the effects. The last confirmed repository

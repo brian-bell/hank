@@ -151,6 +151,7 @@ sequence and does not wrap it for tmux passthrough in v1.
 ## Commands (headless)
 
 ```bash
+hank --startup-timings timings.json    # write startup diagnostics on TUI exit
 hank snapshot [--status <s>] [--json]   # print the merged, attributed list (no TUI)
 hank doctor              # bd version + gate, config/hub paths, per-repo health + journal
 hank reset               # delete the hub DB; rebuilt on the next snapshot/launch
@@ -161,6 +162,20 @@ hank repos discover <dir> [--add]   # scan <dir>/*/.beads one level deep
 hank repos watch <path>|--all       # turn a repo's events journal on (live refresh)
 hank repos unwatch <path>|--all     # turn it off and opt the repo out
 ```
+
+Startup shows the last cached list, including older rows with their original
+refresh age, while a full refresh runs in the background. Reordering repos or
+changing watch settings preserves the cache. Adding repos preserves existing
+rows; removing repos filters their rows from newly written caches (older cache
+files without source paths are discarded on removal).
+
+Use `hank --startup-timings timings.json` (also works with `--watch`) to compare
+launches. On exit the JSON records cache hit/miss reasons, cache loading, first
+frame and first refreshed frame times, and initial refresh phase timings and
+`bd` call counts. Times are milliseconds from runtime startup or durations of
+the named phase; the diagnostic file is overwritten on each run. Cold launches
+still export every repo. Saved prefixes avoid metadata calls only after a fresh
+export verifies them.
 
 `hank snapshot --status` takes `ready` (the default), `open`, `in_progress`,
 or `blocked`, with the same meaning as the TUI's status key; `--json` output

@@ -40,6 +40,10 @@ struct Cli {
     #[arg(long)]
     watch: bool,
 
+    /// Write startup timings and cache diagnostics as JSON on exit (TUI only).
+    #[arg(long, value_name = "PATH")]
+    startup_timings: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -129,6 +133,11 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
+    if cli.startup_timings.is_some() && cli.command.is_some() {
+        return Err(CliError::Roster(
+            "--startup-timings is available only when launching the TUI".into(),
+        ));
+    }
 
     let paths = Paths::resolve().map_err(|e| CliError::Io(io::Error::other(e)))?;
     let bd = BdCli::new();
@@ -171,7 +180,12 @@ fn run() -> Result<(), CliError> {
         None => {
             let roster = cli::load_roster(&paths)?;
             let watch = cli.watch || roster.watch;
-            hank::runtime::run(&paths, roster, watch)
+            hank::runtime::run_with_diagnostics(
+                &paths,
+                roster,
+                watch,
+                cli.startup_timings.as_deref(),
+            )
         }
     }
 }
