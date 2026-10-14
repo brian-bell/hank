@@ -26,7 +26,7 @@ and x86_64 GNU/Linux. Building from source requires Rust 1.88 or newer.
 Install the latest release:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/brian-bell/hank/releases/latest/download/hank-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/brian-bell/hank/releases/latest/download/hank-tui-installer.sh | sh
 ```
 
 The installer places `hank` in `$CARGO_HOME/bin`, falling back to

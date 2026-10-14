@@ -42,15 +42,17 @@ pinned `bd` and fails on any `SKIP`.
 
 - Binaries: tag `vX.Y.Z` and cargo-dist (`dist-workspace.toml`,
   `.github/workflows/release.yml`) builds the GitHub release archives named
-  `hank-<target>.tar.xz` plus the shell installer.
+  `hank-tui-<target>.tar.xz` plus `hank-tui-installer.sh`.
+  Before tagging, update the package version in `Cargo.toml` and `Cargo.lock`,
+  then run `dist plan --tag vX.Y.Z` with the intended tag to verify it matches.
 - Crates.io: the package is `hank-tui` (`hank` is taken by an unrelated crate);
   the binary and lib stay `hank` via `[[bin]]`/`[lib]` in `Cargo.toml`.
   Publishing is manual by the owner (`cargo publish`, after the tag's release
   exists) — no CI job or `CRATES_IO_TOKEN` secret yet; revisit if releases get
   frequent.
-- `[package.metadata.binstall]` hardcodes the archive URL as `hank-<target>`
-  because binstall's default would use the crate name. If a cargo-dist release
-  ever names archives `hank-tui-<target>`, update `pkg-url`/`bin-dir`.
+- `[package.metadata.binstall]` uses `hank-tui-<target>` for the archive URL
+  and directory, matching cargo-dist's package-based names. The executable
+  inside each archive is `hank`.
 - `cargo publish --dry-run` and `cargo package --list` must stay free of
   `.beads`, `.claude`, `.github`, and agent files (see `exclude`).
 

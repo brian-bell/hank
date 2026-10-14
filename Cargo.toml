@@ -1,6 +1,6 @@
 [package]
 name = "hank-tui"
-version = "0.1.0"
+version = "0.2.0"
 default-run = "hank"
 edition = "2024"
 rust-version = "1.88.0"
@@ -32,11 +32,11 @@ name = "hank"
 path = "src/main.rs"
 
 # `cargo binstall hank-tui` resolves the cargo-dist GitHub Release archives. The
-# archives are named after the binary (`hank-<target>.tar.xz`), not the crate,
-# so the URL is spelled out instead of using binstall's `{ name }` default.
+# archives are named after the package (`hank-tui-<target>.tar.xz`), while the
+# executable inside each archive is still named `hank`.
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/hank-{ target }{ archive-suffix }"
-bin-dir = "hank-{ target }/{ bin }{ binary-ext }"
+pkg-url = "{ repo }/releases/download/v{ version }/hank-tui-{ target }{ archive-suffix }"
+bin-dir = "hank-tui-{ target }/{ bin }{ binary-ext }"
 pkg-fmt = "txz"
 
 [dependencies]
