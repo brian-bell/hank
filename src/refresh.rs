@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::bd::{BdClient, BdError, RepoSyncReport};
 use crate::config::{Config, Paths, RepoEntry};
@@ -68,7 +68,7 @@ pub struct RefreshMetrics {
 
 /// A source prefix that a non-empty, freshly exported JSONL file proved still
 /// matches every exported issue id.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedRepoPrefix {
     pub normalized_path: PathBuf,
     pub prefix: String,
@@ -436,6 +436,20 @@ pub(crate) fn run_scoped(
     only: Option<&HashSet<PathBuf>>,
     worker_limit: usize,
 ) -> Result<SyncedRefresh, RefreshError> {
+    run_scoped_observed(bd, roster, paths, previous, only, worker_limit, &|_| {})
+}
+
+/// Observe each source immediately before its export; observations never certify
+/// changes arriving after this boundary as covered by the export.
+pub(crate) fn run_scoped_observed(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    previous: Option<&AttributionCandidate>,
+    only: Option<&HashSet<PathBuf>>,
+    worker_limit: usize,
+    before_export: &(dyn Fn(&Path) + Sync),
+) -> Result<SyncedRefresh, RefreshError> {
     let hub = hub_dir(paths);
     fs::create_dir_all(&hub).map_err(|source| RefreshError::Io {
         path: hub.clone(),
@@ -445,10 +459,17 @@ pub(crate) fn run_scoped(
         Some(lock) => lock,
         None => return Err(RefreshError::AlreadyRefreshing),
     };
+    let persisted = load_prefixes(paths);
     let previous_prefixes: HashMap<PathBuf, String> = previous
         .into_iter()
         .flat_map(|candidate| candidate.repos.iter())
         .map(|repo| (repo.normalized_path.clone(), repo.prefix.clone()))
+        .chain(
+            persisted
+                .iter()
+                .filter(|_| previous.is_none())
+                .map(|repo| (repo.normalized_path.clone(), repo.prefix.clone())),
+        )
         .collect();
     let jobs = normalized_jobs(roster, paths);
     let roster_paths = jobs
@@ -463,7 +484,7 @@ pub(crate) fn run_scoped(
             for job in jobs {
                 let normalized_path = normalize_path(&job.entry.path);
                 match previous_prefixes.get(&normalized_path) {
-                    Some(prefix) if !only.contains(&normalized_path) => {
+                    Some(prefix) if previous.is_some() && !only.contains(&normalized_path) => {
                         carried.push(SourceOutcome {
                             roster_index: job.roster_index,
                             entry: job.entry,
@@ -485,7 +506,7 @@ pub(crate) fn run_scoped(
         }
     };
     let source_started = Instant::now();
-    let mut outcomes = run_source_jobs(bd, jobs, &previous_prefixes, worker_limit)?;
+    let mut outcomes = run_source_jobs(bd, jobs, &previous_prefixes, worker_limit, before_export)?;
     outcomes.append(&mut carried);
     outcomes.sort_by_key(|outcome| outcome.roster_index);
     let source_wall = source_started.elapsed();
@@ -523,6 +544,7 @@ pub(crate) fn run_scoped(
     let sync_report = bd.repo_sync(&hub).map_err(RefreshError::Sync)?;
     let sync = sync_started.elapsed();
 
+    save_prefixes(paths, &verified_repos);
     let prefix_map = Arc::new(PrefixMap::from_pairs(pairs));
     let outcome = RefreshOutcome {
         prefix_map: (*prefix_map).clone(),
@@ -587,6 +609,7 @@ fn run_source_jobs(
     jobs: Vec<SourceJob>,
     previous_prefixes: &HashMap<PathBuf, String>,
     worker_limit: usize,
+    before_export: &(dyn Fn(&Path) + Sync),
 ) -> Result<Vec<SourceOutcome>, RefreshError> {
     if jobs.is_empty() {
         return Ok(Vec::new());
@@ -611,6 +634,7 @@ fn run_source_jobs(
                         }
                     };
                     let Some(job) = job else { break };
+                    before_export(&normalize_path(&job.entry.path));
                     local.push(run_source_job(bd, job, previous_prefixes));
                 }
                 local
@@ -966,6 +990,26 @@ pub fn read_prefix(repo: &Path) -> Result<String, String> {
     let meta: Metadata =
         serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
     Ok(meta.dolt_database)
+}
+
+/// Persisted prefixes are hints only. Every reused hint is checked against a
+/// fresh non-empty export before it can become verified attribution again.
+fn load_prefixes(paths: &Paths) -> Vec<VerifiedRepoPrefix> {
+    fs::read(hub_dir(paths).join(".hank-prefixes.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_prefixes(paths: &Paths, repos: &[VerifiedRepoPrefix]) {
+    let path = hub_dir(paths).join(".hank-prefixes.json");
+    let temp = hub_dir(paths).join(format!(".hank-prefixes.{}.tmp", std::process::id()));
+    if let Ok(bytes) = serde_json::to_vec(repos)
+        && fs::write(&temp, bytes).is_ok()
+        && fs::rename(&temp, &path).is_err()
+    {
+        let _ = fs::remove_file(&temp);
+    }
 }
 
 #[cfg(test)]
@@ -1686,6 +1730,68 @@ mod tests {
             vec![&renamed],
             "the changed export invalidates only its own cached prefix"
         );
+    }
+
+    #[test]
+    fn restart_revalidates_saved_prefixes_and_still_exports_every_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "old");
+        let config = roster(&[&repo]);
+        let first_bd = FakeBdClient::new()
+            .with_issue_prefix(&repo, "old")
+            .with_export_content(&repo, b"{\"id\":\"old-1\"}\n".to_vec());
+        drop(run_with_state(&first_bd, &config, &paths, None, 1).unwrap());
+        assert_eq!(load_prefixes(&paths).len(), 1);
+
+        let resumed =
+            FakeBdClient::new().with_export_content(&repo, b"{\"id\":\"old-1\"}\n".to_vec());
+        let only = HashSet::new();
+        let second = run_scoped(&resumed, &config, &paths, None, Some(&only), 1).unwrap();
+        assert_eq!(second.outcome().metrics.issue_prefix_calls, 0);
+        assert_eq!(exported(&resumed), vec![repo.clone()]);
+        drop(second);
+
+        let renamed = FakeBdClient::new()
+            .with_issue_prefix(&repo, "new")
+            .with_export_content(&repo, b"{\"id\":\"new-1\"}\n".to_vec());
+        let third = run_with_state(&renamed, &config, &paths, None, 1).unwrap();
+        assert_eq!(third.outcome().metrics.issue_prefix_calls, 1);
+        assert_eq!(third.candidate().repos[0].prefix, "new");
+        drop(third);
+        assert_eq!(load_prefixes(&paths)[0].prefix, "new");
+    }
+
+    #[test]
+    fn invalid_or_empty_exports_cannot_certify_persisted_prefixes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "ra");
+        let config = roster(&[&repo]);
+        for content in [
+            b"".as_slice(),
+            b"bad json\n".as_slice(),
+            b"{\"id\":\"ra-child-1\"}\n".as_slice(),
+        ] {
+            save_prefixes(
+                &paths,
+                &[VerifiedRepoPrefix {
+                    normalized_path: normalize_path(&repo),
+                    prefix: "ra".into(),
+                }],
+            );
+            let bd = FakeBdClient::new()
+                .with_issue_prefix(&repo, "ra")
+                .with_export_content(&repo, content.to_vec());
+            let result = run_with_state(&bd, &config, &paths, None, 1).unwrap();
+            assert_eq!(result.outcome().metrics.issue_prefix_calls, 1);
+        }
+        fs::write(hub_dir(&paths).join(".hank-prefixes.json"), "invalid").unwrap();
+        let bd = FakeBdClient::new()
+            .with_issue_prefix(&repo, "ra")
+            .with_export_content(&repo, b"{\"id\":\"ra-1\"}\n".to_vec());
+        let result = run_with_state(&bd, &config, &paths, None, 1).unwrap();
+        assert_eq!(result.outcome().metrics.issue_prefix_calls, 1);
     }
 
     fn exported(bd: &FakeBdClient) -> Vec<PathBuf> {

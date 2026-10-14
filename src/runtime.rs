@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{self, Event, KeyEvent};
 use crossterm::execute;
@@ -28,11 +28,11 @@ use crate::bd::{BdCli, BdClient, BdError, RepoSyncReport};
 use crate::cache;
 use crate::cli::{CliError, load_roster, run_doctor, sanitize, version_gate};
 use crate::config::{Config, Paths};
-use crate::hub::{ReconcileWitness, ensure_hub, hub_dir, reconcile_witness};
+use crate::hub::{ensure_hub, hub_dir, reconcile_witness};
 use crate::refresh::{self, AttributionGeneration, HubGenerationToken, RefreshError};
 use crate::snapshot::{self, Row, Snapshot, StatusFilter};
 use crate::ui_state;
-use crate::watch::{BdJournal, WatchList, Watcher};
+use crate::watch::{BdJournal, Report, WatchList, Watcher};
 
 /// How long the event thread blocks on `event::poll` before re-checking the stop
 /// flag, so a quit is observed promptly without a busy loop.
@@ -73,12 +73,126 @@ pub struct OperationCounts {
 #[derive(Default)]
 pub(crate) struct RuntimeRefreshState {
     compatibility: OnceLock<Result<(), String>>,
-    reconciled: Mutex<Option<ReconcileWitness>>,
     hub_access: RwLock<HubGenerationState>,
     maps: Mutex<HashMap<AttributionGeneration, Arc<refresh::PrefixMap>>>,
     /// The `--watch` watcher, if live refresh is on. Each refresh hands it the
     /// roster it reloaded, so a repo added mid-session gets a follower too.
     watcher: OnceLock<Watcher>,
+    startup_watch: StartupWatch,
+    diagnostics: StartupDiagnostics,
+}
+
+/// Hold startup journal batches until the full refresh completes. An export
+/// covers only batches delivered before it begins. Late replay may cause an
+/// extra refresh, but an event racing an export can never be discarded.
+#[derive(Default)]
+struct StartupWatch {
+    inner: Mutex<StartupWatchState>,
+}
+
+#[derive(Default)]
+struct StartupWatchState {
+    active: bool,
+    pending: BTreeSet<PathBuf>,
+    covered: BTreeSet<PathBuf>,
+    full: bool,
+}
+
+impl StartupWatch {
+    fn hold(&self, scope: RefreshScope) -> Option<RefreshScope> {
+        let state = self.inner.lock().expect("startup watch poisoned");
+        if !state.active {
+            return Some(scope);
+        }
+        None
+    }
+
+    fn observe(&self, report: &Report) {
+        let mut state = self.inner.lock().expect("startup watch poisoned");
+        if !state.active {
+            return;
+        }
+        match report {
+            Report::Changed { repo, .. } => {
+                state.pending.insert(repo.clone());
+            }
+            Report::Rebaseline { .. } => state.full = true,
+            Report::Warning(_) => {}
+        }
+    }
+
+    fn before_export(&self, repo: &Path) {
+        let mut state = self.inner.lock().expect("startup watch poisoned");
+        if state.active && state.pending.remove(repo) {
+            state.covered.insert(repo.to_path_buf());
+        }
+    }
+
+    fn finish(&self, successful: bool) -> Option<RefreshScope> {
+        let mut state = self.inner.lock().expect("startup watch poisoned");
+        if !state.active {
+            return None;
+        }
+        state.active = false;
+        let covered = std::mem::take(&mut state.covered);
+        if !successful {
+            state.pending.extend(covered);
+        }
+        if state.full {
+            return Some(RefreshScope::Full);
+        }
+        let repos = std::mem::take(&mut state.pending);
+        (!repos.is_empty()).then_some(RefreshScope::Repos(repos))
+    }
+}
+
+struct StartupDiagnostics {
+    enabled: AtomicBool,
+    started: Instant,
+    samples: Mutex<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl Default for StartupDiagnostics {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            started: Instant::now(),
+            samples: Mutex::default(),
+        }
+    }
+}
+
+impl StartupDiagnostics {
+    fn record(&self, key: &str, value: serde_json::Value) {
+        if self.enabled.load(Ordering::Relaxed) {
+            self.samples
+                .lock()
+                .expect("diagnostics poisoned")
+                .insert(key.into(), value);
+        }
+    }
+
+    fn elapsed_ms(&self) -> f64 {
+        self.started.elapsed().as_secs_f64() * 1000.0
+    }
+
+    fn refresh(&self, metrics: &PipelineMetrics, success: bool) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut samples = self.samples.lock().expect("diagnostics poisoned");
+        samples.entry("initial_refresh".to_string()).or_insert_with(|| serde_json::json!({
+            "completed_ms": self.elapsed_ms(), "success": success,
+            "pipeline_ms": metrics.total.as_secs_f64() * 1000.0,
+            "version_ms": metrics.version.as_secs_f64() * 1000.0,
+            "reconcile_ms": metrics.reconcile.as_secs_f64() * 1000.0,
+            "exports_ms": metrics.source_wall.as_secs_f64() * 1000.0,
+            "sync_ms": metrics.sync.as_secs_f64() * 1000.0,
+            "read_ms": metrics.ready.as_secs_f64() * 1000.0,
+            "calls": {"version": metrics.calls.version, "export": metrics.calls.export,
+                "prefix": metrics.calls.issue_prefix, "sync": metrics.calls.repo_sync, "read": metrics.calls.ready}
+        }));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -168,12 +282,40 @@ impl From<Msg> for Incoming {
 /// repo added since. With `watch`, the watcher follows each repo's events
 /// journal and refreshes just the repos that change.
 pub fn run(paths: &Paths, roster: Config, watch: bool) -> Result<(), CliError> {
+    run_with_diagnostics(paths, roster, watch, None)
+}
+
+/// Write opt-in startup measurements after restoring the terminal. No
+/// diagnostic output is interleaved with the TUI or normal command output.
+pub fn run_with_diagnostics(
+    paths: &Paths,
+    roster: Config,
+    watch: bool,
+    output: Option<&Path>,
+) -> Result<(), CliError> {
+    let state = Arc::new(RuntimeRefreshState::default());
+    state
+        .diagnostics
+        .enabled
+        .store(output.is_some(), Ordering::Relaxed);
     let mut terminal = setup_terminal().map_err(CliError::Io)?;
-    let loop_result = event_loop(&mut terminal, paths, &roster, watch);
+    let loop_result = event_loop(&mut terminal, paths, &roster, watch, &state);
     let restore_result = restore_terminal(&mut terminal);
-    // Surface a loop failure first; a restore failure only if the loop was fine.
+    let diagnostic_result = (|| -> io::Result<()> {
+        if let Some(output) = output {
+            let samples = state
+                .diagnostics
+                .samples
+                .lock()
+                .expect("diagnostics poisoned");
+            let bytes = serde_json::to_vec_pretty(&*samples).map_err(io::Error::other)?;
+            std::fs::write(output, bytes)?;
+        }
+        Ok(())
+    })();
     loop_result?;
     restore_result.map_err(CliError::Io)?;
+    diagnostic_result.map_err(CliError::Io)?;
     Ok(())
 }
 
@@ -184,6 +326,7 @@ fn event_loop(
     paths: &Paths,
     roster: &Config,
     watch: bool,
+    refresh_state: &Arc<RuntimeRefreshState>,
 ) -> Result<(), CliError> {
     let (tx, rx) = mpsc::channel::<Incoming>();
     let stop = Arc::new(AtomicBool::new(false));
@@ -194,15 +337,20 @@ fn event_loop(
         thread::spawn(move || input_thread(&tx, &stop))
     };
 
-    // A fresh (<12h) on-disk cache paints instantly, before the real refresh
+    // Cached rows paint immediately, retaining their original age, before the real refresh
     // below has a chance to land, so launch never sits in `Loading` behind a
     // slow `bd ready` when yesterday's rows would do. `hydrate_from_cache`
     // (unlike `reduce(Msg::RefreshCompleted { .. })`) leaves `stale` alone,
     // so the born-stale in-flight guard the constructor reserves for the launch
-    // refresh below stays armed the whole time. A stale/missing/corrupt
+    // refresh below stays armed the whole time. A missing/corrupt
     // cache is a silent no-op: the app stays `Loading` exactly as before
     // this existed.
-    let mut app = initial_app(paths, roster, SystemTime::now());
+    let cache_started = Instant::now();
+    let (mut app, cache_reason) = initial_app_with_reason(paths, roster, SystemTime::now());
+    refresh_state.diagnostics.record(
+        "cache_load_ms",
+        serde_json::json!(cache_started.elapsed().as_secs_f64() * 1000.0),
+    );
     // In-flight background workers (refresh *and* detail), tracked so shutdown can
     // wait for the running bd subprocess to finish and release the hub lock —
     // never orphaning a child that would keep mutating the hub after hank's lock
@@ -210,7 +358,9 @@ fn event_loop(
     // grow across a long session (the Slice 8 guard bounds live refresh workers to
     // one; detail fetches are short and pruned likewise).
     let mut worker_handles: Vec<thread::JoinHandle<()>> = Vec::new();
-    let refresh_state = Arc::new(RuntimeRefreshState::default());
+    refresh_state
+        .diagnostics
+        .record("cache", serde_json::json!(cache_reason));
     // Installed before the launch refresh is spawned, so a repo that joins the
     // roster between `main` loading it and that refresh reloading it is still
     // handed to the watcher; later refreshes add repos that join mid-session.
@@ -218,15 +368,32 @@ fn event_loop(
     // born stale, holding the in-flight slot until that refresh completes.
     if watch {
         app.set_watching(true);
+        refresh_state
+            .startup_watch
+            .inner
+            .lock()
+            .expect("startup watch poisoned")
+            .active = true;
         let tx = tx.clone();
-        let watcher = Watcher::start(
+        let state = Arc::clone(refresh_state);
+        let observed_state = Arc::clone(refresh_state);
+        let watcher = Watcher::start_observed(
             Arc::new(BdJournal::new()),
             watch_list(paths, roster),
             paths.events_checkpoints_file().to_path_buf(),
             roster_allows(paths.clone()),
             move |msg| {
-                let _ = tx.send(msg.into());
+                let msg = match msg {
+                    Msg::WatchChanged(scope) => {
+                        state.startup_watch.hold(scope).map(Msg::WatchChanged)
+                    }
+                    msg => Some(msg),
+                };
+                if let Some(msg) = msg {
+                    let _ = tx.send(msg.into());
+                }
             },
+            move |report| observed_state.startup_watch.observe(report),
         );
         // Only ever set here, so this cannot already hold a watcher.
         let _ = refresh_state.watcher.set(watcher);
@@ -236,7 +403,7 @@ fn event_loop(
     worker_handles.push(spawn_refresh(
         &tx,
         paths,
-        Arc::clone(&refresh_state),
+        Arc::clone(refresh_state),
         RefreshScope::Full,
         app.status(),
     ));
@@ -252,7 +419,7 @@ fn event_loop(
         &mut app,
         &mut worker_handles,
         paths,
-        &refresh_state,
+        refresh_state,
     );
     stop.store(true, Ordering::SeqCst);
     if let Some(watcher) = refresh_state.watcher.get() {
@@ -267,12 +434,21 @@ fn event_loop(
 
 /// Restore persisted UI preferences before hydrating cached rows, preserving
 /// the app's born-stale launch-refresh guard.
+#[cfg(test)]
 fn initial_app(paths: &Paths, roster: &Config, now: SystemTime) -> App {
+    initial_app_with_reason(paths, roster, now).0
+}
+
+fn initial_app_with_reason(paths: &Paths, roster: &Config, now: SystemTime) -> (App, &'static str) {
     let mut app = App::with_ui_state(ui_state::load(paths.ui_state_file()));
-    if let Some(snapshot) = cache::load(paths.cache_file(), now, roster) {
+    let (snapshot, mut reason) = cache::load_diagnostic(paths.cache_file(), now, roster, true);
+    if let Some(snapshot) = snapshot {
+        if snapshot.status != app.status() {
+            reason = "status";
+        }
         app.hydrate_from_cache(snapshot);
     }
-    app
+    (app, reason)
 }
 
 /// The render/reduce loop, factored out so [`event_loop`] can join its threads
@@ -288,10 +464,15 @@ fn ui_loop(
     refresh_state: &Arc<RuntimeRefreshState>,
 ) -> Result<(), CliError> {
     draw(terminal, app)?;
+    refresh_state.diagnostics.record(
+        "first_frame_ms",
+        serde_json::json!(refresh_state.diagnostics.elapsed_ms()),
+    );
     // Redraw on every message and on every idle tick, so the staleness age keeps
     // advancing even while no messages arrive. `Disconnected` cannot occur while
     // the caller still holds `tx`, but is handled defensively as a clean exit.
     loop {
+        let mut refreshed = false;
         match rx.recv_timeout(TICK) {
             Ok(incoming) => {
                 // Decode a raw key against the app's *current* search focus (so a
@@ -310,6 +491,7 @@ fn ui_loop(
                     }
                 };
                 if let Some(msg) = msg {
+                    refreshed = matches!(&msg, Msg::RefreshCompleted { snapshot: Some(snapshot), .. } if snapshot.status == app.status());
                     for effect in app.reduce(msg) {
                         execute_effect(effect, tx, worker_handles, paths, refresh_state);
                     }
@@ -323,6 +505,15 @@ fn ui_loop(
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
         draw(terminal, app)?;
+        if refreshed && refresh_state.diagnostics.enabled.load(Ordering::Relaxed) {
+            refresh_state
+                .diagnostics
+                .samples
+                .lock()
+                .expect("diagnostics poisoned")
+                .entry("first_refreshed_frame_ms")
+                .or_insert_with(|| serde_json::json!(refresh_state.diagnostics.elapsed_ms()));
+        }
     }
 }
 
@@ -444,6 +635,11 @@ fn reloading_refresh_worker(
             refresh_worker_with_state(bd, roster, paths, tx, state, scope, status)
         }
         Err(error) => {
+            let pending = state.startup_watch.finish(false);
+            state.diagnostics.record(
+                "initial_refresh",
+                serde_json::json!({"success": false, "error": "roster"}),
+            );
             let _ = tx.send(Msg::RefreshStarted.into());
             let warning = sanitize(&format!(
                 "couldn't read the roster: {error}; keeping the current view"
@@ -455,6 +651,9 @@ fn reloading_refresh_worker(
                 }
                 .into(),
             );
+            if let Some(scope) = pending {
+                let _ = tx.send(Msg::WatchChanged(scope).into());
+            }
         }
     }
 }
@@ -543,20 +742,43 @@ fn refresh_worker_with_state(
         &mut metrics,
         &mut syncs,
     );
+    let caught_up = verified.is_some()
+        && syncs.as_ref().is_some_and(|(_, repos)| {
+            repos
+                .iter()
+                .all(|repo| !matches!(repo.outcome, RepoSyncOutcome::Failed(_)))
+        });
+    let pending_watch = state.startup_watch.finish(caught_up);
+    state.diagnostics.refresh(&metrics, verified.is_some());
     let snapshot = verified.map(|(snapshot, hub_token)| {
         // Cache only while the hub this snapshot was read from is still current:
         // a `hank reset` (or a newer refresh's hub) since the sync must win over
         // this worker's late, lock-free write, or the next launch would paint the
         // discarded hub's rows from disk.
-        let _ = cache::save_if(paths.cache_file(), &snapshot, &roster, || {
-            refresh::read_hub_generation(&paths).ok().flatten().as_ref() == Some(&hub_token)
-        });
+        let map = state
+            .hub_access
+            .read()
+            .expect("hub generation state poisoned")
+            .current_hub
+            .as_ref()
+            .filter(|current| current.hub_token == hub_token)
+            .map(|current| Arc::clone(&current.candidate.prefix_map));
+        let _ = cache::save_if_with_sources(
+            paths.cache_file(),
+            &snapshot,
+            &roster,
+            map.as_deref(),
+            || refresh::read_hub_generation(&paths).ok().flatten().as_ref() == Some(&hub_token),
+        );
         snapshot
     });
     if let Some((synced_at, repos)) = syncs {
         let _ = tx.send(Msg::RepoSyncs { synced_at, repos }.into());
     }
     let _ = tx.send(Msg::RefreshCompleted { snapshot, warnings }.into());
+    if let Some(scope) = pending_watch {
+        let _ = tx.send(Msg::WatchChanged(scope).into());
+    }
 }
 
 /// Each repo's part in a synced refresh, as the app's [`RepoSync`]: a missing
@@ -989,40 +1211,44 @@ fn gather_verified_snapshot(
         .current_hub
         .as_ref()
         .map(|verified| verified.candidate.clone());
-    let synced = match refresh::run_scoped(bd, roster, paths, previous.as_ref(), only, 4) {
-        Ok(synced) => {
-            for repo_error in &synced.outcome().errors {
-                warnings.push(sanitize(&repo_error.to_string()));
+    let synced =
+        match refresh::run_scoped_observed(bd, roster, paths, previous.as_ref(), only, 4, &|repo| {
+            state.startup_watch.before_export(repo)
+        }) {
+            Ok(synced) => {
+                for repo_error in &synced.outcome().errors {
+                    warnings.push(sanitize(&repo_error.to_string()));
+                }
+                for collision in synced.outcome().prefix_map.collisions() {
+                    warnings.push(sanitize(&format!(
+                        "id prefix `{}` is claimed by {} repos; its issues show as `{}`",
+                        collision.prefix,
+                        collision.repos.len(),
+                        snapshot::UNKNOWN_REPO,
+                    )));
+                }
+                *syncs = Some((
+                    synced.outcome().synced_at,
+                    repo_syncs(&synced.outcome().repos),
+                ));
+                synced
             }
-            for collision in synced.outcome().prefix_map.collisions() {
-                warnings.push(sanitize(&format!(
-                    "id prefix `{}` is claimed by {} repos; its issues show as `{}`",
-                    collision.prefix,
-                    collision.repos.len(),
-                    snapshot::UNKNOWN_REPO,
-                )));
+            // Another hank holds the lock: keep the current view intact rather than
+            // fetching a snapshot with no prefix map (which would re-attribute every
+            // row to `unknown`, reset the age, and empty an active repo filter).
+            // Returning `None` makes `reduce` retain the last-good rows.
+            Err(RefreshError::AlreadyRefreshing) => {
+                warnings
+                    .push("another hank is refreshing this hub; keeping the current view".into());
+                metrics.total = total_started.elapsed();
+                return (None, warnings);
             }
-            *syncs = Some((
-                synced.outcome().synced_at,
-                repo_syncs(&synced.outcome().repos),
-            ));
-            synced
-        }
-        // Another hank holds the lock: keep the current view intact rather than
-        // fetching a snapshot with no prefix map (which would re-attribute every
-        // row to `unknown`, reset the age, and empty an active repo filter).
-        // Returning `None` makes `reduce` retain the last-good rows.
-        Err(RefreshError::AlreadyRefreshing) => {
-            warnings.push("another hank is refreshing this hub; keeping the current view".into());
-            metrics.total = total_started.elapsed();
-            return (None, warnings);
-        }
-        Err(fatal) => {
-            warnings.push(sanitize(&format!("refresh failed: {fatal}")));
-            metrics.total = total_started.elapsed();
-            return (None, warnings);
-        }
-    };
+            Err(fatal) => {
+                warnings.push(sanitize(&format!("refresh failed: {fatal}")));
+                metrics.total = total_started.elapsed();
+                return (None, warnings);
+            }
+        };
     metrics.source_wall = synced.outcome().metrics.source_wall;
     metrics.sync = synced.outcome().metrics.sync;
     metrics.calls.export = synced.outcome().metrics.export_calls;
@@ -1074,22 +1300,14 @@ fn ensure_reconciled(
     bd: &impl BdClient,
     paths: &Paths,
     roster: &Config,
-    state: &RuntimeRefreshState,
+    _state: &RuntimeRefreshState,
 ) -> Result<Vec<String>, crate::hub::HubError> {
     let before = reconcile_witness(paths, roster)?;
-    let can_reuse = state
-        .reconciled
-        .lock()
-        .expect("reconcile state poisoned")
-        .as_ref()
-        .is_some_and(|cached| cached == &before && before.is_satisfied());
-    if can_reuse {
+    if before.is_satisfied() {
         return Ok(before.warnings());
     }
 
     let status = ensure_hub(bd, paths, roster)?;
-    let after = reconcile_witness(paths, roster)?;
-    *state.reconciled.lock().expect("reconcile state poisoned") = Some(after);
     Ok(status.warnings)
 }
 
@@ -1279,6 +1497,140 @@ mod tests {
             stderr: "boom".into(),
             kind: BdErrorKind::NonZeroExit { code: Some(1) },
         }
+    }
+
+    fn catchup() -> StartupWatch {
+        StartupWatch {
+            inner: Mutex::new(StartupWatchState {
+                active: true,
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn journal_change(repo: &str) -> Report {
+        Report::Changed {
+            repo: PathBuf::from(repo),
+            checkpoint: crate::watch::Checkpoint {
+                seq: 1,
+                ts: "t1".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn startup_exports_cover_earlier_events_but_retain_racing_changes() {
+        let gate = catchup();
+        gate.observe(&journal_change("/a"));
+        gate.observe(&journal_change("/b"));
+        gate.before_export(Path::new("/a"));
+        gate.observe(&journal_change("/a")); // committed after a's export began
+        gate.before_export(Path::new("/b"));
+        assert!(
+            gate.hold(RefreshScope::Repos(
+                [PathBuf::from("/a"), PathBuf::from("/b")].into()
+            ))
+            .is_none()
+        );
+        assert_eq!(
+            gate.finish(true),
+            Some(RefreshScope::Repos([PathBuf::from("/a")].into()))
+        );
+        let later = RefreshScope::Repos([PathBuf::from("/c")].into());
+        assert_eq!(gate.hold(later.clone()), Some(later));
+    }
+
+    #[test]
+    fn startup_catchup_is_retried_if_export_sync_or_read_failed() {
+        let gate = catchup();
+        gate.observe(&journal_change("/a"));
+        gate.before_export(Path::new("/a"));
+        assert_eq!(
+            gate.finish(false),
+            Some(RefreshScope::Repos([PathBuf::from("/a")].into()))
+        );
+    }
+
+    #[test]
+    fn startup_truncation_remains_a_full_refresh_and_late_replay_is_safe() {
+        let gate = catchup();
+        gate.observe(&Report::Rebaseline { repo: "/a".into() });
+        gate.before_export(Path::new("/a"));
+        assert_eq!(gate.finish(true), Some(RefreshScope::Full));
+        // A debounced batch delivered after completion is conservatively kept.
+        assert_eq!(gate.hold(RefreshScope::Full), Some(RefreshScope::Full));
+    }
+
+    #[test]
+    fn startup_worker_covers_backlog_and_retries_an_event_during_export() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let repo = seed_repo(tmp.path(), "repo", "ra");
+        let state = Arc::new(RuntimeRefreshState::default());
+        state.startup_watch.inner.lock().unwrap().active = true;
+        state.startup_watch.observe(&Report::Changed {
+            repo: refresh::normalize_path(&repo),
+            checkpoint: crate::watch::Checkpoint {
+                seq: 1,
+                ts: "t1".into(),
+            },
+        });
+        let racing_state = Arc::clone(&state);
+        let bd = FakeBdClient::new()
+            .with_export_content(&repo, b"{\"id\":\"ra-1\"}\n".to_vec())
+            .with_call_hook(move |call| {
+                if let crate::bd::Call::Export(repo, _) = call {
+                    racing_state.startup_watch.observe(&Report::Changed {
+                        repo: refresh::normalize_path(repo),
+                        checkpoint: crate::watch::Checkpoint {
+                            seq: 2,
+                            ts: "t2".into(),
+                        },
+                    });
+                }
+            });
+        let (tx, rx) = mpsc::channel();
+        refresh_worker_with_state(
+            &bd,
+            roster(&[&repo]),
+            paths,
+            tx,
+            state,
+            RefreshScope::Full,
+            StatusFilter::Ready,
+        );
+        let messages: Vec<_> = rx.into_iter().collect();
+        assert!(messages.iter().any(|incoming| matches!(
+            incoming,
+            Incoming::Msg(Msg::RefreshCompleted {
+                snapshot: Some(_),
+                ..
+            })
+        )));
+        assert!(
+            matches!(messages.last(), Some(Incoming::Msg(Msg::WatchChanged(RefreshScope::Repos(repos)))) if repos.contains(&refresh::normalize_path(&repo)))
+        );
+    }
+
+    #[test]
+    fn startup_diagnostics_keep_initial_phase_timings_and_counts() {
+        let diagnostics = StartupDiagnostics::default();
+        diagnostics.enabled.store(true, Ordering::Relaxed);
+        let metrics = PipelineMetrics {
+            source_wall: Duration::from_millis(20),
+            calls: OperationCounts {
+                export: 3,
+                issue_prefix: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        diagnostics.refresh(&metrics, true);
+        diagnostics.refresh(&PipelineMetrics::default(), false);
+        let samples = diagnostics.samples.lock().unwrap();
+        assert_eq!(samples["initial_refresh"]["exports_ms"], 20.0);
+        assert_eq!(samples["initial_refresh"]["calls"]["export"], 3);
+        assert_eq!(samples["initial_refresh"]["success"], true);
     }
 
     #[test]

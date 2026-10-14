@@ -95,3 +95,23 @@ fn snapshot_status_lists_and_checks_its_values() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("'closed'"), "{stderr}");
 }
+
+#[test]
+fn startup_timings_are_documented_and_rejected_for_headless_commands() {
+    let output = hank().arg("--help").output().unwrap();
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("--startup-timings <PATH>")
+    );
+    let output = hank()
+        .args(["--startup-timings", "/unused.json", "snapshot"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("available only when launching the TUI")
+    );
+}
