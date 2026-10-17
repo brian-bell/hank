@@ -2,7 +2,7 @@
 //! prefix→repo attribution map — collecting per-repo failures instead of
 //! aborting on the first bad repo.
 //!
-//! A process-level advisory lock on `<hub>/.hank.lock` serializes refreshes
+//! A process-level advisory lock on `<data_dir>/.hank.lock` serializes refreshes
 //! across concurrent hank instances so two cannot run `repo sync` against the
 //! same embedded-Dolt hub at once. See `plans/slices/slice-4.md`.
 
@@ -22,7 +22,7 @@ use crate::bd::{BdClient, BdError, RepoSyncReport};
 use crate::config::{Config, Paths, RepoEntry};
 use crate::hub::hub_dir;
 
-/// Advisory lock file, inside the hub dir.
+/// Advisory lock file, beside the hub so reset never unlinks a live lock.
 const LOCK_FILE: &str = ".hank.lock";
 const GENERATION_FILE: &str = ".hank-generation";
 
@@ -286,18 +286,32 @@ impl PrefixMap {
     }
 }
 
-/// An acquired advisory lock on `<hub>/.hank.lock`. The OS lock is released when
-/// the held `File` drops (closing the fd releases the `flock`).
+/// An acquired advisory lock on `<hub parent>/.hank.lock`. Dropping the guard
+/// explicitly releases the OS lock before closing its file.
 #[derive(Debug)]
 pub struct HubLock {
     _file: File,
+}
+
+impl Drop for HubLock {
+    fn drop(&mut self) {
+        // An unrelated concurrent process spawn can briefly inherit this open
+        // file description before exec closes it. Unlock explicitly so our
+        // completed operation never leaves the next acquisition waiting on it.
+        let _ = FileExt::unlock(&self._file);
+    }
 }
 
 impl HubLock {
     /// Try to acquire the hub lock without blocking: `Ok(Some(lock))` on
     /// success, `Ok(None)` when another holder has it, `Err` on a real IO error.
     pub fn try_acquire(hub: &Path) -> Result<Option<HubLock>, RefreshError> {
-        let path = hub.join(LOCK_FILE);
+        let parent = hub.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|source| RefreshError::Lock {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let path = parent.join(LOCK_FILE);
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -315,6 +329,11 @@ impl HubLock {
             Err(source) => Err(RefreshError::Lock { path, source }),
         }
     }
+}
+
+/// Acquire before inspecting or mutating the hub, including first-run init.
+pub(crate) fn acquire_hub_lock(paths: &Paths) -> Result<HubLock, RefreshError> {
+    HubLock::try_acquire(&hub_dir(paths))?.ok_or(RefreshError::AlreadyRefreshing)
 }
 
 static GENERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -450,15 +469,36 @@ pub(crate) fn run_scoped_observed(
     worker_limit: usize,
     before_export: &(dyn Fn(&Path) + Sync),
 ) -> Result<SyncedRefresh, RefreshError> {
+    let lock = acquire_hub_lock(paths)?;
+    run_scoped_observed_locked(
+        bd,
+        roster,
+        paths,
+        previous,
+        only,
+        worker_limit,
+        before_export,
+        lock,
+    )
+}
+
+/// Continue a reconciliation transaction without acquiring a second flock.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_scoped_observed_locked(
+    bd: &impl BdClient,
+    roster: &Config,
+    paths: &Paths,
+    previous: Option<&AttributionCandidate>,
+    only: Option<&HashSet<PathBuf>>,
+    worker_limit: usize,
+    before_export: &(dyn Fn(&Path) + Sync),
+    lock: HubLock,
+) -> Result<SyncedRefresh, RefreshError> {
     let hub = hub_dir(paths);
     fs::create_dir_all(&hub).map_err(|source| RefreshError::Io {
         path: hub.clone(),
         source,
     })?;
-    let lock = match HubLock::try_acquire(&hub)? {
-        Some(lock) => lock,
-        None => return Err(RefreshError::AlreadyRefreshing),
-    };
     let persisted = load_prefixes(paths);
     let previous_prefixes: HashMap<PathBuf, String> = previous
         .into_iter()
@@ -2144,6 +2184,19 @@ mod tests {
         // The refresh released the lock, so it can be re-acquired now.
         let reacquired = HubLock::try_acquire(&hub_dir(&paths)).unwrap();
         assert!(reacquired.is_some(), "lock must be released after refresh");
+    }
+
+    #[test]
+    fn lock_drop_unlocks_even_if_an_inherited_descriptor_is_still_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let lock = acquire_hub_lock(&paths).unwrap();
+        let inherited = lock._file.try_clone().unwrap();
+
+        drop(lock);
+
+        assert!(HubLock::try_acquire(&hub_dir(&paths)).unwrap().is_some());
+        drop(inherited);
     }
 
     #[test]
