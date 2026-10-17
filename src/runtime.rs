@@ -858,13 +858,35 @@ pub(crate) fn detail_worker(
     let _ = tx.send(Msg::DetailReady { token, detail }.into());
 }
 
-/// Run `bd show <id>` against the hub, mapping a [`BdError`] to a
-/// pre-formatted, [`sanitize`]d message for the pane. No version gate or
-/// `ensure_hub`: the detail pane is reachable only from the list, i.e. after a
-/// snapshot already hydrated the hub.
+/// Run `bd show <id>` against the hub while holding the lifecycle lock. A
+/// [`BdError`] or a busy lock becomes a pre-formatted, [`sanitize`]d pane
+/// message. No version gate, generation check, or `ensure_hub`: cached rows
+/// are openable before the first refresh publishes a verified hub.
 pub(crate) fn gather_detail(bd: &impl BdClient, paths: &Paths, id: &str) -> Result<String, String> {
-    bd.show(&hub_dir(paths), id)
-        .map_err(|e| sanitize(&format!("couldn't load {id}: {e}")))
+    with_hub_lock(paths, |hub| bd.show(hub, id))
+        .map_err(|error| sanitize(&format!("couldn't load {id}: {error}")))
+}
+
+/// Hold the hub lifecycle lock across one read.
+///
+/// Search and status loads use [`with_verified_hub`], which also refuses until
+/// a refresh has published a generation. Detail and markdown copy stay
+/// reachable from cached rows before that, so they take only the lock: a free
+/// lock reads the hub behind the cache, and a busy lock declines instead of
+/// racing a sync or reset.
+fn with_hub_lock<T>(
+    paths: &Paths,
+    read: impl FnOnce(&Path) -> Result<T, BdError>,
+) -> Result<T, String> {
+    let hub = hub_dir(paths);
+    let _lock = match refresh::HubLock::try_acquire(&hub) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return Err("unavailable while another hank is refreshing; retry shortly".to_string());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    read(&hub).map_err(|error| error.to_string())
 }
 
 /// Spawn a background search worker that reports over `tx`, returning its join
@@ -1070,8 +1092,8 @@ fn build_copy_with_map(
     map: Option<Arc<refresh::PrefixMap>>,
 ) -> (String, String) {
     let payload = if markdown {
-        let issue = bd
-            .show_issue(&hub_dir(paths), &row.issue.id)
+        // Lock failure and `bd show` failure both keep the cached row.
+        let issue = with_hub_lock(paths, |hub| bd.show_issue(hub, &row.issue.id))
             .unwrap_or_else(|_| row.issue.clone());
         context::markdown_block(&issue, &row.repo_name)
     } else {
@@ -3275,6 +3297,90 @@ mod tests {
             bd.calls()
                 .iter()
                 .any(|call| matches!(call, crate::bd::Call::Ready(..)))
+        );
+    }
+
+    #[test]
+    fn detail_and_markdown_copy_hold_hub_lock_before_verified_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let hub = hub_dir(&paths);
+        assert!(
+            refresh::read_hub_generation(&paths).unwrap().is_none(),
+            "a cached row is readable before any refresh publishes a generation"
+        );
+        let mut fresh = issue("ra-1", 2, "Fresh title");
+        fresh.description = Some("Current description".into());
+        let bd = FakeBdClient::new()
+            .with_show(detail())
+            .with_show_issue(fresh)
+            .with_call_hook(move |call| {
+                if matches!(
+                    call,
+                    crate::bd::Call::Show(..) | crate::bd::Call::ShowIssue(..)
+                ) {
+                    assert!(
+                        HubLock::try_acquire(&hub).unwrap().is_none(),
+                        "hub read escaped the lifecycle lock: {call:?}"
+                    );
+                }
+            });
+
+        let loaded =
+            gather_detail(&bd, &paths, "ra-1").expect("detail works before a verified refresh");
+        assert!(loaded.contains("ra-z70"), "{loaded}");
+
+        let row = copy_row("session-tui", "ra-1");
+        let (payload, _) = build_copy_with_map(&bd, &paths, &row, true, None);
+        assert!(payload.contains("Fresh title"), "{payload}");
+        assert!(payload.contains("Current description"), "{payload}");
+        assert!(
+            refresh::read_hub_generation(&paths).unwrap().is_none(),
+            "the locked read does not publish a hub generation"
+        );
+    }
+
+    #[test]
+    fn detail_and_markdown_copy_decline_while_hub_lock_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let hub = hub_dir(&paths);
+        fs::create_dir_all(&hub).unwrap();
+        let _held = HubLock::try_acquire(&hub)
+            .unwrap()
+            .expect("acquired the lock");
+        let mut fresh = issue("ra-1", 2, "Should not be read");
+        fresh.description = Some("live description".into());
+        let bd = FakeBdClient::new()
+            .with_show(detail())
+            .with_show_issue(fresh);
+        let row = copy_row("session-tui", "ra-1");
+
+        let error = gather_detail(&bd, &paths, "ra-1").expect_err("detail declines");
+        assert!(
+            error.to_lowercase().contains("refresh"),
+            "a busy lock is surfaced: {error}"
+        );
+
+        let (payload, _) = build_copy_with_map(&bd, &paths, &row, true, None);
+        assert!(
+            payload.contains("Ready one"),
+            "markdown copy keeps the cached row: {payload}"
+        );
+        assert!(
+            !payload.contains("Should not be read") && !payload.contains("live description"),
+            "markdown copy does not use a hub read that never ran: {payload}"
+        );
+
+        let (command, _) = build_copy_with_map(&bd, &paths, &row, false, None);
+        assert!(
+            command.contains("show ra-1"),
+            "shell copy does not need the hub: {command}"
+        );
+        assert!(
+            bd.calls().is_empty(),
+            "a held lock skips both hub reads: {:?}",
+            bd.calls()
         );
     }
 }
