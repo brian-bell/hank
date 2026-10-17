@@ -804,11 +804,35 @@ mod tests {
     use crate::refresh::HubLock;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
 
-    /// Serializes the tests that mutate process-global state (`cwd`, `$HOME`), which
-    /// cargo would otherwise run concurrently on separate threads of one process.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Run a process-global-state test alone in a child test harness. A mutex
+    /// around mutators cannot protect unrelated subprocess tests that inherit cwd
+    /// or read HOME while the mutator's temporary directories are being removed.
+    /// Returns true in the parent, where the calling test should return early.
+    fn run_isolated(test_name: &str) -> bool {
+        const CHILD_TEST: &str = "HANK_ISOLATED_TEST";
+        let test_name = format!("cli::tests::{test_name}");
+        if std::env::var(CHILD_TEST).as_deref() == Ok(test_name.as_str()) {
+            return false;
+        }
+        let original_dir = std::env::current_dir().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture", "--test-threads=1"])
+            .env(CHILD_TEST, &test_name)
+            .output()
+            .expect("start isolated test harness");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+            "isolated {test_name} failed or did not run:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(std::env::current_dir().unwrap(), original_dir);
+        assert_eq!(std::env::var_os("HOME"), original_home);
+        true
+    }
 
     fn version(v: &str, schema: i64) -> BdVersion {
         BdVersion {
@@ -1386,6 +1410,9 @@ mod tests {
 
     #[test]
     fn load_roster_absolutizes_relative_entries_at_the_config_boundary() {
+        if run_isolated("load_roster_absolutizes_relative_entries_at_the_config_boundary") {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let config_dir = paths
@@ -1402,7 +1429,6 @@ mod tests {
         .save(paths.config_file())
         .unwrap();
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(launch_dir).unwrap();
         let loaded = load_roster(&paths);
@@ -1957,6 +1983,9 @@ mod tests {
 
     #[test]
     fn remove_after_repo_deleted_still_matches() {
+        if run_isolated("remove_after_repo_deleted_still_matches") {
+            return;
+        }
         // The remove-after-deletion case: add a repo (stored canonical), delete it
         // from disk, then remove it by its original relative spelling from the parent.
         let tmp = tempfile::tempdir().unwrap();
@@ -1965,7 +1994,6 @@ mod tests {
         run_repos_add(&FakeBdClient::new(), &paths, &repo, &mut Vec::new()).unwrap();
         fs::remove_dir_all(&repo).unwrap();
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Remove by a relative path resolved from the parent dir (repo is gone).
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
@@ -1986,6 +2014,9 @@ mod tests {
 
     #[test]
     fn add_dedupes_against_relative_hand_edited_entry() {
+        if run_isolated("add_dedupes_against_relative_hand_edited_entry") {
+            return;
+        }
         // A config a user hand-edited to hold a relative entry: adding the same repo
         // by its canonical absolute path must dedupe against it, not duplicate.
         let tmp = tempfile::tempdir().unwrap();
@@ -2005,7 +2036,6 @@ mod tests {
         .save(paths.config_file())
         .unwrap();
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(launch_dir).unwrap();
         let mut out = Vec::new();
@@ -2034,6 +2064,9 @@ mod tests {
 
     #[test]
     fn discover_skips_relative_hand_edited_entry() {
+        if run_isolated("discover_skips_relative_hand_edited_entry") {
+            return;
+        }
         // discover must also normalize stored entries: an already-added repo spelled
         // relatively in the config should not be re-offered.
         let tmp = tempfile::tempdir().unwrap();
@@ -2049,7 +2082,6 @@ mod tests {
         .save(paths.config_file())
         .unwrap();
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
         let mut out = Vec::new();
@@ -2067,14 +2099,16 @@ mod tests {
 
     #[test]
     fn add_expands_tilde_and_canonicalizes() {
+        if run_isolated("add_expands_tilde_and_canonicalizes") {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         // Point HOME at a tempdir holding a seeded repo, then add it via `~/r`.
         let home = tmp.path().join("home");
         let r = seed_repo(&home, "r", "r");
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("HOME");
-        // SAFETY: ENV_LOCK serializes HOME/cwd mutation across tests; restored below.
+        // SAFETY: this child harness runs only this test; HOME is restored below.
         unsafe { std::env::set_var("HOME", &home) };
         let mut out = Vec::new();
         let result = run_repos_add(&FakeBdClient::new(), &paths, Path::new("~/r"), &mut out);
