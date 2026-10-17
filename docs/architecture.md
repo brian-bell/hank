@@ -34,6 +34,12 @@ Source repos            Hank                              Hub (bd workspace)
 - **Live refresh** (opt-in): one `bd events tail --follow` per repo feeds a
   debounced batcher; a batch refreshes only the repos that changed, queued
   behind any refresh already running. See [Live refresh](../README.md#live-refresh).
+- **Roster writes**: `repos add`, `remove`, `discover --add`, `watch`, and
+  `unwatch` hold `<config_root>/hank/.config.toml.lock` from before loading the
+  roster through its atomic save, preserving concurrent changes. The lock is
+  independent of the derived hub and survives config replacement. Remove
+  releases it before attempting the hub prune; readers and discovery previews
+  need no roster lock.
 - **Startup**: valid cached rows paint with their original age, even beyond
   the ordinary 12h cache freshness limit, while a full refresh runs. Cache
   membership ignores order and watch preferences; per-row source paths in new
