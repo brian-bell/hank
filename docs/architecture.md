@@ -64,3 +64,12 @@ types) · `hub` (lifecycle) · `refresh` (export + sync + prefix map) · `snapsh
 (the read model) · `app` (`reduce` core, `view` renderer, `keys` mapping,
 `context` copy builders) · `runtime` (the event loop and workers) · `watch`
 (the opt-in events-journal follower) · `cli` (headless subcommands).
+
+Hub roster reconciliation reads `repos.additional` from the hub's
+`.beads/config.yaml`. Supported bd versions ignore `--json` on `bd repo list`,
+so `BdClient` deliberately has no repo-list operation. Parsing its human-readable
+output would add an unused compatibility surface. The deprecated `serde_yaml`
+0.9.34 dependency is retained for this read-only, narrowly typed YAML read:
+bd owns the file format, and comments, quoted paths, and unrelated configuration
+must keep working. Removing the unused CLI operation does not remove that need;
+replacing the YAML parser requires a separate compatibility assessment.

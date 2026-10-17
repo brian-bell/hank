@@ -138,16 +138,6 @@ fn argv_repo_remove(hub: &Path, repo_path: &Path) -> Vec<OsString> {
     ]
 }
 
-fn argv_repo_list(hub: &Path) -> Vec<OsString> {
-    vec![
-        "-C".into(),
-        arg(hub),
-        "repo".into(),
-        "list".into(),
-        "--json".into(),
-    ]
-}
-
 fn argv_export(repo: &Path, output: &Path) -> Vec<OsString> {
     // bd resolves a relative `-o` against hank's *process* working directory, not
     // the `-C` dir (verified against bd 1.1.0: `bd -C <repo> export -o
@@ -313,10 +303,6 @@ impl BdClient for BdCli {
         self.run_ok(argv_repo_remove(hub, repo_path))
     }
 
-    fn repo_list(&self, hub: &Path) -> Result<serde_json::Value, BdError> {
-        self.run_json(argv_repo_list(hub))
-    }
-
     fn export_to(&self, repo: &Path, output: &Path) -> Result<(), BdError> {
         self.run_ok(argv_export(repo, output))
     }
@@ -437,11 +423,6 @@ mod tests {
         assert_eq!(
             argv_repo_remove(Path::new("/tmp/hub"), Path::new("/tmp/ra")),
             os(&["-C", "/tmp/hub", "repo", "remove", "/tmp/ra"])
-        );
-
-        assert_eq!(
-            argv_repo_list(Path::new("/tmp/hub")),
-            os(&["-C", "/tmp/hub", "repo", "list", "--json"])
         );
 
         // The caller controls the output path; its bytes are passed unchanged.
