@@ -1,7 +1,45 @@
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// A roster transaction lock. The sidecar stays in the config directory so
+/// replacing `config.toml` atomically (or resetting the derived hub) never
+/// replaces a live lock's inode. Hold it from before loading through saving;
+/// closing the file releases the OS lock, including after a process exits.
+pub(crate) struct RosterLock {
+    _file: fs::File,
+}
+
+impl RosterLock {
+    /// Wait for an earlier roster mutation, creating the config directory on
+    /// first run. Readers need no lock because config saves use atomic rename.
+    pub(crate) fn acquire(config_file: &Path) -> Result<Self> {
+        let parent = config_file
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating config directory {}", parent.display()))?;
+        let name = config_file
+            .file_name()
+            .context("config path has no file name")?;
+        let mut lock_name = std::ffi::OsString::from(".");
+        lock_name.push(name);
+        lock_name.push(".lock");
+        let path = parent.join(lock_name);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening roster lock {}", path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("acquiring roster lock {}", path.display()))?;
+        Ok(Self { _file: file })
+    }
+}
 
 /// A single beads source repository in the roster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +90,8 @@ impl Config {
     /// the serialized config is written to a temporary file in the same
     /// directory and then renamed over the destination, so an interrupted or
     /// failed write can never leave `config.toml` truncated or partial.
+    /// Read-modify-write callers must also hold the roster transaction lock
+    /// across the load and save to preserve other writers' changes.
     pub fn save(&self, path: &Path) -> Result<()> {
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
         if let Some(parent) = parent {

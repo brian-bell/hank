@@ -387,6 +387,13 @@ fn save_roster(roster: &Config, paths: &Paths) -> Result<(), CliError> {
         .map_err(|e| CliError::Io(std::io::Error::other(e)))
 }
 
+/// Serialize the complete roster load/mutate/save transaction. This lock is
+/// independent of the hub lock; remove releases it before attempting a prune.
+fn lock_roster(paths: &Paths) -> Result<crate::config::RosterLock, CliError> {
+    crate::config::RosterLock::acquire(paths.config_file())
+        .map_err(|e| CliError::Io(std::io::Error::other(e)))
+}
+
 /// `hank repos add <path>`: canonicalize and append a beads repo to the roster.
 ///
 /// Rejects a directory without a `.beads/` subdir (naming the path and pointing at
@@ -409,6 +416,7 @@ pub fn run_repos_add(
         )));
     }
     let canonical = store_path(path);
+    let _roster_lock = lock_roster(paths)?;
     let mut roster = load_roster(paths)?;
     // Normalize each existing entry too, not just the new path: a hand-edited
     // config.toml may hold relative or symlink-aliased entries, and adding the same
@@ -464,6 +472,7 @@ pub fn run_repos_remove(
     if !hub::tracked_repos_matching(paths, matches)?.is_empty() {
         version_gate(&bd.version()?).map_err(CliError::VersionGate)?;
     }
+    let roster_lock = lock_roster(paths)?;
     let mut roster = load_roster(paths)?;
     let before = roster.repos.len();
     roster
@@ -483,6 +492,7 @@ pub fn run_repos_remove(
             sanitize(&expanded.display().to_string())
         )?;
     }
+    drop(roster_lock);
     prune_hub(bd, paths, matches, out)
 }
 
@@ -555,6 +565,8 @@ pub fn run_repos_discover(
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let root = expand_tilde(root);
+    // A preview remains read-only, including when there is no config yet.
+    let _roster_lock = if add { Some(lock_roster(paths)?) } else { None };
     let mut roster = load_roster(paths)?;
     // Normalize stored entries so a candidate already in the roster under a different
     // spelling (relative/aliased/`~`, e.g. a hand-edited config) is still skipped.
@@ -705,6 +717,7 @@ pub fn run_repos_watch(
     on: bool,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
+    let _roster_lock = lock_roster(paths)?;
     let mut roster = load_roster(paths)?;
     let selected: Vec<usize> = match path {
         Some(path) => {
@@ -1484,6 +1497,94 @@ mod tests {
     }
 
     #[test]
+    fn roster_mutations_wait_for_the_lock_and_reload_the_latest_config() {
+        use fs2::FileExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for command in ["add", "remove", "discover", "watch", "unwatch"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = Paths::with_base(tmp.path());
+            let root = tmp.path().join("sources");
+            let ra = seed_repo(&root, "ra", "ra").canonicalize().unwrap();
+            let concurrent = seed_repo(tmp.path(), "concurrent", "concurrent")
+                .canonicalize()
+                .unwrap();
+            let mut initial = Config::default();
+            if !matches!(command, "add" | "discover") {
+                initial.repos.push(RepoEntry::new(ra.clone()));
+                initial.repos[0].unwatched = command == "watch";
+            }
+            initial.save(paths.config_file()).unwrap();
+
+            // Model another process holding the roster transaction open. Its
+            // later save must be observed by the waiting CLI command.
+            let held = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(paths.config_file().with_file_name(".config.toml.lock"))
+                .unwrap();
+            held.lock_exclusive().unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker_paths = paths.clone();
+            let worker_ra = ra.clone();
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let bd = events_bd();
+                let mut out = Vec::new();
+                let result = match command {
+                    "add" => run_repos_add(&bd, &worker_paths, &worker_ra, &mut out),
+                    "remove" => run_repos_remove(&bd, &worker_paths, &worker_ra, &mut out),
+                    "discover" => run_repos_discover(&bd, &worker_paths, &root, true, &mut out),
+                    _ => run_repos_watch(
+                        &bd,
+                        &worker_paths,
+                        Some(&worker_ra),
+                        command == "watch",
+                        &mut out,
+                    ),
+                };
+                done_tx.send(result).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                matches!(
+                    done_rx.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "{command} must wait until the previous roster transaction ends"
+            );
+            initial.repos.push(RepoEntry::new(concurrent.clone()));
+            initial.watch = true;
+            initial.save(paths.config_file()).unwrap();
+            drop(held);
+
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            worker.join().unwrap();
+            let saved = reload(&paths);
+            assert!(
+                saved.watch,
+                "{command} preserves a concurrent settings change"
+            );
+            assert!(
+                saved.repos.iter().any(|entry| entry.path == concurrent),
+                "{command} preserves the concurrent addition: {saved:?}"
+            );
+            let target = saved.repos.iter().find(|entry| entry.path == ra);
+            match command {
+                "remove" => assert!(target.is_none()),
+                "watch" | "unwatch" => assert_eq!(target.unwrap().unwatched, command == "unwatch"),
+                _ => assert!(target.is_some()),
+            }
+        }
+    }
+
+    #[test]
     fn add_appends_and_dedupes() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
@@ -1780,6 +1881,10 @@ mod tests {
         assert!(
             std::fs::symlink_metadata(paths.config_file()).is_err(),
             "discover without --add mutates nothing"
+        );
+        assert!(
+            !paths.config_file().parent().unwrap().exists(),
+            "a discovery preview creates no config directory or lock"
         );
     }
 
