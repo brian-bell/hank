@@ -540,12 +540,8 @@ mod tests {
     #[test]
     fn show_spawns_bd_once() {
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
 
-        let tmp = tempfile::tempdir().unwrap();
-        let program = tmp.path().join("fake-bd");
-        fs::write(
-            &program,
+        let (_tmp, bd) = install_fake_bd(
             r#"#!/bin/sh
 printf 'call\n' >> "${0}.calls"
 case " $* " in
@@ -553,17 +549,11 @@ case " $* " in
   *) printf '○ ra-1 [TASK] · Task\n' ;;
 esac
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let bd = BdCli {
-            program: program.to_string_lossy().into_owned(),
-        };
+        );
         bd.show(Path::new("/tmp/hub"), "ra-1")
             .expect("native detail loads");
 
-        let calls = fs::read_to_string(format!("{}.calls", program.display())).unwrap();
+        let calls = fs::read_to_string(format!("{}.calls", bd.program)).unwrap();
         assert_eq!(calls.lines().count(), 1, "one detail open runs one bd show");
     }
 
@@ -613,7 +603,6 @@ esac
     #[test]
     fn search_drops_closed_row_from_search_fixture() {
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
 
         let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/search.json");
         let fixture = fs::read_to_string(&fixture_path).expect("search.json reads");
@@ -625,17 +614,10 @@ esac
             "search.json must include closed issue ra-9kq"
         );
 
-        let tmp = tempfile::tempdir().unwrap();
-        let program = tmp.path().join("fake-bd");
+        let (_tmp, bd) = install_fake_bd("#!/bin/sh\ncat \"${0}.json\"\n");
         // `$0` is the script path. The fixture is that path plus `.json`, so a
         // quote in the checkout path never enters the script text.
-        fs::write(program.with_extension("json"), &fixture).unwrap();
-        fs::write(&program, "#!/bin/sh\ncat \"${0}.json\"\n").unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let bd = BdCli {
-            program: program.to_string_lossy().into_owned(),
-        };
+        fs::write(format!("{}.json", bd.program), &fixture).unwrap();
         let issues = bd
             .search(Path::new("/tmp/hub"), "task")
             .expect("bd search --json parses");
@@ -667,7 +649,22 @@ esac
 
         let tmp = tempfile::tempdir().unwrap();
         let program = tmp.path().join("fake-bd");
-        fs::write(&program, script).unwrap();
+        // Never open the executable for writing in the test process: another
+        // test can fork while that fd is live and inherit it until exec, making
+        // our own exec fail with ETXTBSY even after fs::write has returned.
+        // Only this child owns the writable fd, and waiting for its exit closes
+        // it before the file becomes executable. Script bytes stay literal argv.
+        let output = Command::new("/bin/sh")
+            .args(["-c", "printf '%s' \"$2\" > \"$1\"", "install-fake-bd"])
+            .arg(&program)
+            .arg(script)
+            .output()
+            .expect("start fake-bd installer");
+        assert!(
+            output.status.success(),
+            "fake-bd installer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
         let bd = BdCli {
             program: program.to_string_lossy().into_owned(),
