@@ -24,7 +24,13 @@ Source repos            Hank                              Hub (bd workspace)
   atomically replaced while preserving the platform's standard permission
   object. Ownership, ACLs, xattrs, labels, file flags, and inode identity are
   not part of the changed-export metadata contract. The stale list stays
-  browsable, and `<hub>/.hank.lock` serializes concurrent Hank instances.
+  browsable. `<data_root>/hank/.hank.lock` serializes concurrent Hank instances
+  from before hub initialization/reconciliation through sync and the snapshot
+  read. Reset takes the same lock through hub deletion and cache removal; the
+  lock lives outside the disposable hub so deletion cannot split the lock inode.
+  Contention keeps the TUI's current rows and makes `snapshot` and `reset`
+  return a busy error without touching the hub. Older Hank processes using
+  `<hub>/.hank.lock` must be stopped before running this lock protocol.
 - **Live refresh** (opt-in): one `bd events tail --follow` per repo feeds a
   debounced batcher; a batch refreshes only the repos that changed, queued
   behind any refresh already running. See [Live refresh](../README.md#live-refresh).
