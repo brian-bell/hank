@@ -9,13 +9,14 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::time::SystemTime;
 
 use crate::bd::{BdClient, BdError, BdVersion};
 use crate::cache;
 use crate::config::{Config, Paths, RepoEntry};
 use crate::hub::{self, HubError, hub_dir};
-use crate::refresh::{self, PrefixMap, RefreshError};
+use crate::refresh::{self, RefreshError};
 use crate::snapshot::{self, Row, StatusFilter};
 
 /// The minimum bd the version gate accepts.
@@ -34,8 +35,7 @@ pub enum CliError {
     /// Hub lifecycle failed fatally (e.g. init).
     #[error(transparent)]
     Hub(#[from] HubError),
-    /// Refresh failed fatally (sync/lock/io — `AlreadyRefreshing` is handled as a
-    /// non-fatal degraded path inside `run_snapshot`, never surfaced here).
+    /// Refresh failed fatally (sync/lock/io, including hub contention).
     #[error(transparent)]
     Refresh(#[from] RefreshError),
     /// A `bd` read (version/ready) failed fatally.
@@ -123,8 +123,8 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// `ensure_hub → refresh → fetch → print`. See `plans/slices/slice-6.md` for the
-/// full control flow (version gate fatal; per-repo errors and `AlreadyRefreshing`
-/// degrade with a warning; sync/hub/read failures fatal). `status` picks which
+/// full control flow (per-repo errors degrade with a warning; hub contention and
+/// sync/hub/read failures are fatal). `status` picks which
 /// issues to print (see [`snapshot::read_issues`]).
 pub fn run_snapshot(
     roster: &Config,
@@ -139,7 +139,8 @@ pub fn run_snapshot(
     // hank's `--json` parsing was not written against, before touching the hub.
     version_gate(&bd.version()?).map_err(CliError::VersionGate)?;
 
-    let hub_status = hub::ensure_hub(bd, paths, roster)?;
+    let lock = refresh::acquire_hub_lock(paths)?;
+    let hub_status = hub::ensure_hub_locked(bd, paths, roster, &lock)?;
     for warning in &hub_status.warnings {
         // Warnings embed config/repo-derived text (paths, bd stderr, prefixes)
         // and go to a terminal, so sanitize them like rows and doctor output.
@@ -147,44 +148,33 @@ pub fn run_snapshot(
     }
 
     let hub = hub_dir(paths);
-    let fallback_map = PrefixMap::default();
-    let (snapshot, refresh_warnings) = match refresh::run_with_state(bd, roster, paths, None, 4) {
-        Ok(synced) => {
-            // Per-repo failures and prefix collisions are surfaced but never fatal
-            // — the hub still synced whatever exported cleanly.
-            let mut warnings = synced
-                .outcome()
-                .errors
-                .iter()
-                .map(|repo_error| sanitize(&repo_error.to_string()))
-                .collect::<Vec<_>>();
-            for collision in synced.outcome().prefix_map.collisions() {
-                warnings.push(format!(
-                    "id prefix `{}` is claimed by {} repos; its issues show as `{}`",
-                    sanitize(&collision.prefix),
-                    collision.repos.len(),
-                    snapshot::UNKNOWN_REPO,
-                ));
-            }
-            refresh::publish_hub_generation(paths, &refresh::HubGenerationToken::fresh())?;
-            let snapshot = snapshot::fetch(
-                bd,
-                &hub,
-                &synced.outcome().prefix_map,
-                synced.outcome().synced_at,
-                status,
-            )?;
-            drop(synced);
-            (snapshot, warnings)
-        }
-        // Degraded, not fatal: another hank holds the lock, so print the last
-        // synced data (attribution unavailable → every row falls to `unknown`).
-        Err(RefreshError::AlreadyRefreshing) => (
-            snapshot::fetch(bd, &hub, &fallback_map, SystemTime::now(), status)?,
-            vec!["another hank is refreshing this hub; showing the last synced data".to_string()],
-        ),
-        Err(fatal) => return Err(fatal.into()),
-    };
+    let synced =
+        refresh::run_scoped_observed_locked(bd, roster, paths, None, None, 4, &|_| {}, lock)?;
+    // Per-repo failures and prefix collisions are surfaced but never fatal
+    // — the hub still synced whatever exported cleanly.
+    let mut refresh_warnings = synced
+        .outcome()
+        .errors
+        .iter()
+        .map(|repo_error| sanitize(&repo_error.to_string()))
+        .collect::<Vec<_>>();
+    for collision in synced.outcome().prefix_map.collisions() {
+        refresh_warnings.push(format!(
+            "id prefix `{}` is claimed by {} repos; its issues show as `{}`",
+            sanitize(&collision.prefix),
+            collision.repos.len(),
+            snapshot::UNKNOWN_REPO,
+        ));
+    }
+    refresh::publish_hub_generation(paths, &refresh::HubGenerationToken::fresh())?;
+    let snapshot = snapshot::fetch(
+        bd,
+        &hub,
+        &synced.outcome().prefix_map,
+        synced.outcome().synced_at,
+        status,
+    )?;
+    drop(synced);
 
     for warning in refresh_warnings {
         writeln!(err, "warning: {warning}")?;
@@ -318,12 +308,13 @@ pub fn load_roster(paths: &Paths) -> Result<Config, CliError> {
 /// and a cache left behind would otherwise let the very next launch paint
 /// rows from the just-discarded hub for up to [`cache::MAX_AGE`].
 pub fn run_reset(paths: &Paths, out: &mut impl Write) -> Result<(), CliError> {
+    let lock = refresh::acquire_hub_lock(paths)?;
     let hub = hub_dir(paths);
     // Mirror `hub::reset`'s own `symlink_metadata` test rather than `Path::exists`:
     // exists() follows symlinks and reports false for a dangling hub symlink that
     // reset nonetheless removes, which would misreport it as "nothing to remove".
     let existed = std::fs::symlink_metadata(&hub).is_ok();
-    hub::reset(paths)?;
+    hub::reset_locked(paths, &lock)?;
     cache::clear(paths.cache_file())?;
     if existed {
         writeln!(out, "hub reset: removed {}", hub.display())?;
@@ -1119,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_already_refreshing_degrades() {
+    fn snapshot_already_refreshing_declines_without_touching_the_hub() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
@@ -1132,7 +1123,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
 
-        run_snapshot(
+        let error = run_snapshot(
             &roster(&[&ra]),
             &bd,
             &paths,
@@ -1141,17 +1132,49 @@ mod tests {
             &mut out,
             &mut err,
         )
-        .expect("degrades, ok");
-
-        let stdout = String::from_utf8(out).unwrap();
-        let stderr = String::from_utf8(err).unwrap();
+        .expect_err("declines while another process owns the hub");
         assert!(
-            stdout.contains("ra-2hc"),
-            "stale rows still printed: {stdout:?}"
+            matches!(error, CliError::Refresh(RefreshError::AlreadyRefreshing)),
+            "{error:?}"
+        );
+        assert!(out.is_empty());
+        assert_eq!(bd.calls(), vec![crate::bd::Call::Version]);
+    }
+
+    #[test]
+    fn snapshot_holds_one_hub_lock_from_init_through_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let hub = hub_dir(&paths);
+        let bd = FakeBdClient::new().with_call_hook(move |call| {
+            if !matches!(call, crate::bd::Call::Version) {
+                assert!(
+                    HubLock::try_acquire(&hub).unwrap().is_none(),
+                    "hub operation escaped the lifecycle lock: {call:?}"
+                );
+            }
+        });
+
+        run_snapshot(
+            &roster(&[&ra]),
+            &bd,
+            &paths,
+            StatusFilter::Ready,
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            bd.calls()
+                .iter()
+                .any(|call| matches!(call, crate::bd::Call::Init(..)))
         );
         assert!(
-            stderr.to_lowercase().contains("refreshing"),
-            "AlreadyRefreshing warned on err: {stderr:?}"
+            bd.calls()
+                .iter()
+                .any(|call| matches!(call, crate::bd::Call::Ready(..)))
         );
     }
 

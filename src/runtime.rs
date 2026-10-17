@@ -28,7 +28,7 @@ use crate::bd::{BdCli, BdClient, BdError, RepoSyncReport};
 use crate::cache;
 use crate::cli::{CliError, load_roster, run_doctor, sanitize, version_gate};
 use crate::config::{Config, Paths};
-use crate::hub::{ensure_hub, hub_dir, reconcile_witness};
+use crate::hub::{ensure_hub_locked, hub_dir, reconcile_witness};
 use crate::refresh::{self, AttributionGeneration, HubGenerationToken, RefreshError};
 use crate::snapshot::{self, Row, Snapshot, StatusFilter};
 use crate::ui_state;
@@ -858,13 +858,35 @@ pub(crate) fn detail_worker(
     let _ = tx.send(Msg::DetailReady { token, detail }.into());
 }
 
-/// Run `bd show <id>` against the hub, mapping a [`BdError`] to a
-/// pre-formatted, [`sanitize`]d message for the pane. No version gate or
-/// `ensure_hub`: the detail pane is reachable only from the list, i.e. after a
-/// snapshot already hydrated the hub.
+/// Run `bd show <id>` against the hub while holding the lifecycle lock. A
+/// [`BdError`] or a busy lock becomes a pre-formatted, [`sanitize`]d pane
+/// message. No version gate, generation check, or `ensure_hub`: cached rows
+/// are openable before the first refresh publishes a verified hub.
 pub(crate) fn gather_detail(bd: &impl BdClient, paths: &Paths, id: &str) -> Result<String, String> {
-    bd.show(&hub_dir(paths), id)
-        .map_err(|e| sanitize(&format!("couldn't load {id}: {e}")))
+    with_hub_lock(paths, |hub| bd.show(hub, id))
+        .map_err(|error| sanitize(&format!("couldn't load {id}: {error}")))
+}
+
+/// Hold the hub lifecycle lock across one read.
+///
+/// Search and status loads use [`with_verified_hub`], which also refuses until
+/// a refresh has published a generation. Detail and markdown copy stay
+/// reachable from cached rows before that, so they take only the lock: a free
+/// lock reads the hub behind the cache, and a busy lock declines instead of
+/// racing a sync or reset.
+fn with_hub_lock<T>(
+    paths: &Paths,
+    read: impl FnOnce(&Path) -> Result<T, BdError>,
+) -> Result<T, String> {
+    let hub = hub_dir(paths);
+    let _lock = match refresh::HubLock::try_acquire(&hub) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return Err("unavailable while another hank is refreshing; retry shortly".to_string());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    read(&hub).map_err(|error| error.to_string())
 }
 
 /// Spawn a background search worker that reports over `tx`, returning its join
@@ -1070,8 +1092,8 @@ fn build_copy_with_map(
     map: Option<Arc<refresh::PrefixMap>>,
 ) -> (String, String) {
     let payload = if markdown {
-        let issue = bd
-            .show_issue(&hub_dir(paths), &row.issue.id)
+        // Lock failure and `bd show` failure both keep the cached row.
+        let issue = with_hub_lock(paths, |hub| bd.show_issue(hub, &row.issue.id))
             .unwrap_or_else(|_| row.issue.clone());
         context::markdown_block(&issue, &row.repo_name)
     } else {
@@ -1186,8 +1208,27 @@ fn gather_verified_snapshot(
         return (None, warnings);
     }
 
+    // Keep the in-process lock order consistent with reads: generation first,
+    // then the cross-process lock. Hold both through reconciliation and fetch.
+    let mut generation_state = state
+        .hub_access
+        .write()
+        .expect("hub generation state poisoned");
+    let lock = match refresh::acquire_hub_lock(paths) {
+        Ok(lock) => lock,
+        Err(RefreshError::AlreadyRefreshing) => {
+            warnings.push("another hank is refreshing this hub; keeping the current view".into());
+            metrics.total = total_started.elapsed();
+            return (None, warnings);
+        }
+        Err(error) => {
+            warnings.push(sanitize(&format!("refresh failed: {error}")));
+            metrics.total = total_started.elapsed();
+            return (None, warnings);
+        }
+    };
     let reconcile_started = std::time::Instant::now();
-    match ensure_reconciled(bd, paths, roster, state) {
+    match ensure_reconciled_locked(bd, paths, roster, &lock) {
         Ok(reconcile_warnings) => {
             warnings.extend(reconcile_warnings.iter().map(|warning| sanitize(warning)))
         }
@@ -1203,52 +1244,44 @@ fn gather_verified_snapshot(
     let hub = hub_dir(paths);
     // Bind sync, marker publication, generation registration, and ready to one
     // in-process write generation. Search takes the read side.
-    let mut generation_state = state
-        .hub_access
-        .write()
-        .expect("hub generation state poisoned");
     let previous = generation_state
         .current_hub
         .as_ref()
         .map(|verified| verified.candidate.clone());
-    let synced =
-        match refresh::run_scoped_observed(bd, roster, paths, previous.as_ref(), only, 4, &|repo| {
-            state.startup_watch.before_export(repo)
-        }) {
-            Ok(synced) => {
-                for repo_error in &synced.outcome().errors {
-                    warnings.push(sanitize(&repo_error.to_string()));
-                }
-                for collision in synced.outcome().prefix_map.collisions() {
-                    warnings.push(sanitize(&format!(
-                        "id prefix `{}` is claimed by {} repos; its issues show as `{}`",
-                        collision.prefix,
-                        collision.repos.len(),
-                        snapshot::UNKNOWN_REPO,
-                    )));
-                }
-                *syncs = Some((
-                    synced.outcome().synced_at,
-                    repo_syncs(&synced.outcome().repos),
-                ));
-                synced
+    let synced = match refresh::run_scoped_observed_locked(
+        bd,
+        roster,
+        paths,
+        previous.as_ref(),
+        only,
+        4,
+        &|repo| state.startup_watch.before_export(repo),
+        lock,
+    ) {
+        Ok(synced) => {
+            for repo_error in &synced.outcome().errors {
+                warnings.push(sanitize(&repo_error.to_string()));
             }
-            // Another hank holds the lock: keep the current view intact rather than
-            // fetching a snapshot with no prefix map (which would re-attribute every
-            // row to `unknown`, reset the age, and empty an active repo filter).
-            // Returning `None` makes `reduce` retain the last-good rows.
-            Err(RefreshError::AlreadyRefreshing) => {
-                warnings
-                    .push("another hank is refreshing this hub; keeping the current view".into());
-                metrics.total = total_started.elapsed();
-                return (None, warnings);
+            for collision in synced.outcome().prefix_map.collisions() {
+                warnings.push(sanitize(&format!(
+                    "id prefix `{}` is claimed by {} repos; its issues show as `{}`",
+                    collision.prefix,
+                    collision.repos.len(),
+                    snapshot::UNKNOWN_REPO,
+                )));
             }
-            Err(fatal) => {
-                warnings.push(sanitize(&format!("refresh failed: {fatal}")));
-                metrics.total = total_started.elapsed();
-                return (None, warnings);
-            }
-        };
+            *syncs = Some((
+                synced.outcome().synced_at,
+                repo_syncs(&synced.outcome().repos),
+            ));
+            synced
+        }
+        Err(fatal) => {
+            warnings.push(sanitize(&format!("refresh failed: {fatal}")));
+            metrics.total = total_started.elapsed();
+            return (None, warnings);
+        }
+    };
     metrics.source_wall = synced.outcome().metrics.source_wall;
     metrics.sync = synced.outcome().metrics.sync;
     metrics.calls.export = synced.outcome().metrics.export_calls;
@@ -1296,18 +1329,18 @@ fn gather_verified_snapshot(
     result
 }
 
-fn ensure_reconciled(
+fn ensure_reconciled_locked(
     bd: &impl BdClient,
     paths: &Paths,
     roster: &Config,
-    _state: &RuntimeRefreshState,
+    lock: &refresh::HubLock,
 ) -> Result<Vec<String>, crate::hub::HubError> {
     let before = reconcile_witness(paths, roster)?;
     if before.is_satisfied() {
         return Ok(before.warnings());
     }
 
-    let status = ensure_hub(bd, paths, roster)?;
+    let status = ensure_hub_locked(bd, paths, roster, lock)?;
     Ok(status.warnings)
 }
 
@@ -2109,32 +2142,41 @@ mod tests {
     }
 
     #[test]
-    fn refresh_task_does_not_resurrect_the_cache_after_a_concurrent_reset() {
+    fn reset_declines_until_refresh_finishes_reading_then_clears_the_cache() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let cache_file = paths.cache_file().to_path_buf();
         let ra = seed_repo(tmp.path(), "ra", "ra");
-        // `hank reset` in another terminal lands while this refresh's lock-free
-        // `bd ready` is still running, i.e. after sync but before the cache write.
+        // A reset cannot delete the synced hub while ready is still reading it.
         let reset_paths = paths.clone();
         let bd = FakeBdClient::new()
             .with_ready(vec![issue("ra-1", 1, "Ready one")])
             .with_call_hook(move |call| {
                 if matches!(call, crate::bd::Call::Ready(_)) {
-                    crate::cli::run_reset(&reset_paths, &mut io::sink()).unwrap();
+                    assert!(matches!(
+                        crate::cli::run_reset(&reset_paths, &mut io::sink()),
+                        Err(CliError::Refresh(RefreshError::AlreadyRefreshing))
+                    ));
                 }
             });
         let cfg = roster(&[&ra]);
         let (tx, rx) = mpsc::channel();
 
-        let handle = thread::spawn(move || refresh_worker(bd, cfg, paths, tx));
+        let worker_paths = paths.clone();
+        let handle = thread::spawn(move || refresh_worker(bd, cfg, worker_paths, tx));
         assert_eq!(recv_msg(&rx), Msg::RefreshStarted);
         assert!(matches!(recv_msg(&rx), Msg::RefreshCompleted { .. }));
         handle.join().unwrap();
 
         assert!(
+            cache_file.exists(),
+            "the completed refresh may cache its snapshot"
+        );
+        crate::cli::run_reset(&paths, &mut io::sink()).unwrap();
+
+        assert!(
             !cache_file.exists(),
-            "a refresh that read the pre-reset hub must not write the cache after reset cleared it"
+            "a reset after the refresh removes its derived cache"
         );
     }
 
@@ -2661,11 +2703,11 @@ mod tests {
         seed_initialized_hub(&paths, &[]);
         let repo = tmp.path().join("later");
         let config = roster(&[&repo]);
-        let state = RuntimeRefreshState::default();
         let bd = FakeBdClient::new();
+        let lock = refresh::acquire_hub_lock(&paths).unwrap();
 
-        let first = ensure_reconciled(&bd, &paths, &config, &state).unwrap();
-        let second = ensure_reconciled(&bd, &paths, &config, &state).unwrap();
+        let first = ensure_reconciled_locked(&bd, &paths, &config, &lock).unwrap();
+        let second = ensure_reconciled_locked(&bd, &paths, &config, &lock).unwrap();
         assert_eq!(first, second);
         assert!(first[0].contains("does not exist"));
         assert!(
@@ -2674,7 +2716,7 @@ mod tests {
         );
 
         fs::create_dir_all(&repo).unwrap();
-        ensure_reconciled(&bd, &paths, &config, &state).unwrap();
+        ensure_reconciled_locked(&bd, &paths, &config, &lock).unwrap();
         let canonical_repo = fs::canonicalize(&repo).unwrap();
 
         assert!(
@@ -2692,20 +2734,20 @@ mod tests {
         let repo = seed_repo(tmp.path(), "repo", "ra");
         let config = roster(&[&repo]);
         seed_initialized_hub(&paths, &[&repo]);
-        let state = RuntimeRefreshState::default();
         let bd = FakeBdClient::new();
-        ensure_reconciled(&bd, &paths, &config, &state).unwrap();
+        let lock = refresh::acquire_hub_lock(&paths).unwrap();
+        ensure_reconciled_locked(&bd, &paths, &config, &lock).unwrap();
         assert!(bd.calls().is_empty());
 
         seed_initialized_hub(&paths, &[]);
-        ensure_reconciled(&bd, &paths, &config, &state).unwrap();
+        ensure_reconciled_locked(&bd, &paths, &config, &lock).unwrap();
         let canonical_repo = fs::canonicalize(&repo).unwrap();
         assert!(bd.calls().iter().any(
             |call| matches!(call, crate::bd::Call::RepoAdd(_, actual) if actual == &canonical_repo)
         ));
 
         fs::remove_dir_all(hub_dir(&paths)).unwrap();
-        ensure_reconciled(&bd, &paths, &config, &state).unwrap();
+        ensure_reconciled_locked(&bd, &paths, &config, &lock).unwrap();
         assert!(
             bd.calls()
                 .iter()
@@ -3226,6 +3268,119 @@ mod tests {
                 .iter()
                 .any(|w| w.to_lowercase().contains("refreshing")),
             "the lock contention is surfaced: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn tui_refresh_holds_one_hub_lock_from_init_through_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let hub = hub_dir(&paths);
+        let bd = FakeBdClient::new().with_call_hook(move |call| {
+            if !matches!(call, crate::bd::Call::Version) {
+                assert!(
+                    HubLock::try_acquire(&hub).unwrap().is_none(),
+                    "hub operation escaped the lifecycle lock: {call:?}"
+                );
+            }
+        });
+
+        let (snapshot, warnings) = gather_snapshot(&bd, &roster(&[&ra]), &paths);
+        assert!(snapshot.is_some(), "{warnings:?}");
+        assert!(
+            bd.calls()
+                .iter()
+                .any(|call| matches!(call, crate::bd::Call::Init(..)))
+        );
+        assert!(
+            bd.calls()
+                .iter()
+                .any(|call| matches!(call, crate::bd::Call::Ready(..)))
+        );
+    }
+
+    #[test]
+    fn detail_and_markdown_copy_hold_hub_lock_before_verified_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let hub = hub_dir(&paths);
+        assert!(
+            refresh::read_hub_generation(&paths).unwrap().is_none(),
+            "a cached row is readable before any refresh publishes a generation"
+        );
+        let mut fresh = issue("ra-1", 2, "Fresh title");
+        fresh.description = Some("Current description".into());
+        let bd = FakeBdClient::new()
+            .with_show(detail())
+            .with_show_issue(fresh)
+            .with_call_hook(move |call| {
+                if matches!(
+                    call,
+                    crate::bd::Call::Show(..) | crate::bd::Call::ShowIssue(..)
+                ) {
+                    assert!(
+                        HubLock::try_acquire(&hub).unwrap().is_none(),
+                        "hub read escaped the lifecycle lock: {call:?}"
+                    );
+                }
+            });
+
+        let loaded =
+            gather_detail(&bd, &paths, "ra-1").expect("detail works before a verified refresh");
+        assert!(loaded.contains("ra-z70"), "{loaded}");
+
+        let row = copy_row("session-tui", "ra-1");
+        let (payload, _) = build_copy_with_map(&bd, &paths, &row, true, None);
+        assert!(payload.contains("Fresh title"), "{payload}");
+        assert!(payload.contains("Current description"), "{payload}");
+        assert!(
+            refresh::read_hub_generation(&paths).unwrap().is_none(),
+            "the locked read does not publish a hub generation"
+        );
+    }
+
+    #[test]
+    fn detail_and_markdown_copy_decline_while_hub_lock_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let hub = hub_dir(&paths);
+        fs::create_dir_all(&hub).unwrap();
+        let _held = HubLock::try_acquire(&hub)
+            .unwrap()
+            .expect("acquired the lock");
+        let mut fresh = issue("ra-1", 2, "Should not be read");
+        fresh.description = Some("live description".into());
+        let bd = FakeBdClient::new()
+            .with_show(detail())
+            .with_show_issue(fresh);
+        let row = copy_row("session-tui", "ra-1");
+
+        let error = gather_detail(&bd, &paths, "ra-1").expect_err("detail declines");
+        assert!(
+            error.to_lowercase().contains("refresh"),
+            "a busy lock is surfaced: {error}"
+        );
+
+        let (payload, _) = build_copy_with_map(&bd, &paths, &row, true, None);
+        assert!(
+            payload.contains("Ready one"),
+            "markdown copy keeps the cached row: {payload}"
+        );
+        assert!(
+            !payload.contains("Should not be read") && !payload.contains("live description"),
+            "markdown copy does not use a hub read that never ran: {payload}"
+        );
+
+        let (command, _) = build_copy_with_map(&bd, &paths, &row, false, None);
+        assert!(
+            command.contains("show ra-1"),
+            "shell copy does not need the hub: {command}"
+        );
+        assert!(
+            bd.calls().is_empty(),
+            "a held lock skips both hub reads: {:?}",
+            bd.calls()
         );
     }
 }
