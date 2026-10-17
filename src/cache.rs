@@ -115,10 +115,9 @@ pub fn load_diagnostic(
 /// partial/interleaved write — the same atomic-replace pattern
 /// [`crate::config::Config::save`] uses for `config.toml`.
 ///
-/// Two hank instances can each hold the hub lock only during their own sync
-/// (see `refresh::run`), so their later, lock-free `bd ready` reads and cache
-/// writes can finish out of order. An exclusive OS lock (mirroring
-/// `refresh::HubLock`, but blocking rather than declining) is held across the
+/// Two hank instances release the hub lock after reading their snapshots, so
+/// their later cache writes can finish out of order. An exclusive OS lock
+/// (mirroring `refresh::HubLock`, but blocking rather than declining) is held across the
 /// read-compare-write sequence below, and the write is skipped as a no-op
 /// when an existing on-disk cache's `fetched_at` is already at or after
 /// `snapshot`'s, so the cache stays monotonic in `fetched_at` even under a

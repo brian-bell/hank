@@ -20,6 +20,7 @@ use serde::Deserialize;
 
 use crate::bd::{BdClient, BdError};
 use crate::config::{Config, Paths};
+use crate::refresh::{HubLock, RefreshError, acquire_hub_lock};
 
 /// The bd prefix used for the hub workspace.
 const HUB_PREFIX: &str = "hub";
@@ -97,6 +98,9 @@ impl ReconcileWitness {
 /// A fatal hub-lifecycle failure.
 #[derive(Debug, thiserror::Error)]
 pub enum HubError {
+    /// Lock contention or an error opening the shared lifecycle lock.
+    #[error(transparent)]
+    Lock(#[from] RefreshError),
     /// A `bd` invocation failed.
     #[error(transparent)]
     Bd(#[from] BdError),
@@ -172,14 +176,21 @@ pub fn ensure_hub(
     paths: &Paths,
     roster: &Config,
 ) -> Result<HubStatus, HubError> {
+    let lock = acquire_hub_lock(paths)?;
+    ensure_hub_locked(bd, paths, roster, &lock)
+}
+
+/// Reconcile while a caller retains the same lock through sync and reads.
+pub(crate) fn ensure_hub_locked(
+    bd: &impl BdClient,
+    paths: &Paths,
+    roster: &Config,
+    _lock: &HubLock,
+) -> Result<HubStatus, HubError> {
     let hub = hub_dir(paths);
     mkdir_all(&hub)?;
 
-    // Single-process reconciliation: this check-then-init (and the roster
-    // read/add below) is not guarded against a second hank running concurrently.
-    // Cross-process safety is the Slice 4 hub lock's job (see the master plan's
-    // process-level locking design); ensure_hub stays simple here and surfaces a
-    // genuine init failure rather than masking it behind a partial `.beads`.
+    // The caller holds the lifecycle lock across check/init and roster read/add.
     if !is_initialized(&hub) {
         bd.init(&hub, HUB_PREFIX)?;
     }
@@ -258,6 +269,12 @@ pub fn prune_repos(
 ///
 /// A no-op (still `Ok`) when the hub does not exist.
 pub fn reset(paths: &Paths) -> Result<(), HubError> {
+    let lock = acquire_hub_lock(paths)?;
+    reset_locked(paths, &lock)
+}
+
+/// Reset while the caller retains the lock through clearing derived caches.
+pub(crate) fn reset_locked(paths: &Paths, _lock: &HubLock) -> Result<(), HubError> {
     let hub = hub_dir(paths);
     ensure_within(paths.data_dir(), &hub)?;
     // `symlink_metadata` does not follow symlinks, so a *dangling* symlink at the
@@ -431,6 +448,82 @@ mod tests {
             &inits[0],
             Call::Init(dir, prefix) if dir == &hub_dir(&paths) && prefix == HUB_PREFIX
         ));
+    }
+
+    #[test]
+    fn concurrent_ensure_hub_declines_before_initializing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let first = FakeBdClient::new().with_call_hook(move |call| {
+            if matches!(call, Call::Init(..)) {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        });
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| ensure_hub(&first, &paths, &Config::default()));
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let second = FakeBdClient::new();
+            let result = ensure_hub(&second, &paths, &Config::default());
+            release_tx.send(()).unwrap();
+            worker.join().unwrap().unwrap();
+            assert!(
+                matches!(result, Err(HubError::Lock(RefreshError::AlreadyRefreshing))),
+                "a second reconciler must decline: {result:?}"
+            );
+            assert!(second.calls().is_empty(), "no concurrent bd mutations");
+        });
+    }
+
+    #[test]
+    fn reset_declines_while_hub_lock_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        seed_hub_config(&hub_dir(&paths), &[]);
+        let held = crate::refresh::HubLock::try_acquire(&hub_dir(&paths))
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            reset(&paths),
+            Err(HubError::Lock(RefreshError::AlreadyRefreshing))
+        ));
+        assert!(
+            hub_dir(&paths).exists(),
+            "contended reset preserves the hub"
+        );
+        drop(held);
+        reset(&paths).unwrap();
+        assert!(!hub_dir(&paths).exists());
+    }
+
+    #[test]
+    fn hub_lock_survives_removing_the_derived_hub_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let hub = hub_dir(&paths);
+        fs::create_dir_all(&hub).unwrap();
+        let held = crate::refresh::HubLock::try_acquire(&hub).unwrap().unwrap();
+        fs::remove_dir_all(&hub).unwrap();
+        fs::create_dir_all(&hub).unwrap();
+
+        assert!(
+            crate::refresh::HubLock::try_acquire(&hub)
+                .unwrap()
+                .is_none(),
+            "replacing the hub must not replace the live lock inode"
+        );
+        drop(held);
+        assert!(
+            crate::refresh::HubLock::try_acquire(&hub)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
