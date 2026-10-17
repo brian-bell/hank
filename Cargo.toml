@@ -52,6 +52,7 @@ fs2 = "0.4.3"
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+# Retained for read-only bd hub roster YAML parsing; see docs/architecture.md.
 serde_yaml = "0.9.34"
 thiserror = "2.0.18"
 toml = "1.1.2"

@@ -59,9 +59,6 @@ pub trait BdClient: Sync {
     /// the issues the hub hydrated from it. bd matches `repo_path` against the
     /// stored `repos.additional` string exactly, so pass the entry as stored.
     fn repo_remove(&self, hub: &Path, repo_path: &Path) -> Result<(), BdError>;
-    /// `bd -C <hub> repo list --json` — the hub's registered repos. The shape is
-    /// consumed in Slice 3; here it is returned as a tolerant JSON value.
-    fn repo_list(&self, hub: &Path) -> Result<serde_json::Value, BdError>;
     /// `bd -C <repo> export -o <output>` — write a passive JSONL export to the
     /// caller-selected target. `refresh` alone decides whether to publish it
     /// over the canonical source artifact.

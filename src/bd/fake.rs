@@ -23,7 +23,6 @@ pub enum Call {
     Init(PathBuf, String),
     RepoAdd(PathBuf, PathBuf),
     RepoRemove(PathBuf, PathBuf),
-    RepoList(PathBuf),
     Export(PathBuf, PathBuf),
     IssuePrefix(PathBuf),
     EventsJournal(PathBuf),
@@ -42,7 +41,7 @@ pub enum Call {
 ///
 /// **Every** method of the trait is programmable with a success value or a
 /// [`BdError`], so downstream modules can drive their error paths (hub init
-/// failure, roster-list failure, sync failure, per-repo export failure, …)
+/// failure, repo-add failure, sync failure, per-repo export failure, …)
 /// without writing another fake. Each `with_*` response is **reused** across
 /// calls (not consumed). Unset slots default to something benign: the
 /// value-returning calls yield an empty list / bd 1.1.0 version / an empty show
@@ -60,7 +59,6 @@ pub struct FakeBdClient {
     init: Option<Result<(), BdError>>,
     repo_add: Option<Result<(), BdError>>,
     repo_remove: Option<Result<(), BdError>>,
-    repo_list: Option<Result<serde_json::Value, BdError>>,
     repo_sync: Option<Result<RepoSyncReport, BdError>>,
     ready: Option<Result<Vec<Issue>, BdError>>,
     list_status: HashMap<String, Result<Vec<Issue>, BdError>>,
@@ -117,16 +115,6 @@ impl FakeBdClient {
 
     pub fn with_repo_remove_err(mut self, err: BdError) -> Self {
         self.repo_remove = Some(Err(err));
-        self
-    }
-
-    pub fn with_repo_list(mut self, value: serde_json::Value) -> Self {
-        self.repo_list = Some(Ok(value));
-        self
-    }
-
-    pub fn with_repo_list_err(mut self, err: BdError) -> Self {
-        self.repo_list = Some(Err(err));
         self
     }
 
@@ -335,11 +323,6 @@ impl BdClient for FakeBdClient {
     fn repo_remove(&self, hub: &Path, repo_path: &Path) -> Result<(), BdError> {
         self.record(Call::RepoRemove(hub.to_path_buf(), repo_path.to_path_buf()));
         resolve(&self.repo_remove, || ())
-    }
-
-    fn repo_list(&self, hub: &Path) -> Result<serde_json::Value, BdError> {
-        self.record(Call::RepoList(hub.to_path_buf()));
-        resolve(&self.repo_list, || serde_json::Value::Array(Vec::new()))
     }
 
     fn export_to(&self, repo: &Path, output: &Path) -> Result<(), BdError> {
@@ -570,12 +553,6 @@ mod tests {
             FakeBdClient::new()
                 .with_repo_add_err(err())
                 .repo_add(hub, Path::new("/tmp/ra"))
-                .is_err()
-        );
-        assert!(
-            FakeBdClient::new()
-                .with_repo_list_err(err())
-                .repo_list(hub)
                 .is_err()
         );
         assert!(
