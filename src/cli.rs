@@ -9,13 +9,14 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::time::SystemTime;
 
 use crate::bd::{BdClient, BdError, BdVersion};
 use crate::cache;
 use crate::config::{Config, Paths, RepoEntry};
 use crate::hub::{self, HubError, hub_dir};
-use crate::refresh::{self, PrefixMap, RefreshError};
+use crate::refresh::{self, RefreshError};
 use crate::snapshot::{self, Row, StatusFilter};
 
 /// The minimum bd the version gate accepts.
@@ -34,8 +35,7 @@ pub enum CliError {
     /// Hub lifecycle failed fatally (e.g. init).
     #[error(transparent)]
     Hub(#[from] HubError),
-    /// Refresh failed fatally (sync/lock/io — `AlreadyRefreshing` is handled as a
-    /// non-fatal degraded path inside `run_snapshot`, never surfaced here).
+    /// Refresh failed fatally (sync/lock/io, including hub contention).
     #[error(transparent)]
     Refresh(#[from] RefreshError),
     /// A `bd` read (version/ready) failed fatally.
@@ -123,8 +123,8 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// `ensure_hub → refresh → fetch → print`. See `plans/slices/slice-6.md` for the
-/// full control flow (version gate fatal; per-repo errors and `AlreadyRefreshing`
-/// degrade with a warning; sync/hub/read failures fatal). `status` picks which
+/// full control flow (per-repo errors degrade with a warning; hub contention and
+/// sync/hub/read failures are fatal). `status` picks which
 /// issues to print (see [`snapshot::read_issues`]).
 pub fn run_snapshot(
     roster: &Config,
@@ -139,7 +139,8 @@ pub fn run_snapshot(
     // hank's `--json` parsing was not written against, before touching the hub.
     version_gate(&bd.version()?).map_err(CliError::VersionGate)?;
 
-    let hub_status = hub::ensure_hub(bd, paths, roster)?;
+    let lock = refresh::acquire_hub_lock(paths)?;
+    let hub_status = hub::ensure_hub_locked(bd, paths, roster, &lock)?;
     for warning in &hub_status.warnings {
         // Warnings embed config/repo-derived text (paths, bd stderr, prefixes)
         // and go to a terminal, so sanitize them like rows and doctor output.
@@ -147,44 +148,33 @@ pub fn run_snapshot(
     }
 
     let hub = hub_dir(paths);
-    let fallback_map = PrefixMap::default();
-    let (snapshot, refresh_warnings) = match refresh::run_with_state(bd, roster, paths, None, 4) {
-        Ok(synced) => {
-            // Per-repo failures and prefix collisions are surfaced but never fatal
-            // — the hub still synced whatever exported cleanly.
-            let mut warnings = synced
-                .outcome()
-                .errors
-                .iter()
-                .map(|repo_error| sanitize(&repo_error.to_string()))
-                .collect::<Vec<_>>();
-            for collision in synced.outcome().prefix_map.collisions() {
-                warnings.push(format!(
-                    "id prefix `{}` is claimed by {} repos; its issues show as `{}`",
-                    sanitize(&collision.prefix),
-                    collision.repos.len(),
-                    snapshot::UNKNOWN_REPO,
-                ));
-            }
-            refresh::publish_hub_generation(paths, &refresh::HubGenerationToken::fresh())?;
-            let snapshot = snapshot::fetch(
-                bd,
-                &hub,
-                &synced.outcome().prefix_map,
-                synced.outcome().synced_at,
-                status,
-            )?;
-            drop(synced);
-            (snapshot, warnings)
-        }
-        // Degraded, not fatal: another hank holds the lock, so print the last
-        // synced data (attribution unavailable → every row falls to `unknown`).
-        Err(RefreshError::AlreadyRefreshing) => (
-            snapshot::fetch(bd, &hub, &fallback_map, SystemTime::now(), status)?,
-            vec!["another hank is refreshing this hub; showing the last synced data".to_string()],
-        ),
-        Err(fatal) => return Err(fatal.into()),
-    };
+    let synced =
+        refresh::run_scoped_observed_locked(bd, roster, paths, None, None, 4, &|_| {}, lock)?;
+    // Per-repo failures and prefix collisions are surfaced but never fatal
+    // — the hub still synced whatever exported cleanly.
+    let mut refresh_warnings = synced
+        .outcome()
+        .errors
+        .iter()
+        .map(|repo_error| sanitize(&repo_error.to_string()))
+        .collect::<Vec<_>>();
+    for collision in synced.outcome().prefix_map.collisions() {
+        refresh_warnings.push(format!(
+            "id prefix `{}` is claimed by {} repos; its issues show as `{}`",
+            sanitize(&collision.prefix),
+            collision.repos.len(),
+            snapshot::UNKNOWN_REPO,
+        ));
+    }
+    refresh::publish_hub_generation(paths, &refresh::HubGenerationToken::fresh())?;
+    let snapshot = snapshot::fetch(
+        bd,
+        &hub,
+        &synced.outcome().prefix_map,
+        synced.outcome().synced_at,
+        status,
+    )?;
+    drop(synced);
 
     for warning in refresh_warnings {
         writeln!(err, "warning: {warning}")?;
@@ -318,12 +308,13 @@ pub fn load_roster(paths: &Paths) -> Result<Config, CliError> {
 /// and a cache left behind would otherwise let the very next launch paint
 /// rows from the just-discarded hub for up to [`cache::MAX_AGE`].
 pub fn run_reset(paths: &Paths, out: &mut impl Write) -> Result<(), CliError> {
+    let lock = refresh::acquire_hub_lock(paths)?;
     let hub = hub_dir(paths);
     // Mirror `hub::reset`'s own `symlink_metadata` test rather than `Path::exists`:
     // exists() follows symlinks and reports false for a dangling hub symlink that
     // reset nonetheless removes, which would misreport it as "nothing to remove".
     let existed = std::fs::symlink_metadata(&hub).is_ok();
-    hub::reset(paths)?;
+    hub::reset_locked(paths, &lock)?;
     cache::clear(paths.cache_file())?;
     if existed {
         writeln!(out, "hub reset: removed {}", hub.display())?;
@@ -387,6 +378,13 @@ fn save_roster(roster: &Config, paths: &Paths) -> Result<(), CliError> {
         .map_err(|e| CliError::Io(std::io::Error::other(e)))
 }
 
+/// Serialize the complete roster load/mutate/save transaction. This lock is
+/// independent of the hub lock; remove releases it before attempting a prune.
+fn lock_roster(paths: &Paths) -> Result<crate::config::RosterLock, CliError> {
+    crate::config::RosterLock::acquire(paths.config_file())
+        .map_err(|e| CliError::Io(std::io::Error::other(e)))
+}
+
 /// `hank repos add <path>`: canonicalize and append a beads repo to the roster.
 ///
 /// Rejects a directory without a `.beads/` subdir (naming the path and pointing at
@@ -409,6 +407,7 @@ pub fn run_repos_add(
         )));
     }
     let canonical = store_path(path);
+    let _roster_lock = lock_roster(paths)?;
     let mut roster = load_roster(paths)?;
     // Normalize each existing entry too, not just the new path: a hand-edited
     // config.toml may hold relative or symlink-aliased entries, and adding the same
@@ -464,6 +463,7 @@ pub fn run_repos_remove(
     if !hub::tracked_repos_matching(paths, matches)?.is_empty() {
         version_gate(&bd.version()?).map_err(CliError::VersionGate)?;
     }
+    let roster_lock = lock_roster(paths)?;
     let mut roster = load_roster(paths)?;
     let before = roster.repos.len();
     roster
@@ -483,6 +483,7 @@ pub fn run_repos_remove(
             sanitize(&expanded.display().to_string())
         )?;
     }
+    drop(roster_lock);
     prune_hub(bd, paths, matches, out)
 }
 
@@ -555,6 +556,8 @@ pub fn run_repos_discover(
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let root = expand_tilde(root);
+    // A preview remains read-only, including when there is no config yet.
+    let _roster_lock = if add { Some(lock_roster(paths)?) } else { None };
     let mut roster = load_roster(paths)?;
     // Normalize stored entries so a candidate already in the roster under a different
     // spelling (relative/aliased/`~`, e.g. a hand-edited config) is still skipped.
@@ -705,6 +708,7 @@ pub fn run_repos_watch(
     on: bool,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
+    let _roster_lock = lock_roster(paths)?;
     let mut roster = load_roster(paths)?;
     let selected: Vec<usize> = match path {
         Some(path) => {
@@ -1119,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_already_refreshing_degrades() {
+    fn snapshot_already_refreshing_declines_without_touching_the_hub() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
         let ra = seed_repo(tmp.path(), "ra", "ra");
@@ -1132,7 +1136,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
 
-        run_snapshot(
+        let error = run_snapshot(
             &roster(&[&ra]),
             &bd,
             &paths,
@@ -1141,17 +1145,49 @@ mod tests {
             &mut out,
             &mut err,
         )
-        .expect("degrades, ok");
-
-        let stdout = String::from_utf8(out).unwrap();
-        let stderr = String::from_utf8(err).unwrap();
+        .expect_err("declines while another process owns the hub");
         assert!(
-            stdout.contains("ra-2hc"),
-            "stale rows still printed: {stdout:?}"
+            matches!(error, CliError::Refresh(RefreshError::AlreadyRefreshing)),
+            "{error:?}"
+        );
+        assert!(out.is_empty());
+        assert_eq!(bd.calls(), vec![crate::bd::Call::Version]);
+    }
+
+    #[test]
+    fn snapshot_holds_one_hub_lock_from_init_through_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let ra = seed_repo(tmp.path(), "ra", "ra");
+        let hub = hub_dir(&paths);
+        let bd = FakeBdClient::new().with_call_hook(move |call| {
+            if !matches!(call, crate::bd::Call::Version) {
+                assert!(
+                    HubLock::try_acquire(&hub).unwrap().is_none(),
+                    "hub operation escaped the lifecycle lock: {call:?}"
+                );
+            }
+        });
+
+        run_snapshot(
+            &roster(&[&ra]),
+            &bd,
+            &paths,
+            StatusFilter::Ready,
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            bd.calls()
+                .iter()
+                .any(|call| matches!(call, crate::bd::Call::Init(..)))
         );
         assert!(
-            stderr.to_lowercase().contains("refreshing"),
-            "AlreadyRefreshing warned on err: {stderr:?}"
+            bd.calls()
+                .iter()
+                .any(|call| matches!(call, crate::bd::Call::Ready(..)))
         );
     }
 
@@ -1484,6 +1520,94 @@ mod tests {
     }
 
     #[test]
+    fn roster_mutations_wait_for_the_lock_and_reload_the_latest_config() {
+        use fs2::FileExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for command in ["add", "remove", "discover", "watch", "unwatch"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = Paths::with_base(tmp.path());
+            let root = tmp.path().join("sources");
+            let ra = seed_repo(&root, "ra", "ra").canonicalize().unwrap();
+            let concurrent = seed_repo(tmp.path(), "concurrent", "concurrent")
+                .canonicalize()
+                .unwrap();
+            let mut initial = Config::default();
+            if !matches!(command, "add" | "discover") {
+                initial.repos.push(RepoEntry::new(ra.clone()));
+                initial.repos[0].unwatched = command == "watch";
+            }
+            initial.save(paths.config_file()).unwrap();
+
+            // Model another process holding the roster transaction open. Its
+            // later save must be observed by the waiting CLI command.
+            let held = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(paths.config_file().with_file_name(".config.toml.lock"))
+                .unwrap();
+            held.lock_exclusive().unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker_paths = paths.clone();
+            let worker_ra = ra.clone();
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let bd = events_bd();
+                let mut out = Vec::new();
+                let result = match command {
+                    "add" => run_repos_add(&bd, &worker_paths, &worker_ra, &mut out),
+                    "remove" => run_repos_remove(&bd, &worker_paths, &worker_ra, &mut out),
+                    "discover" => run_repos_discover(&bd, &worker_paths, &root, true, &mut out),
+                    _ => run_repos_watch(
+                        &bd,
+                        &worker_paths,
+                        Some(&worker_ra),
+                        command == "watch",
+                        &mut out,
+                    ),
+                };
+                done_tx.send(result).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                matches!(
+                    done_rx.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "{command} must wait until the previous roster transaction ends"
+            );
+            initial.repos.push(RepoEntry::new(concurrent.clone()));
+            initial.watch = true;
+            initial.save(paths.config_file()).unwrap();
+            drop(held);
+
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            worker.join().unwrap();
+            let saved = reload(&paths);
+            assert!(
+                saved.watch,
+                "{command} preserves a concurrent settings change"
+            );
+            assert!(
+                saved.repos.iter().any(|entry| entry.path == concurrent),
+                "{command} preserves the concurrent addition: {saved:?}"
+            );
+            let target = saved.repos.iter().find(|entry| entry.path == ra);
+            match command {
+                "remove" => assert!(target.is_none()),
+                "watch" | "unwatch" => assert_eq!(target.unwrap().unwatched, command == "unwatch"),
+                _ => assert!(target.is_some()),
+            }
+        }
+    }
+
+    #[test]
     fn add_appends_and_dedupes() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(tmp.path());
@@ -1780,6 +1904,10 @@ mod tests {
         assert!(
             std::fs::symlink_metadata(paths.config_file()).is_err(),
             "discover without --add mutates nothing"
+        );
+        assert!(
+            !paths.config_file().parent().unwrap().exists(),
+            "a discovery preview creates no config directory or lock"
         );
     }
 
